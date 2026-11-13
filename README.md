@@ -10,7 +10,11 @@
 </p>
 
 <p align="center">
-  <img src="assets/wizard.svg" width="702" alt="The hilo wizard pairing a Mac with a server called devbox">
+  <b>English</b> · <a href="README.es.md">Español</a>
+</p>
+
+<p align="center">
+  <img src="assets/wizard.svg" width="678" alt="The hilo wizard pairing a Mac with a server called devbox">
 </p>
 
 An agent on your Mac and another on your server each work on their own copy of the repo. What one
