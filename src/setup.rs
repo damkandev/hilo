@@ -160,8 +160,8 @@ ls -1 "$HOME" | sed 's/^/dir=/'
 
 fn triple(os: &str, arch: &str) -> Option<&'static str> {
     Some(match (os, arch) {
-        ("Linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        ("Linux", "aarch64" | "arm64") => "aarch64-unknown-linux-gnu",
+        ("Linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("Linux", "aarch64" | "arm64") => "aarch64-unknown-linux-musl",
         ("Darwin", "arm64") => "aarch64-apple-darwin",
         ("Darwin", "x86_64") => "x86_64-apple-darwin",
         _ => return None,

@@ -9,8 +9,8 @@ DEST="${HILO_BIN_DIR:-$HOME/.local/bin}"
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) T=aarch64-apple-darwin ;;
   Darwin-x86_64) T=x86_64-apple-darwin ;;
-  Linux-x86_64) T=x86_64-unknown-linux-gnu ;;
-  Linux-aarch64|Linux-arm64) T=aarch64-unknown-linux-gnu ;;
+  Linux-x86_64) T=x86_64-unknown-linux-musl ;;
+  Linux-aarch64|Linux-arm64) T=aarch64-unknown-linux-musl ;;
   *) echo "hilo: no build for $(uname -s) $(uname -m) yet" >&2; exit 1 ;;
 esac
 
