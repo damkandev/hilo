@@ -19,7 +19,7 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --offline --locked --target ${{ matrix.target }}
       - name: Sign and notarize (macOS, when the secrets exist)

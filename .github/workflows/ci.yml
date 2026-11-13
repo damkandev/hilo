@@ -15,7 +15,7 @@ jobs:
       HILO_KEYCHAIN: "0"
       HILO_NOTIFY: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: git config --global user.email ci@hilo && git config --global user.name ci
       # vendored crates only: the build never touches the network
       - run: cargo test --release --offline --locked
@@ -24,6 +24,6 @@ jobs:
   vet:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: cargo install cargo-vet --locked
       - run: cargo vet --locked
