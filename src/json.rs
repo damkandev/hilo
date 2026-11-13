@@ -1,5 +1,6 @@
 //! Minimal JSON: parse, build, serialize. Keeps object key order and number text as written,
 //! so editing someone's settings.json changes only what we touch.
+#![forbid(unsafe_code)]
 use std::fmt::Write;
 
 #[derive(Clone, Debug, PartialEq)]

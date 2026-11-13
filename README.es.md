@@ -131,7 +131,11 @@ lo que protege las escrituras es la regla de arriba.
 
 **Envs.** `.env` y `.env.*` nunca viajan como archivos. Cada clave vive en una bóveda por repo
 (ChaCha20-Poly1305) con una capa compartida y otra que nunca sale de la máquina. hilo escribe el
-archivo combinado solo donde git lo ignora, y los agentes no pueden leerlo con sus herramientas.
+archivo combinado solo donde git lo ignora. Los hooks de Claude Code impiden que los agentes lo lean
+con sus herramientas, pero eso es una barrera, no una garantía: una shell igual puede imprimirlo, y
+los agentes sin hooks (Codex, Cursor) no tienen ninguna barrera. Cuando eso importa, usa
+`env = strict`, que nunca escribe el archivo y solo entrega las variables a los procesos que lances
+con `hilo run`, y guarda las llaves de producción con `hilo env prod`.
 
 ## Comandos
 
@@ -164,7 +168,10 @@ La interfaz de la línea de comandos está en inglés.
 - **Las rutas que ejecutan código** (`.claude/`, `.mcp.json`, `.envrc`, `.vscode/`, `.husky/`, `.github/workflows/`, `Makefile`, los `scripts` de `package.json`, `CLAUDE.md`, `AGENTS.md`) esperan a `hilo approve`, que muestra el diff.
 - **Los secretos nunca se sincronizan como archivos.** Eso incluye archivos de llaves y formatos de token conocidos (AWS, Stripe live, GitHub, llaves privadas).
 - **Las llaves viven en el Keychain de macOS,** y solo el binario firmado de hilo puede leerlas. En Linux viven en `~/.hilo/secrets` con permisos 0600. El socket local nunca devuelve el valor de un secreto.
-- **Dependencias:** lo único que viene de crates es la criptografía, vendorizada y revisada con `cargo vet`.
+- **Criptografía:** X25519 y ChaCha20-Poly1305 vienen de crates fijados y vendorizados (`x25519-dalek`, `chacha20poly1305`). SHA-256, HMAC, HKDF y la máquina de estados de Noise están escritos en este repo y verificados contra FIPS 180-4, RFC 4231, RFC 5869 y el vector de cacophony. Tests de fuzzing deterministas comprueban que se rechazan mensajes del handshake y del transporte alterados, truncados, reordenados o repetidos, que quedarse sin nonces es un error y no una reutilización, y que el decodificador resiste 200.000 entradas mutadas. **Nada de esto tiene una auditoría externa.**
+- **`unsafe`** solo aparece en los bindings del sistema (FSEvents, inotify, el Keychain, `openat`) y en el SHA-256 por hardware. Todo módulo que procesa datos de la red es `#![forbid(unsafe_code)]`.
+- **Cadena de suministro:** `cargo vet` pasa, pero los crates de cripto pasan como excepciones explícitas: no están auditados en este repo. Los crates AEAD de RustCrypto documentan una auditoría de NCC Group (2020); los de dalek no documentan ninguna. `supply-chain/config.toml` dice cuál es cuál.
+- **Verificar una descarga:** el instalador revisa el SHA-256, que detecta una descarga corrupta pero viene del mismo release que el binario. La prueba de origen es la atestación de build de GitHub: el instalador la revisa si `gh` tiene sesión, y `HILO_REQUIRE_ATTESTATION=1` la vuelve obligatoria. A mano: `gh attestation verify hilo-<target>.tar.gz --repo damkandev/hilo`.
 
 ## Configuración
 

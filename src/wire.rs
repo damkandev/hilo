@@ -1,4 +1,5 @@
 //! Hand-rolled binary codec. Frames are length-prefixed and encrypted (see net.rs).
+#![forbid(unsafe_code)]
 use crate::sync::{Data, Hash, Op, Reject};
 use std::io::{self, Read, Write};
 
@@ -257,5 +258,48 @@ mod tests {
         }
         assert_eq!(decode(&[2, 0xff, 0xff]), None);
         assert_eq!(decode(&[13, 0xff, 0xff, 0xff, 0xff]), None);
+    }
+
+    /// Whatever arrives after the MAC check goes through `decode`: it must never panic or
+    /// allocate wildly, and a decoded message must re-encode to the same bytes.
+    #[test]
+    fn decoder_fuzz() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let seeds: Vec<Vec<u8>> = [
+            Msg::Hello { last_seq: 7, name: "mac".into() },
+            Msg::Op(Op { seq: 1, wt: "r:main".into(), path: "a/b.ts".into(), base: [1; 32], new: [2; 32], data: Data::Full(b"x".to_vec()), origin: "m".into(), t_event: 1, t_seq: 2 }),
+            Msg::Lease(Lease { wt: "w".into(), path: "p".into(), session: "s".into(), machine: "m".into(), age_ms: 1, ttl_ms: 2 }),
+            Msg::Peers(vec!["a".into()]),
+            Msg::Time { t0: 1, t1: 2 },
+        ]
+        .iter()
+        .map(encode)
+        .collect();
+        for i in 0..200_000 {
+            let mut b = seeds[i % seeds.len()].clone();
+            match rnd() % 4 {
+                0 => {
+                    let p = (rnd() as usize) % b.len();
+                    b[p] = rnd() as u8;
+                }
+                1 => b.truncate((rnd() as usize) % (b.len() + 1)),
+                2 => b = (0..(rnd() % 64)).map(|_| rnd() as u8).collect(),
+                _ => {
+                    // huge length prefixes must be rejected before allocating
+                    if b.len() > 5 {
+                        b[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+                    }
+                }
+            }
+            if let Some(m) = decode(&b) {
+                assert_eq!(encode(&m), b, "decode/encode mismatch");
+            }
+        }
     }
 }

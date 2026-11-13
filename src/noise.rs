@@ -2,6 +2,7 @@
 //!   -> e
 //!   <- e, ee, s, es
 //!   -> s, se, psk
+#![forbid(unsafe_code)]
 use crate::crypto::{hmac, sha256};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -28,14 +29,15 @@ impl Cipher {
         n[4..].copy_from_slice(&self.n.to_le_bytes());
         n
     }
-    pub fn encrypt(&mut self, ad: &[u8], pt: &[u8]) -> Vec<u8> {
-        let Some(k) = self.k else { return pt.to_vec() };
-        assert!(self.n < u64::MAX, "nonce exhausted"); // never reuse a nonce
-        let ct = ChaCha20Poly1305::new(&k.into())
-            .encrypt(&self.nonce().into(), Payload { msg: pt, aad: ad })
-            .expect("chacha encrypt");
+    /// Fails (instead of ever reusing a nonce) once 2^64-1 messages have gone out.
+    pub fn encrypt(&mut self, ad: &[u8], pt: &[u8]) -> R<Vec<u8>> {
+        let Some(k) = self.k else { return Ok(pt.to_vec()) };
+        if self.n == u64::MAX {
+            return Err(Error);
+        }
+        let ct = ChaCha20Poly1305::new(&k.into()).encrypt(&self.nonce().into(), Payload { msg: pt, aad: ad }).map_err(|_| Error)?;
         self.n += 1;
-        ct
+        Ok(ct)
     }
     pub fn decrypt(&mut self, ad: &[u8], ct: &[u8]) -> R<Vec<u8>> {
         let Some(k) = self.k else { return Ok(ct.to_vec()) };
@@ -81,10 +83,10 @@ impl Symmetric {
         self.mix_hash(&th);
         self.c = Cipher::new(Some(k));
     }
-    fn encrypt_and_hash(&mut self, pt: &[u8]) -> Vec<u8> {
-        let ct = self.c.encrypt(&self.h, pt);
+    fn encrypt_and_hash(&mut self, pt: &[u8]) -> R<Vec<u8>> {
+        let ct = self.c.encrypt(&self.h, pt)?;
         self.mix_hash(&ct);
-        ct
+        Ok(ct)
     }
     fn decrypt_and_hash(&mut self, ct: &[u8]) -> R<Vec<u8>> {
         let pt = self.c.decrypt(&self.h, ct)?;
@@ -142,11 +144,11 @@ impl Handshake {
     }
 
     // ---- initiator ----
-    pub fn write1(&mut self, payload: &[u8]) -> Vec<u8> {
+    pub fn write1(&mut self, payload: &[u8]) -> R<Vec<u8>> {
         let e = self.e_pub();
         self.sym.mix_hash(&e);
         self.sym.mix_key(&e); // psk modifier
-        [&e[..], &self.sym.encrypt_and_hash(payload)].concat()
+        Ok([&e[..], &self.sym.encrypt_and_hash(payload)?].concat())
     }
     pub fn read2(&mut self, mut m: &[u8]) -> R<Vec<u8>> {
         let re = take(&mut m, 32)?;
@@ -163,10 +165,10 @@ impl Handshake {
     }
     pub fn write3(&mut self, payload: &[u8], psk: &[u8; 32]) -> R<Vec<u8>> {
         let s = PublicKey::from(&self.s).to_bytes();
-        let cs = self.sym.encrypt_and_hash(&s);
+        let cs = self.sym.encrypt_and_hash(&s)?;
         self.sym.mix_key(&dh(&self.s, self.re.as_ref().ok_or(Error)?)?); // se
         self.sym.mix_key_and_hash(psk);
-        Ok([cs, self.sym.encrypt_and_hash(payload)].concat())
+        Ok([cs, self.sym.encrypt_and_hash(payload)?].concat())
     }
 
     // ---- responder ----
@@ -184,9 +186,9 @@ impl Handshake {
         self.sym.mix_key(&e);
         self.sym.mix_key(&dh(&self.e, &re)?); // ee
         let s = PublicKey::from(&self.s).to_bytes();
-        let cs = self.sym.encrypt_and_hash(&s);
+        let cs = self.sym.encrypt_and_hash(&s)?;
         self.sym.mix_key(&dh(&self.s, &re)?); // es
-        Ok([&e[..], &cs, &self.sym.encrypt_and_hash(payload)].concat())
+        Ok([&e[..], &cs, &self.sym.encrypt_and_hash(payload)?].concat())
     }
     /// Tries each candidate psk; returns which one matched. Unknown psk => Err.
     pub fn read3(&mut self, mut m: &[u8], psks: &[[u8; 32]]) -> R<(usize, Vec<u8>)> {
@@ -254,7 +256,7 @@ mod tests {
             ("457567656e2042f6686d20766f6e2042617765726b", "7d4e2c3873eef6a213b04e72f9df60a91666072d3544c5d96c34a09e2329b5030bee796741"),
         ];
         let p = |k: usize| unhex(msgs[k].0).unwrap();
-        let m1 = i.write1(&p(0));
+        let m1 = i.write1(&p(0)).unwrap();
         assert_eq!(hex(&m1), msgs[0].1);
         assert_eq!(r.read1(&m1).unwrap(), p(0));
         let m2 = r.write2(&p(1)).unwrap();
@@ -269,20 +271,131 @@ mod tests {
 
         let (mut i_tx, mut i_rx) = i.split();
         let (mut r_rx, mut r_tx) = r.split();
-        let c3 = r_tx.encrypt(&[], &p(3));
+        let c3 = r_tx.encrypt(&[], &p(3)).unwrap();
         assert_eq!(hex(&c3), msgs[3].1);
         assert_eq!(i_rx.decrypt(&[], &c3).unwrap(), p(3));
-        let c4 = i_tx.encrypt(&[], &p(4));
+        let c4 = i_tx.encrypt(&[], &p(4)).unwrap();
         assert_eq!(hex(&c4), msgs[4].1);
         assert_eq!(r_rx.decrypt(&[], &c4).unwrap(), p(4));
-        assert_eq!(hex(&r_tx.encrypt(&[], &p(5))), msgs[5].1);
+        assert_eq!(hex(&r_tx.encrypt(&[], &p(5)).unwrap()), msgs[5].1);
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// Flip, cut, extend or swap bytes of a valid message.
+    fn mutate(rng: &mut Rng, m: &[u8]) -> Vec<u8> {
+        let mut v = m.to_vec();
+        match rng.below(5) {
+            0 if !v.is_empty() => {
+                let i = rng.below(v.len());
+                v[i] ^= 1 << rng.below(8);
+            }
+            1 => v.truncate(rng.below(v.len() + 1)),
+            2 => v.extend((0..1 + rng.below(40)).map(|_| rng.next() as u8)),
+            3 => v = (0..rng.below(200)).map(|_| rng.next() as u8).collect(),
+            _ if v.len() > 1 => {
+                let (a, b) = (rng.below(v.len()), rng.below(v.len()));
+                v.swap(a, b);
+            }
+            _ => v.push(0),
+        }
+        v
+    }
+
+    /// Fuzz the handshake: any change to any message must be refused, and nothing may panic.
+    #[test]
+    fn handshake_refuses_every_tampered_message() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let psk = [5u8; 32];
+        for round in 0..3000 {
+            let mut i = Handshake::new([1; 32], b"p", Some([3; 32]));
+            let mut r = Handshake::new([2; 32], b"p", Some([4; 32]));
+            let m1 = i.write1(b"").unwrap();
+            let which = round % 3;
+            let m1x = if which == 0 { mutate(&mut rng, &m1) } else { m1.clone() };
+            if r.read1(&m1x).is_err() {
+                continue;
+            }
+            let m2 = match r.write2(b"") {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let m2x = if which == 1 { mutate(&mut rng, &m2) } else { m2.clone() };
+            let ok2 = i.read2(&m2x).is_ok();
+            if which == 1 {
+                assert!(!ok2 || m2x == m2, "round {round}: tampered message 2 accepted");
+                continue;
+            }
+            assert!(ok2 || which == 0, "round {round}");
+            if which == 0 {
+                // a tampered first message must not lead to a completed handshake
+                let m3 = i.write3(b"", &psk).unwrap_or_default();
+                assert!(m1x == m1 || r.read3(&m3, &[psk]).is_err(), "round {round}: tampered message 1 accepted");
+                continue;
+            }
+            let m3 = i.write3(b"", &psk).unwrap();
+            let m3x = mutate(&mut rng, &m3);
+            assert!(m3x == m3 || r.read3(&m3x, &[psk]).is_err(), "round {round}: tampered message 3 accepted");
+        }
+    }
+
+    fn pair() -> ((Cipher, Cipher), (Cipher, Cipher)) {
+        let psk = [5u8; 32];
+        let mut i = Handshake::new([1; 32], b"", None);
+        let mut r = Handshake::new([2; 32], b"", None);
+        r.read1(&i.write1(b"").unwrap()).unwrap();
+        i.read2(&r.write2(b"").unwrap()).unwrap();
+        r.read3(&i.write3(b"", &psk).unwrap(), &[psk]).unwrap();
+        (i.split(), r.split())
+    }
+
+    #[test]
+    fn transport_refuses_replay_reorder_and_tampering() {
+        let ((mut tx, _), (mut rx, _)) = pair();
+        let a = tx.encrypt(&[], b"first").unwrap();
+        let b = tx.encrypt(&[], b"second").unwrap();
+        // reordered: the second message can't be read first
+        let mut rx2 = rx.clone();
+        assert!(rx2.decrypt(&[], &b).is_err());
+        assert_eq!(rx.decrypt(&[], &a).unwrap(), b"first");
+        assert!(rx.clone().decrypt(&[], &a).is_err(), "replay accepted");
+        let mut rng = Rng(42);
+        for _ in 0..2000 {
+            let bx = mutate(&mut rng, &b);
+            if bx != b {
+                assert!(rx.clone().decrypt(&[], &bx).is_err(), "tampered frame accepted");
+            }
+        }
+        assert_eq!(rx.decrypt(&[], &b).unwrap(), b"second");
+    }
+
+    #[test]
+    fn nonce_exhaustion_is_an_error_not_a_panic() {
+        let ((mut tx, _), (mut rx, _)) = pair();
+        tx.n = u64::MAX - 1;
+        rx.n = u64::MAX - 1;
+        let last = tx.encrypt(&[], b"last").unwrap();
+        assert!(tx.encrypt(&[], b"one more").is_err());
+        assert_eq!(rx.decrypt(&[], &last).unwrap(), b"last");
+        assert!(rx.decrypt(&[], &last).is_err());
     }
 
     #[test]
     fn wrong_psk_fails() {
         let mut i = Handshake::new([1; 32], b"", None);
         let mut r = Handshake::new([2; 32], b"", None);
-        r.read1(&i.write1(b"")).unwrap();
+        r.read1(&i.write1(b"").unwrap()).unwrap();
         i.read2(&r.write2(b"").unwrap()).unwrap();
         let m3 = i.write3(b"", &[9; 32]).unwrap();
         assert!(r.read3(&m3, &[[0; 32], [8; 32]]).is_err());

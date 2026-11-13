@@ -1,5 +1,6 @@
 //! The env vault. Each repo has a shared layer (encrypted, synced key by key through the anchor
 //! like files) and a local layer (never leaves the machine; `prod` keys only reach `hilo run`).
+#![forbid(unsafe_code)]
 use crate::config;
 use crate::crypto::random;
 use crate::secret;

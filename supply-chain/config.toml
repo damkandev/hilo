@@ -27,10 +27,12 @@ criteria = "safe-to-deploy"
 [[exemptions.chacha20]]
 version = "0.9.1"
 criteria = "safe-to-deploy"
+notes = "Not audited in this repo. The crate documents an external audit by NCC Group (2020, no significant findings): https://research.nccgroup.com/2020/02/26/public-report-rustcrypto-aes-gcm-and-chacha20poly1305-implementation-review/"
 
 [[exemptions.chacha20poly1305]]
 version = "0.10.1"
 criteria = "safe-to-deploy"
+notes = "Not audited in this repo. The crate documents an external audit by NCC Group (2020, no significant findings): https://research.nccgroup.com/2020/02/26/public-report-rustcrypto-aes-gcm-and-chacha20poly1305-implementation-review/"
 
 [[exemptions.cpufeatures]]
 version = "0.2.17"
@@ -43,6 +45,7 @@ criteria = "safe-to-deploy"
 [[exemptions.curve25519-dalek]]
 version = "4.1.3"
 criteria = "safe-to-deploy"
+notes = "Not audited in this repo, and the vendored crate documents no audit. Review before each update."
 
 [[exemptions.curve25519-dalek-derive]]
 version = "0.1.1"
@@ -67,6 +70,7 @@ criteria = "safe-to-deploy"
 [[exemptions.poly1305]]
 version = "0.8.0"
 criteria = "safe-to-deploy"
+notes = "Not audited in this repo. NCC Group audit (2020) per the crate README; it notes the AVX2 backend came later and is not covered: https://research.nccgroup.com/2020/02/26/public-report-rustcrypto-aes-gcm-and-chacha20poly1305-implementation-review/"
 
 [[exemptions.proc-macro2]]
 version = "1.0.107"
@@ -115,6 +119,7 @@ criteria = "safe-to-deploy"
 [[exemptions.x25519-dalek]]
 version = "2.0.1"
 criteria = "safe-to-deploy"
+notes = "Not audited in this repo, and the vendored crate documents no audit. Review before each update."
 
 [[exemptions.zeroize_derive]]
 version = "1.5.0"

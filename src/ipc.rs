@@ -1,6 +1,7 @@
 //! Unix socket between the daemon and the CLI, hooks and MCP. Requests are lists of strings;
 //! replies are (code, text). Lease checks are answered right here from the daemon's copy of the
 //! table, without waiting for the main loop. Nothing on this socket ever returns a secret value.
+#![forbid(unsafe_code)]
 use crate::daemon::{Ev, Shared};
 use crate::lease;
 use crate::wire::{read_frame, write_frame, Msg, Rd, W};

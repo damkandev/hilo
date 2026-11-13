@@ -1,6 +1,7 @@
 //! `hilo hook pre|post|stop`, run by Claude Code with the event as JSON on stdin.
 //! Exit 2 + stderr = Claude Code blocks the tool (pre) or shows the message to the agent.
 //! If the daemon is down, hooks fail open: the anchor's ordering rule still protects every write.
+#![forbid(unsafe_code)]
 use crate::fsops::is_env_name;
 use crate::ipc;
 use crate::json::Json;

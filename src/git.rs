@@ -1,4 +1,5 @@
 //! Everything git, through the system `git` binary. Paths always go after `--` or via stdin.
+#![forbid(unsafe_code)]
 use crate::crypto::{hex, random, sha256};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};

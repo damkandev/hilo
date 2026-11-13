@@ -1,5 +1,6 @@
 //! `hilo mcp`: claim / release / who over MCP (JSON-RPC on stdio) for agents without hooks.
 //! Cooperative: an agent that ignores it is still protected by the anchor's ordering rule.
+#![forbid(unsafe_code)]
 use crate::ipc;
 use crate::json::Json;
 use std::io::{BufRead, Write};

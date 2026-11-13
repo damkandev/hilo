@@ -1,5 +1,6 @@
 //! The per-machine loop: watch worktrees, send changes, apply what the anchor orders,
 //! keep commits, envs and leases in step, and answer the CLI, hooks and MCP over a Unix socket.
+#![forbid(unsafe_code)]
 use crate::anchor::{self, now_ms};
 use crate::config::{self, Config};
 use crate::crypto::{ct_eq, sha256, unhex};

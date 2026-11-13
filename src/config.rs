@@ -1,4 +1,5 @@
 //! ~/.hilo: `config` (key = value), `key`, `peers`, `tokens`. HILO_HOME overrides the location.
+#![forbid(unsafe_code)]
 use crate::crypto::{hex, hkdf, random, unhex};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};

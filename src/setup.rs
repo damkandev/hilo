@@ -1,5 +1,6 @@
 //! `hilo` with no arguments (the wizard) and `hilo setup HOST`: set up the other machine over SSH
 //! and pair this one with it. The join code travels over the SSH connection, so nobody copies it.
+#![forbid(unsafe_code)]
 use crate::config::Config;
 use crate::tui::{self, bold, choice, dim, fg, Progress, CYAN};
 use crate::{config, ipc, Opts};

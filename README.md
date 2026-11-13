@@ -130,7 +130,11 @@ writes safe.
 
 **Envs.** `.env` and `.env.*` never travel as files. Each key lives in a per-repo vault
 (ChaCha20-Poly1305) with a shared layer and a layer that never leaves the machine. hilo writes the
-merged file only where git ignores it, and agents can't read it through their tools.
+merged file only where git ignores it. Claude Code's hooks stop agents from reading it with their
+tools, but that's a barrier, not a guarantee: a shell can still print it, and agents without hooks
+(Codex, Cursor) have no barrier at all. When that matters, set `env = strict` so no file is ever
+written and variables only reach processes started with `hilo run`, and keep production keys in
+`hilo env prod`.
 
 ## Commands
 
@@ -161,7 +165,10 @@ You only need `hilo`. Everything else is there when you want to look or change s
 - **Paths that run code** (`.claude/`, `.mcp.json`, `.envrc`, `.vscode/`, `.husky/`, `.github/workflows/`, `Makefile`, `package.json` scripts, `CLAUDE.md`, `AGENTS.md`) wait for `hilo approve`, which shows the diff.
 - **Secrets never sync as files.** That covers key files and known token formats (AWS, Stripe live, GitHub, private keys).
 - **Keys live in the macOS Keychain,** readable only by the signed hilo binary. On Linux they live in `~/.hilo/secrets` with mode 0600. The local socket never returns a secret value.
-- **Dependencies:** cryptography is the only thing that comes from crates, and those are vendored and checked with `cargo vet`.
+- **Cryptography:** X25519 and ChaCha20-Poly1305 come from pinned, vendored crates (`x25519-dalek`, `chacha20poly1305`). SHA-256, HMAC, HKDF and the Noise state machine are written in this repo and checked against FIPS 180-4, RFC 4231, RFC 5869 and the cacophony vector. Deterministic fuzz tests check that tampered, truncated, reordered and replayed handshake and transport messages are refused, that running out of nonces is an error and not a reuse, and that the decoder survives 200,000 mutated inputs. **None of this has had an external audit.**
+- **`unsafe`** only appears in the system bindings (FSEvents, inotify, the Keychain, `openat`) and the hardware SHA-256 path. Every module that handles network input is `#![forbid(unsafe_code)]`.
+- **Supply chain:** `cargo vet` passes, but the crypto crates pass as explicit exemptions: they aren't audited in this repo. The RustCrypto AEAD crates document an NCC Group audit (2020); the dalek crates document none. `supply-chain/config.toml` says which is which.
+- **Verifying a download:** the installer checks the SHA-256, which catches a corrupt download but comes from the same release as the binary. The proof of origin is the GitHub build attestation: the installer checks it when `gh` is logged in, and `HILO_REQUIRE_ATTESTATION=1` makes it mandatory. By hand: `gh attestation verify hilo-<target>.tar.gz --repo damkandev/hilo`.
 
 ## Configuration
 

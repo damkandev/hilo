@@ -1,6 +1,7 @@
 //! Pure sync logic: the anchor's sequencer and each machine's replica state.
 //! No I/O here, so the deterministic simulation below can hammer it.
 //! Keys are (worktree, path) for files, (worktree, "\0ref") for the branch, ("vault:<repo>", "<file>\n<KEY>") for envs.
+#![forbid(unsafe_code)]
 use crate::crypto::sha256;
 use std::collections::{HashMap, VecDeque};
 

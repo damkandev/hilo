@@ -1,5 +1,6 @@
 //! The anchor: orders every change, keeps the latest version of each key, owns the lease table,
 //! hands out vault keys, and serves catch-up as a list of hashes (machines fetch only what differs).
+#![forbid(unsafe_code)]
 use crate::config::{self, Peer};
 use crate::crypto::{ct_eq, hex};
 use crate::fsops::{excluded, is_env_name, valid_path, MAX_FILE};

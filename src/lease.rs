@@ -1,6 +1,7 @@
 //! Leases: "this agent session is editing this file". Advisory only; the anchor's ordering rule
 //! still protects every write. The anchor owns the table and broadcasts it; every daemon answers
 //! hooks from its own copy, so hooks never wait on the network.
+#![forbid(unsafe_code)]
 use crate::sync::Key;
 use crate::wire::Lease;
 use std::collections::HashMap;

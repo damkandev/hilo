@@ -1,6 +1,7 @@
 #!/bin/sh
 # hilo installer: downloads the release for this machine, checks its SHA-256 (and its GitHub
-# build attestation when `gh` is available), and puts `hilo` on your PATH. Then: hilo init / hilo join.
+# build attestation when `gh` is available; HILO_REQUIRE_ATTESTATION=1 makes that mandatory),
+# and puts `hilo` on your PATH.
 set -eu
 REPO="${HILO_REPO:-damkandev/hilo}"
 VERSION="${HILO_VERSION:-latest}"
@@ -24,8 +25,15 @@ curl -fsSLO "$BASE/SHA256SUMS"
 if command -v sha256sum >/dev/null; then grep " hilo-$T.tar.gz\$" SHA256SUMS | sha256sum -c - >/dev/null
 else grep " hilo-$T.tar.gz\$" SHA256SUMS | shasum -a 256 -c - >/dev/null; fi
 echo "hilo: checksum ok"
+# The checksum comes from the same release as the binary: it catches corruption, not a tampered
+# release. The build attestation (signed by GitHub for this repo's workflow) is what proves origin.
 if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-  gh attestation verify "hilo-$T.tar.gz" --repo "$REPO" >/dev/null && echo "hilo: build attestation ok"
+  gh attestation verify "hilo-$T.tar.gz" --repo "$REPO" >/dev/null && echo "hilo: build attestation ok (built by $REPO's release workflow)"
+elif [ "${HILO_REQUIRE_ATTESTATION:-0}" = 1 ]; then
+  echo "hilo: HILO_REQUIRE_ATTESTATION=1 needs the GitHub CLI (gh), logged in" >&2
+  exit 1
+else
+  echo "hilo: note: build attestation not checked (no gh). To check it: gh attestation verify hilo-$T.tar.gz --repo $REPO"
 fi
 tar -xzf "hilo-$T.tar.gz"
 mkdir -p "$DEST"

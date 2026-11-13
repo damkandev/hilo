@@ -1,5 +1,6 @@
 //! TCP + Noise. One reader and one writer thread per connection.
 //! Messages above 60 KB go out in chunks; small changes to other files overtake them.
+#![forbid(unsafe_code)]
 use crate::noise::{Cipher, Handshake};
 use crate::wire::{self, Msg, MAX_FRAME, MAX_MSG};
 use std::collections::VecDeque;
@@ -146,7 +147,7 @@ pub fn dial(addr: &str) -> io::Result<TcpStream> {
 pub fn initiate(s: &mut TcpStream, key: [u8; 32], psk: &[u8; 32]) -> io::Result<(Cipher, Cipher, [u8; 32])> {
     s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let mut hs = Handshake::new(key, PROLOGUE, None);
-    wire::write_frame(s, &hs.write1(&[]))?;
+    wire::write_frame(s, &hs.write1(&[]).map_err(bad)?)?;
     hs.read2(&wire::read_frame(s, MAX_FRAME)?).map_err(bad)?;
     wire::write_frame(s, &hs.write3(&[], psk).map_err(bad)?)?;
     let (tx, rx) = hs.split();
@@ -169,7 +170,8 @@ fn send_part(s: &mut TcpStream, c: &mut Cipher, kind: u8, payload: &[u8]) -> io:
     let mut pt = Vec::with_capacity(payload.len() + 1);
     pt.push(kind);
     pt.extend_from_slice(payload);
-    wire::write_frame(s, &c.encrypt(&[], &pt))
+    let ct = c.encrypt(&[], &pt).map_err(|_| io::Error::other("nonce space exhausted: reconnect"))?;
+    wire::write_frame(s, &ct)
 }
 
 /// Blocking send of one message (used before the writer thread exists).

@@ -1,5 +1,6 @@
 //! Finds what changed in a worktree: either a full walk (startup, every 30 s, or the plan-B poll)
 //! or just the paths the watcher / a hook reported. Compares (mtime, size, inode) before reading.
+#![forbid(unsafe_code)]
 use crate::crypto::{hex, sha256};
 use crate::fsops::{self, has_secret, is_dotgit, is_env_name, is_secret, Stamp, MAX_FILE, TMP_PREFIX};
 use crate::git::Ignore;
