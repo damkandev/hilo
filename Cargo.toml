@@ -1,0 +1,17 @@
+[package]
+name = "hilo"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Keeps the same code alive on all your machines while your agents work."
+
+# Only crypto comes from crates (see PRD: "Rust sin librerías"). Everything else is std.
+[dependencies]
+x25519-dalek = { version = "=2.0.1", features = ["static_secrets"] }
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "unwind" # per-connection threads must survive a panic

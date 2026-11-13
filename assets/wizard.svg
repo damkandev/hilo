@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="678" height="720" viewBox="0 0 678 720" role="img" aria-label="The hilo setup wizard pairing a Mac with a server called devbox">
+<defs><linearGradient id="t" x1="0" x2="1"><stop offset="0" stop-color="#2563eb"/><stop offset=".5" stop-color="#22d3ee"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs>
+<rect width="678" height="720" rx="10" fill="#0d1117"/>
+<rect x=".5" y=".5" width="677" height="719" rx="10" fill="none" stroke="#30363d"/>
+<line x1="0" y1="34" x2="678" y2="34" stroke="#21262d"/>
+<circle cx="18" cy="17.0" r="6" fill="#ff5f57"/>
+<circle cx="38" cy="17.0" r="6" fill="#febc2e"/>
+<circle cx="58" cy="17.0" r="6" fill="#28c840"/>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#c9d1d9" xml:space="preserve">
+<text x="22.0" y="67" fill="#8b949e">$</text>
+<text x="37.7" y="67" textLength="31.3" lengthAdjust="spacing" fill="#e6edf3">hilo</text>
+<text x="37.7" y="105" fill="#2563eb">●</text>
+<linearGradient id="g2_45" gradientUnits="userSpaceOnUse" x1="45.5" x2="311.7"><stop offset="0" stop-color="#2563eb"/><stop offset=".5" stop-color="#22d3ee"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
+<text x="45.5" y="105" textLength="266.2" lengthAdjust="spacing" fill="url(#g2_45)">──────────────────────────────────</text>
+<linearGradient id="g2_311" gradientUnits="userSpaceOnUse" x1="311.7" x2="319.5"><stop offset="0" stop-color="#2563eb"/><stop offset=".5" stop-color="#22d3ee"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
+<text x="311.7" y="105" fill="url(#g2_311)">●</text>
+<linearGradient id="g4_37" gradientUnits="userSpaceOnUse" x1="37.7" x2="69.0"><stop offset="0" stop-color="#2563eb"/><stop offset=".5" stop-color="#22d3ee"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
+<text x="37.7" y="143" textLength="31.3" lengthAdjust="spacing" fill="url(#g4_37)" font-weight="700">hilo</text>
+<text x="84.6" y="143" textLength="313.2" lengthAdjust="spacing" fill="#8b949e">the same code, live on all your machines</text>
+<text x="22.0" y="181" fill="#4ade80">✔</text>
+<text x="37.7" y="181" textLength="258.4" lengthAdjust="spacing" font-weight="700">Which folder should stay in sync?</text>
+<text x="303.9" y="181" fill="#8b949e">…</text>
+<text x="319.5" y="181" textLength="47.0" lengthAdjust="spacing" fill="#22d3ee">~/code</text>
+<text x="37.7" y="200" textLength="391.5" lengthAdjust="spacing" fill="#8b949e">7 repos: api, web, mobile, landing, docs, infra +1</text>
+<text x="22.0" y="219" fill="#4ade80">✔</text>
+<text x="37.7" y="219" textLength="219.2" lengthAdjust="spacing" font-weight="700">Where is your other machine?</text>
+<text x="264.7" y="219" fill="#8b949e">…</text>
+<text x="280.4" y="219" textLength="47.0" lengthAdjust="spacing" fill="#22d3ee">devbox</text>
+<text x="22.0" y="238" fill="#4ade80">✔</text>
+<text x="37.7" y="238" textLength="375.8" lengthAdjust="spacing" >connected to devbox — Ubuntu 26.04.1 LTS, x86_64</text>
+<text x="421.3" y="238" textLength="31.3" lengthAdjust="spacing" fill="#8b949e">1.0s</text>
+<text x="22.0" y="257" fill="#4ade80">✔</text>
+<text x="37.7" y="257" textLength="133.1" lengthAdjust="spacing" font-weight="700">Folder on devbox?</text>
+<text x="178.6" y="257" fill="#8b949e">…</text>
+<text x="194.3" y="257" textLength="47.0" lengthAdjust="spacing" fill="#22d3ee">~/code</text>
+<text x="37.7" y="295" textLength="47.0" lengthAdjust="spacing" font-weight="700">~/code</text>
+<text x="100.3" y="295" fill="#22d3ee">⇄</text>
+<text x="123.8" y="295" textLength="101.8" lengthAdjust="spacing" font-weight="700">devbox:~/code</text>
+<text x="37.7" y="314" textLength="618.6" lengthAdjust="spacing" fill="#8b949e">devbox becomes the anchor (10.0.0.12:7710); hilo runs in the background on both</text>
+<text x="22.0" y="352" fill="#4ade80">✔</text>
+<text x="37.7" y="352" textLength="78.3" lengthAdjust="spacing" font-weight="700">Set it up?</text>
+<text x="123.8" y="352" fill="#8b949e">…</text>
+<text x="139.4" y="352" textLength="23.5" lengthAdjust="spacing" fill="#22d3ee">Yes</text>
+<text x="22.0" y="390" fill="#4ade80">✔</text>
+<text x="37.7" y="390" textLength="234.9" lengthAdjust="spacing" >hilo 0.2.0 installed on devbox</text>
+<text x="280.4" y="390" textLength="31.3" lengthAdjust="spacing" fill="#8b949e">2.9s</text>
+<text x="22.0" y="409" fill="#4ade80">✔</text>
+<text x="37.7" y="409" textLength="297.5" lengthAdjust="spacing" >devbox is the anchor at 10.0.0.12:7710</text>
+<text x="343.0" y="409" textLength="31.3" lengthAdjust="spacing" fill="#8b949e">1.2s</text>
+<text x="22.0" y="428" fill="#4ade80">✔</text>
+<text x="37.7" y="428" textLength="211.4" lengthAdjust="spacing" >10.0.0.12:7710 is reachable</text>
+<text x="256.9" y="428" textLength="31.3" lengthAdjust="spacing" fill="#8b949e">0.1s</text>
+<text x="22.0" y="447" fill="#4ade80">✔</text>
+<text x="37.7" y="447" textLength="289.7" lengthAdjust="spacing" >this machine is paired; ~/code linked</text>
+<text x="335.2" y="447" textLength="31.3" lengthAdjust="spacing" fill="#8b949e">0.8s</text>
+<text x="22.0" y="466" fill="#4ade80">✔</text>
+<text x="37.7" y="466" textLength="258.4" lengthAdjust="spacing" >in sync: 7 repos on both machines</text>
+<text x="303.9" y="466" textLength="31.3" lengthAdjust="spacing" fill="#8b949e">1.5s</text>
+<linearGradient id="g24_53" gradientUnits="userSpaceOnUse" x1="53.3" x2="170.8"><stop offset="0" stop-color="#2563eb"/><stop offset=".5" stop-color="#22d3ee"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
+<text x="53.3" y="523" textLength="117.5" lengthAdjust="spacing" fill="url(#g24_53)" font-weight="700">hilo is running</text>
+<text x="186.4" y="523" textLength="172.3" lengthAdjust="spacing" fill="#8b949e">on this machine and on</text>
+<text x="366.5" y="523" textLength="47.0" lengthAdjust="spacing" font-weight="700">devbox</text>
+<text x="53.3" y="561" textLength="47.0" lengthAdjust="spacing" >~/code</text>
+<text x="116.0" y="561" fill="#22d3ee">⇄</text>
+<text x="139.5" y="561" textLength="101.8" lengthAdjust="spacing" >devbox:~/code</text>
+<text x="53.3" y="599" textLength="516.8" lengthAdjust="spacing" fill="#8b949e">New repos in that folder appear on the other machine on their own.</text>
+<text x="53.3" y="618" textLength="477.6" lengthAdjust="spacing" fill="#8b949e">Agents get told before they collide; .env files follow along.</text>
+<text x="53.3" y="656" textLength="86.1" lengthAdjust="spacing" fill="#22d3ee">hilo status</text>
+<text x="162.9" y="656" textLength="148.8" lengthAdjust="spacing" fill="#8b949e">see what&#x27;s going on</text>
+<text x="53.3" y="675" textLength="94.0" lengthAdjust="spacing" fill="#22d3ee">hilo add DIR</text>
+<text x="162.9" y="675" textLength="148.8" lengthAdjust="spacing" fill="#8b949e">link another folder</text>
+</g>
+<rect x="37.7" y="496.9" width="548.1" height="190.0" rx="8" fill="none" stroke="#22d3ee" stroke-width="1.2"/>
+</svg>

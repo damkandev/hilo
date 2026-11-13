@@ -1,0 +1,28 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [macos-14, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      HILO_KEYCHAIN: "0"
+      HILO_NOTIFY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --global user.email ci@hilo && git config --global user.name ci
+      # vendored crates only: the build never touches the network
+      - run: cargo test --release --offline --locked
+      - run: cargo build --release --offline --locked && ls -la target/release/hilo
+
+  vet:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-vet --locked
+      - run: cargo vet --locked

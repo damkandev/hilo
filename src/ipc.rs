@@ -1,0 +1,147 @@
+//! Unix socket between the daemon and the CLI, hooks and MCP. Requests are lists of strings;
+//! replies are (code, text). Lease checks are answered right here from the daemon's copy of the
+//! table, without waiting for the main loop. Nothing on this socket ever returns a secret value.
+use crate::daemon::{Ev, Shared};
+use crate::lease;
+use crate::wire::{read_frame, write_frame, Msg, Rd, W};
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::Arc;
+use std::time::Duration;
+
+pub fn socket_path() -> PathBuf {
+    let p = crate::config::path("hilo.sock");
+    if p.as_os_str().len() < 100 {
+        return p;
+    }
+    // sun_path is ~104 bytes on macOS: deep HILO_HOMEs get a short, stable name instead
+    let h = crate::crypto::hex(&crate::crypto::sha256(p.as_os_str().as_encoded_bytes()));
+    std::env::temp_dir().join(format!("hilo-{}.sock", &h[..12]))
+}
+
+fn encode(args: &[String]) -> Vec<u8> {
+    let mut w = W::default();
+    w.u32(args.len() as u32);
+    for a in args {
+        w.str(a);
+    }
+    w.0
+}
+
+fn decode(b: &[u8]) -> Option<Vec<String>> {
+    let mut r = Rd(b);
+    let n = r.u32()? as usize;
+    (0..n.min(64)).map(|_| r.str()).collect()
+}
+
+pub fn serve(sh: Arc<Shared>, tx: Sender<Ev>) -> io::Result<()> {
+    let p = socket_path();
+    let _ = std::fs::remove_file(&p);
+    let l = UnixListener::bind(&p)?;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            let (sh, tx) = (sh.clone(), tx.clone());
+            std::thread::spawn(move || {
+                let _ = handle(s, &sh, &tx);
+            });
+        }
+    });
+    Ok(())
+}
+
+fn with_notices(sh: &Shared, session: &str, code: u8, text: String) -> (u8, String) {
+    let n = sh.notices_for(session);
+    if n.is_empty() {
+        return (code, text);
+    }
+    let mut all: Vec<String> = n;
+    if !text.is_empty() {
+        all.insert(0, text);
+    }
+    (2, all.join("\n\n"))
+}
+
+fn handle(mut s: UnixStream, sh: &Shared, tx: &Sender<Ev>) -> io::Result<()> {
+    s.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let req = decode(&read_frame(&mut s, 1 << 20)?).ok_or_else(|| io::Error::other("bad request"))?;
+    let a: Vec<&str> = req.iter().map(String::as_str).collect();
+    let (code, text) = match a.as_slice() {
+        // PreToolUse: may this session edit that file?
+        ["claim", session, path] => match sh.locate(Path::new(path)) {
+            None => with_notices(sh, session, 0, String::new()),
+            Some((wt, rel)) => {
+                let mut t = sh.leases.lock().unwrap();
+                match t.holder(&wt, &rel) {
+                    Some(e) if e.session != *session => (2, lease::busy_message(&rel, e)),
+                    _ => {
+                        t.claim(&wt, &rel, session, &sh.name); // optimistic; the anchor has the last word
+                        drop(t);
+                        sh.send(Msg::Claim { wt, path: rel, session: session.to_string() });
+                        with_notices(sh, session, 0, String::new())
+                    }
+                }
+            }
+        },
+        // PostToolUse: renew, remember who wrote it, and sync it now (no watcher delay)
+        ["touch", session, path] => {
+            if let Some((wt, rel)) = sh.locate(Path::new(path)) {
+                sh.leases.lock().unwrap().claim(&wt, &rel, session, &sh.name);
+                sh.authors.lock().unwrap().insert((wt.clone(), rel.clone()), session.to_string());
+                sh.send(Msg::Claim { wt, path: rel, session: session.to_string() });
+                let _ = tx.send(Ev::Touched(PathBuf::from(path)));
+            }
+            with_notices(sh, session, 0, String::new())
+        }
+        ["release", session, rest @ ..] => {
+            let (wt, rel) = match rest.first().and_then(|p| sh.locate(Path::new(p))) {
+                Some(x) => x,
+                None if rest.is_empty() => (String::new(), String::new()),
+                None => return reply(&mut s, 0, String::new()),
+            };
+            sh.leases.lock().unwrap().release(&wt, &rel, session);
+            sh.send(Msg::Release { wt, path: rel, session: session.to_string() });
+            with_notices(sh, session, 0, String::new())
+        }
+        ["who", path] => match sh.locate(Path::new(path)) {
+            None => (0, format!("{path} is not in a synced worktree")),
+            Some((wt, rel)) => match sh.leases.lock().unwrap().holder(&wt, &rel) {
+                None => (0, format!("{rel}: free")),
+                Some(e) => (0, lease::busy_message(&rel, e)),
+            },
+        },
+        _ => {
+            let (rtx, rrx) = channel();
+            tx.send(Ev::Ipc(req.clone(), rtx)).map_err(|_| io::Error::other("daemon stopping"))?;
+            rrx.recv_timeout(Duration::from_secs(60)).unwrap_or((1, "daemon busy".into()))
+        }
+    };
+    reply(&mut s, code, text)
+}
+
+fn reply(s: &mut UnixStream, code: u8, text: String) -> io::Result<()> {
+    let mut w = W::default();
+    w.u8(code).str(&text);
+    write_frame(s, &w.0)
+}
+
+/// Sends a request to the local daemon.
+pub fn call(args: &[String], timeout: Duration) -> io::Result<(u8, String)> {
+    let mut s = UnixStream::connect(socket_path())?;
+    s.set_read_timeout(Some(timeout))?;
+    s.set_write_timeout(Some(timeout))?;
+    write_frame(&mut s, &encode(args))?;
+    let f = read_frame(&mut s, 64 << 20)?;
+    let mut r = Rd(&f);
+    match (r.u8(), r.str()) {
+        (Some(c), Some(t)) => Ok((c, t)),
+        _ => Err(io::Error::other("bad reply")),
+    }
+}
+
+pub fn args(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
