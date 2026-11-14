@@ -1,12 +1,5 @@
 <p align="center">
-  <img src="assets/icon.svg" width="72" height="72" alt="">
-</p>
-
-<h1 align="center">hilo</h1>
-
-<p align="center">
-  The same code, live on all your machines, while your agents work.<br>
-  No push, no pull, no copying <code>.env</code> files around.
+  <img src="assets/banner.png" width="100%" alt="hilo. The same code, live on all your machines. No push, no pull, no copying .env files around.">
 </p>
 
 <p align="center">
