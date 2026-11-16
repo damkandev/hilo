@@ -146,23 +146,22 @@ pub fn dial(addr: &str) -> io::Result<TcpStream> {
 /// Returns (send, recv, remote static key).
 pub fn initiate(s: &mut TcpStream, key: [u8; 32], psk: &[u8; 32]) -> io::Result<(Cipher, Cipher, [u8; 32])> {
     s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let mut hs = Handshake::new(key, PROLOGUE, None);
+    let mut hs = Handshake::new(key, PROLOGUE, true, None).map_err(bad)?;
     wire::write_frame(s, &hs.write1(&[]).map_err(bad)?)?;
     hs.read2(&wire::read_frame(s, MAX_FRAME)?).map_err(bad)?;
     wire::write_frame(s, &hs.write3(&[], psk).map_err(bad)?)?;
-    let (tx, rx) = hs.split();
-    Ok((tx, rx, hs.rs.unwrap()))
+    hs.split().map_err(bad)
 }
 
 /// Returns (send, recv, remote static key, index of the psk that matched).
 pub fn respond(s: &mut TcpStream, key: [u8; 32], psks: &[[u8; 32]]) -> io::Result<(Cipher, Cipher, [u8; 32], usize)> {
     s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let mut hs = Handshake::new(key, PROLOGUE, None);
+    let mut hs = Handshake::new(key, PROLOGUE, false, None).map_err(bad)?;
     hs.read1(&wire::read_frame(s, MAX_FRAME)?).map_err(bad)?;
     wire::write_frame(s, &hs.write2(&[]).map_err(bad)?)?;
     let (i, _) = hs.read3(&wire::read_frame(s, MAX_FRAME)?, psks).map_err(bad)?;
-    let (rx, tx) = hs.split();
-    Ok((tx, rx, hs.rs.unwrap(), i))
+    let (tx, rx, rs) = hs.split().map_err(bad)?;
+    Ok((tx, rx, rs, i))
 }
 
 // Plaintext of each frame: [kind][payload]. 0 = whole message, 1 = chunk with more to come, 2 = last chunk.
@@ -170,7 +169,7 @@ fn send_part(s: &mut TcpStream, c: &mut Cipher, kind: u8, payload: &[u8]) -> io:
     let mut pt = Vec::with_capacity(payload.len() + 1);
     pt.push(kind);
     pt.extend_from_slice(payload);
-    let ct = c.encrypt(&[], &pt).map_err(|_| io::Error::other("nonce space exhausted: reconnect"))?;
+    let ct = c.encrypt(&pt).map_err(|_| io::Error::other("nonce space exhausted: reconnect"))?;
     wire::write_frame(s, &ct)
 }
 
@@ -269,7 +268,7 @@ pub fn recv(s: &mut TcpStream, c: &mut Cipher) -> io::Result<Msg> {
     let mut buf: Vec<u8> = vec![];
     loop {
         let f = wire::read_frame(s, MAX_FRAME)?;
-        let pt = c.decrypt(&[], &f).map_err(|_| bad("bad mac"))?;
+        let pt = c.decrypt(&f).map_err(|_| bad("bad mac"))?;
         let (&kind, payload) = pt.split_first().ok_or_else(|| bad("empty frame"))?;
         if kind == 0 && buf.is_empty() {
             return wire::decode(payload).ok_or_else(|| bad("bad message"));

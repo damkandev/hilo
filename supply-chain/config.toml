@@ -10,6 +10,9 @@ url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-c
 [imports.google]
 url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
 
+[imports.isrg]
+url = "https://raw.githubusercontent.com/divviup/libprio-rs/main/supply-chain/audits.toml"
+
 [imports.mozilla]
 url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
 
@@ -51,20 +54,22 @@ notes = "Not audited in this repo, and the vendored crate documents no audit. Re
 version = "0.1.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.fiat-crypto]]
-version = "0.2.9"
+[[exemptions.digest]]
+version = "0.10.7"
 criteria = "safe-to-deploy"
+notes = "Not audited in this repo. Traits and buffering glue under sha2/hmac; ISRG audited 0.9.0 (imported), not this version."
 
 [[exemptions.generic-array]]
 version = "0.14.7"
 criteria = "safe-to-deploy"
 
+[[exemptions.hkdf]]
+version = "0.12.4"
+criteria = "safe-to-deploy"
+notes = "Not audited in this repo, and the vendored crate documents no audit. Small (RFC 5869 on top of hmac, which ISRG audited); checked here against the RFC 5869 vector."
+
 [[exemptions.libc]]
 version = "0.2.191"
-criteria = "safe-to-deploy"
-
-[[exemptions.opaque-debug]]
-version = "0.3.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.poly1305]]
@@ -88,9 +93,10 @@ criteria = "safe-to-deploy"
 version = "1.0.229"
 criteria = "safe-to-deploy"
 
-[[exemptions.subtle]]
-version = "2.6.1"
+[[exemptions.snow]]
+version = "0.10.0"
 criteria = "safe-to-deploy"
+notes = "Not audited in this repo. Its README says it 'has not received any formal audit'. Only its handshake/transport state machine is used here; the primitives come from its default resolver (curve25519-dalek, chacha20poly1305, sha2). Checked here against the cacophony vector for Noise_XXpsk3_25519_ChaChaPoly_SHA256. Review before each update."
 
 [[exemptions.syn]]
 version = "2.0.119"
@@ -106,10 +112,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.unicode-ident]]
 version = "1.0.27"
-criteria = "safe-to-deploy"
-
-[[exemptions.universal-hash]]
-version = "0.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.version_check]]

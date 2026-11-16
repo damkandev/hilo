@@ -9,6 +9,14 @@ description = "Keeps the same code alive on all your machines while your agents 
 [dependencies]
 x25519-dalek = { version = "=2.0.1", features = ["static_secrets"] }
 chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+sha2 = { version = "=0.10.9", default-features = false }
+hkdf = { version = "=0.12.4", default-features = false }
+# Noise with snow's own resolver for 25519 / ChaChaPoly / SHA256 (same dalek and RustCrypto crates as above).
+# No getrandom: the RNG is /dev/urandom (noise.rs), like everywhere else in hilo.
+snow = { version = "=0.10.0", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-sha2"] }
+
+[dev-dependencies]
+hmac = { version = "=0.12.1", default-features = false } # RFC 4231 test only; hkdf uses it underneath
 
 [profile.release]
 strip = true

@@ -3,6 +3,13 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/damkandev/hilo/actions/workflows/ci.yml"><img src="https://github.com/damkandev/hilo/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/damkandev/hilo/releases/latest"><img src="https://img.shields.io/github/v/release/damkandev/hilo" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="macOS and Linux">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+</p>
+
+<p align="center">
   <b>English</b> · <a href="README.es.md">Español</a>
 </p>
 
@@ -45,6 +52,8 @@ hilo init --listen 10.0.0.12:7710      # on the machine the others can reach
 hilo join HILO-7KQ2-M9PA-XR4T@10.0.0.12:7710   # on every other machine
 ```
 
+See [Deployment](docs/deployment.md) for addresses, services and platforms.
+
 </details>
 
 ## What you get
@@ -57,40 +66,7 @@ hilo join HILO-7KQ2-M9PA-XR4T@10.0.0.12:7710   # on every other machine
 | **Branches and commits** | Commits travel with the files, branches move on every machine, and a new worktree on one machine appears on the others. |
 | **New repos on their own** | `git init` a repo in a linked folder, make the first commit, and it shows up on the other machine with its history and uncommitted files. |
 | **`.env` without copying** | Variables are encrypted, synced key by key, and written into every worktree that needs them. Keys can stay per machine or production-only. |
-
-## Cloud agents
-
-Agents that run in someone else's sandbox (Claude Code on the web, Codex, Cursor background agents,
-Codespaces, Gitpod, Coder, dev containers) can join too. Each sandbox joins as its own short-lived
-machine, and the branch it works on shows up on your Mac **while it works**, before anything is
-pushed.
-
-On the anchor, make a token (or run `hilo` and pick **Let cloud agents in**):
-
-```sh
-hilo token create --addr hilo.example.com:7710        # add --env to share .env values with them
-```
-
-Then, on the platform:
-
-1. add the token as a secret: `HILO_TOKEN=HILO-CLOUD-…@hilo.example.com:7710`
-2. add one line to its setup script:
-
-   ```sh
-   curl -fsSL https://raw.githubusercontent.com/damkandev/hilo/main/install.sh | sh -s -- up
-   ```
-
-`hilo up` joins with the token, links the repo it's run in, starts the daemon in the background (no
-service manager needed) and waits until it's in sync. Sandboxes that can only reach the internet
-through a proxy work as they are: hilo goes through `HTTPS_PROXY` or `ALL_PROXY` (HTTP CONNECT or
-SOCKS5), so Tailscale in userspace mode works too.
-
-| | |
-| --- | --- |
-| **Reachability** | The sandbox has to reach the anchor: use a VPS as anchor, a port forward, or a domain, and allow it in the platform's network settings. If the platform cuts the network once setup ends, hilo only syncs during setup. |
-| **Same repo, any clone** | A repo is its first commit plus `owner/repo`, so a clone made through the platform's git proxy is still the same repo. |
-| **Secrets** | Without `--env` a sandbox never gets the vault keys. With it, it gets the shared layer; `hilo env prod` keys never leave your machine. |
-| **Cleanup** | Sandboxes that haven't connected in 7 days are forgotten. `hilo token revoke ID` cuts every sandbox that used the token at once. |
+| **Cloud agents too** | Claude Code on the web, Codex, Cursor and Codespaces sandboxes join with a token, and their branch shows up on your Mac while they work. [How →](docs/cloud-agents.md) |
 
 ## How it works
 
@@ -101,93 +77,30 @@ SOCKS5), so Tailscale in userspace mode works too.
   </picture>
 </p>
 
-**One anchor.** One machine, usually the server, gives every change a sequence number. The others
-open an outgoing, encrypted connection to it, so nothing needs an open port at home. With a single
-orderer every machine sees changes in the same order and converges, without clocks or CRDTs.
+One machine, the **anchor**, gives every change a sequence number; the others connect to it over an
+encrypted, outgoing connection. A write carries the hash of the version it was based on, and the
+anchor accepts only the first write on each version. The loser's edit is never merged or dropped:
+it's saved on a conflict branch. [Read more →](docs/architecture.md)
 
-**The rule.** A write travels with the hash of the version its writer had. The anchor accepts the
-first write on a version and rejects the rest. hilo never merges two edits: the machine that lost
-saves its version on a conflict branch, with `git commit-tree` so the worktree isn't touched, and
-takes the winner. A deterministic simulation (3 machines, 400,000 random steps with dropped
-connections) checks that nothing is ever overwritten before it's saved.
+## Documentation
 
-**Live branches, not folders.** A worktree is identified by its repo and branch, not its path:
-`~/code/x` on one machine and `/srv/x` on another are the same repo if they share their first commit
-and `origin`. Commits travel as git bundles, after their files, and the other machines move the
-branch with `git reset --mixed`, so the worktree stays clean.
-
-**Leases.** Claude Code's `PreToolUse` hook takes a 120-second lease on the file. The anchor broadcasts
-the lease table, so the hook answers from the local daemon in a few milliseconds. Agents without
-hooks use `claim`, `release` and `who` over MCP. Leases only warn; the rule above is what keeps
-writes safe.
-
-**Envs.** `.env` and `.env.*` never travel as files. Each key lives in a per-repo vault
-(ChaCha20-Poly1305) with a shared layer and a layer that never leaves the machine. hilo writes the
-merged file only where git ignores it. Claude Code's hooks stop agents from reading it with their
-tools, but that's a barrier, not a guarantee: a shell can still print it, and agents without hooks
-(Codex, Cursor) have no barrier at all. When that matters, set `env = strict` so no file is ever
-written and variables only reach processes started with `hilo run`, and keep production keys in
-`hilo env prod`.
-
-## Commands
-
-You only need `hilo`. Everything else is there when you want to look or change something.
-
-| Command | |
+| | |
 | --- | --- |
-| `hilo` | the wizard; on a machine that's set up, a menu |
-| `hilo status [--latency]` | machines online, linked folders, leases, conflicts, waiting approvals, p50/p95 latency |
-| `hilo add DIR` | link another folder (or a single repo) |
-| `hilo env set KEY=value` · `unset KEY` | change a variable everywhere (`--file apps/web/.env` in monorepos) |
-| `hilo env local KEY` | every machine keeps its own value, e.g. `DATABASE_URL` |
-| `hilo env prod KEY` | only on this machine, only reachable through `hilo run` |
-| `hilo env ls` · `history [KEY]` · `revert KEY [N]` | layers, the last 50 versions per file, going back |
-| `hilo run -- npm run dev` | run with the variables, without writing any file |
-| `hilo approve [PATH \| --all \| --deny PATH]` | review a remote change to a path that runs code |
-| `hilo trust MACHINE read-only` | that machine may read from this one but not write to it |
-| `hilo invite` · `hilo unpair MACHINE` | a new join code · cut a machine off and rotate the vault key |
-| `hilo token create` · `ls` · `revoke ID` | reusable tokens for cloud sandboxes |
-| `hilo up` | in a sandbox's setup script: join, link, start, wait until in sync |
-| `hilo uninstall` | remove the service, hooks and config; your repos stay plain git repos |
+| [Architecture](docs/architecture.md) | the anchor, the write rule, live branches, leases, the `.env` vault |
+| [Cloud agents](docs/cloud-agents.md) | tokens, `hilo up`, proxies, what a sandbox can see |
+| [Commands and configuration](docs/commands.md) | every command, `~/.hilo/config`, environment variables |
+| [Deployment](docs/deployment.md) | choosing the anchor, addresses, background services, files, platforms |
+| [Security](SECURITY.md) | network, files, keys, cryptography, supply chain, verifying downloads, reporting |
+| [Contributing](CONTRIBUTING.md) | building, testing, CI and releases |
 
-## Security
+## Status
 
-- **Pairing:** a single-use, 10-minute code mixed into a `Noise_XXpsk3_25519_ChaChaPoly_SHA256` handshake, tested against the official cacophony vectors. After pairing, only known keys connect, and each side pins the other's key.
-- **The anchor** listens only on the private address you choose. A public one needs `--public`. Before a peer authenticates: a 1 MiB frame cap, a 5-second handshake timeout and at most 16 pending connections.
-- **Every receiver checks every path itself.** It refuses `.git` in any case or Unicode disguise, opens each parent with `openat(O_NOFOLLOW)`, creates temp files with `O_EXCL`, never sets setuid, and refuses names that collide on a case-insensitive disk.
-- **Paths that run code** (`.claude/`, `.mcp.json`, `.envrc`, `.vscode/`, `.husky/`, `.github/workflows/`, `Makefile`, `package.json` scripts, `CLAUDE.md`, `AGENTS.md`) wait for `hilo approve`, which shows the diff.
-- **Secrets never sync as files.** That covers key files and known token formats (AWS, Stripe live, GitHub, private keys).
-- **Keys live in the macOS Keychain,** readable only by the signed hilo binary. On Linux they live in `~/.hilo/secrets` with mode 0600. The local socket never returns a secret value.
-- **Cryptography:** X25519 and ChaCha20-Poly1305 come from pinned, vendored crates (`x25519-dalek`, `chacha20poly1305`). SHA-256, HMAC, HKDF and the Noise state machine are written in this repo and checked against FIPS 180-4, RFC 4231, RFC 5869 and the cacophony vector. Deterministic fuzz tests check that tampered, truncated, reordered and replayed handshake and transport messages are refused, that running out of nonces is an error and not a reuse, and that the decoder survives 200,000 mutated inputs. **None of this has had an external audit.**
-- **`unsafe`** only appears in the system bindings (FSEvents, inotify, the Keychain, `openat`) and the hardware SHA-256 path. Every module that handles network input is `#![forbid(unsafe_code)]`.
-- **Supply chain:** `cargo vet` passes, but the crypto crates pass as explicit exemptions: they aren't audited in this repo. The RustCrypto AEAD crates document an NCC Group audit (2020); the dalek crates document none. `supply-chain/config.toml` says which is which.
-- **Verifying a download:** the installer checks the SHA-256, which catches a corrupt download but comes from the same release as the binary. The proof of origin is the GitHub build attestation: the installer checks it when `gh` is logged in, and `HILO_REQUIRE_ATTESTATION=1` makes it mandatory. By hand: `gh attestation verify hilo-<target>.tar.gz --repo damkandev/hilo`.
-
-## Configuration
-
-`~/.hilo/config` is plain `key = value`. You rarely need to touch it.
-
-| Key | |
-| --- | --- |
-| `folder` | a linked folder (one line each) |
-| `mirrors` | where mirrored branches go: `<repo>.worktrees/<branch>` next to the repo by default, a directory, or `off` |
-| `env = strict` | never write `.env` files; variables only reach `hilo run` |
-| `readonly` | machines that may not write here (`hilo trust`) |
-| `bind` | listen on a different address than the one you advertise (NAT, containers) |
-
-## Develop
-
-```sh
-HILO_KEYCHAIN=0 HILO_NOTIFY=0 cargo test --offline   # includes the 400k-step simulation
-cargo test -- --ignored keychain                      # touches the real login Keychain
-cargo vet
-```
-
-One Rust binary of about 1.5 MB. SHA-256, HMAC, HKDF, Noise, JSON, the wire format, the terminal UI
-and the FSEvents and inotify bindings are written against the standard library and system calls.
-`x25519-dalek` and `chacha20poly1305` are the only crates.
+hilo is young (v0.3) and has had no external security audit. One Rust binary of about 1.6 MB; the
+only crates are for cryptography.
 
 **Not in v1:** Windows, NAT traversal (the anchor needs an address the others can reach), and syncing
 the agent's conversation.
 
-MIT licensed.
+## License
+
+[MIT](LICENSE)

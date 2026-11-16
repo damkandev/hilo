@@ -1,223 +1,175 @@
-//! Noise_XXpsk3_25519_ChaChaPoly_SHA256, by hand on top of two audited primitives.
+//! Noise_XXpsk3_25519_ChaChaPoly_SHA256 through `snow`.
 //!   -> e
 //!   <- e, ee, s, es
 //!   -> s, se, psk
 #![forbid(unsafe_code)]
-use crate::crypto::{hmac, sha256};
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::ChaCha20Poly1305;
+use snow::resolvers::{CryptoResolver, DefaultResolver};
+use snow::params::{CipherChoice, DHChoice, HashChoice};
+use snow::types::{Cipher as SnowCipher, Dh, Hash, Random};
+use snow::{HandshakeState, StatelessTransportState};
+use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-pub const NAME: &[u8] = b"Noise_XXpsk3_25519_ChaChaPoly_SHA256";
+pub const NAME: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA256";
+const MAX: usize = 65535;
 
 #[derive(Debug)]
 pub struct Error;
 type R<T> = Result<T, Error>;
 
+impl From<snow::Error> for Error {
+    fn from(_: snow::Error) -> Self {
+        Error
+    }
+}
+
+/// snow's own 25519 / ChaChaPoly / SHA256. The only randomness snow asks for is the ephemeral key,
+/// which hilo draws from /dev/urandom and hands over here, so a responder can replay its side exactly.
+struct Resolver([u8; 32]);
+struct Ephemeral([u8; 32]);
+impl Random for Ephemeral {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), snow::Error> {
+        dest.copy_from_slice(self.0.get(..dest.len()).ok_or(snow::Error::Rng)?);
+        Ok(())
+    }
+}
+impl CryptoResolver for Resolver {
+    fn resolve_rng(&self) -> Option<Box<dyn Random>> {
+        Some(Box::new(Ephemeral(self.0)))
+    }
+    fn resolve_dh(&self, c: &DHChoice) -> Option<Box<dyn Dh>> {
+        DefaultResolver.resolve_dh(c)
+    }
+    fn resolve_hash(&self, c: &HashChoice) -> Option<Box<dyn Hash>> {
+        DefaultResolver.resolve_hash(c)
+    }
+    fn resolve_cipher(&self, c: &CipherChoice) -> Option<Box<dyn SnowCipher>> {
+        DefaultResolver.resolve_cipher(c)
+    }
+}
+
+/// One direction of a transport session.
 #[derive(Clone)]
 pub struct Cipher {
-    k: Option<[u8; 32]>,
+    t: Arc<StatelessTransportState>,
     n: u64,
 }
 
 impl Cipher {
-    fn new(k: Option<[u8; 32]>) -> Self {
-        Cipher { k, n: 0 }
-    }
-    fn nonce(&self) -> [u8; 12] {
-        let mut n = [0u8; 12];
-        n[4..].copy_from_slice(&self.n.to_le_bytes());
-        n
-    }
-    /// Fails (instead of ever reusing a nonce) once 2^64-1 messages have gone out.
-    pub fn encrypt(&mut self, ad: &[u8], pt: &[u8]) -> R<Vec<u8>> {
-        let Some(k) = self.k else { return Ok(pt.to_vec()) };
-        if self.n == u64::MAX {
-            return Err(Error);
-        }
-        let ct = ChaCha20Poly1305::new(&k.into()).encrypt(&self.nonce().into(), Payload { msg: pt, aad: ad }).map_err(|_| Error)?;
+    /// snow refuses nonce 2^64-1, so this fails (instead of ever reusing a nonce) once the space runs out.
+    pub fn encrypt(&mut self, pt: &[u8]) -> R<Vec<u8>> {
+        let mut out = vec![0u8; pt.len() + 16];
+        let n = self.t.write_message(self.n, pt, &mut out)?;
+        out.truncate(n);
         self.n += 1;
-        Ok(ct)
+        Ok(out)
     }
-    pub fn decrypt(&mut self, ad: &[u8], ct: &[u8]) -> R<Vec<u8>> {
-        let Some(k) = self.k else { return Ok(ct.to_vec()) };
-        if self.n == u64::MAX {
-            return Err(Error);
-        }
-        let pt = ChaCha20Poly1305::new(&k.into())
-            .decrypt(&self.nonce().into(), Payload { msg: ct, aad: ad })
-            .map_err(|_| Error)?;
+    pub fn decrypt(&mut self, ct: &[u8]) -> R<Vec<u8>> {
+        let mut out = vec![0u8; ct.len()];
+        let n = self.t.read_message(self.n, ct, &mut out)?;
+        out.truncate(n);
         self.n += 1;
-        Ok(pt)
-    }
-}
-
-/// Noise HKDF: up to three 32-byte outputs.
-fn kdf(ck: &[u8; 32], ikm: &[u8]) -> [[u8; 32]; 3] {
-    let t = hmac(ck, &[ikm]);
-    let o1 = hmac(&t, &[&[1]]);
-    let o2 = hmac(&t, &[&o1, &[2]]);
-    let o3 = hmac(&t, &[&o2, &[3]]);
-    [o1, o2, o3]
-}
-
-#[derive(Clone)]
-struct Symmetric {
-    ck: [u8; 32],
-    h: [u8; 32],
-    c: Cipher,
-}
-
-impl Symmetric {
-    fn mix_hash(&mut self, d: &[u8]) {
-        self.h = sha256(&[&self.h[..], d].concat());
-    }
-    fn mix_key(&mut self, ikm: &[u8]) {
-        let [ck, k, _] = kdf(&self.ck, ikm);
-        self.ck = ck;
-        self.c = Cipher::new(Some(k));
-    }
-    fn mix_key_and_hash(&mut self, ikm: &[u8]) {
-        let [ck, th, k] = kdf(&self.ck, ikm);
-        self.ck = ck;
-        self.mix_hash(&th);
-        self.c = Cipher::new(Some(k));
-    }
-    fn encrypt_and_hash(&mut self, pt: &[u8]) -> R<Vec<u8>> {
-        let ct = self.c.encrypt(&self.h, pt)?;
-        self.mix_hash(&ct);
-        Ok(ct)
-    }
-    fn decrypt_and_hash(&mut self, ct: &[u8]) -> R<Vec<u8>> {
-        let pt = self.c.decrypt(&self.h, ct)?;
-        self.mix_hash(ct);
-        Ok(pt)
+        Ok(out)
     }
 }
 
 pub struct Handshake {
-    sym: Symmetric,
-    s: StaticSecret,
-    e: StaticSecret,
-    re: Option<PublicKey>,
-    pub rs: Option<[u8; 32]>,
+    hs: HandshakeState,
+    s: [u8; 32],
+    e: [u8; 32],
+    prologue: Vec<u8>,
+    m1: Vec<u8>, // responder: what it read and wrote, to replay per candidate psk
+    p2: Vec<u8>,
 }
 
-fn dh(a: &StaticSecret, b: &PublicKey) -> R<[u8; 32]> {
-    let s = a.diffie_hellman(b);
-    if !s.was_contributory() {
-        return Err(Error); // low-order point
-    }
-    Ok(s.to_bytes())
-}
-
-fn take<'a>(m: &mut &'a [u8], n: usize) -> R<&'a [u8]> {
-    if m.len() < n {
-        return Err(Error);
-    }
-    let (a, b) = m.split_at(n);
-    *m = b;
-    Ok(a)
-}
-
-fn pubkey(b: &[u8]) -> PublicKey {
-    PublicKey::from(<[u8; 32]>::try_from(b).unwrap())
+fn build(s: &[u8; 32], prologue: &[u8], initiator: bool, e: [u8; 32]) -> R<HandshakeState> {
+    let b = snow::Builder::with_resolver(NAME.parse()?, Box::new(Resolver(e))).local_private_key(s)?.prologue(prologue)?;
+    Ok(if initiator { b.build_initiator()? } else { b.build_responder()? })
 }
 
 impl Handshake {
     /// `e` is only injected by tests; real handshakes draw a fresh ephemeral.
-    pub fn new(s: [u8; 32], prologue: &[u8], e: Option<[u8; 32]>) -> Self {
-        let h: [u8; 32] = sha256(NAME); // name > 32 bytes
-        let mut sym = Symmetric { ck: h, h, c: Cipher::new(None) };
-        sym.mix_hash(prologue);
-        Handshake {
-            sym,
-            s: StaticSecret::from(s),
-            e: StaticSecret::from(e.unwrap_or_else(crate::crypto::random)),
-            re: None,
-            rs: None,
-        }
+    pub fn new(s: [u8; 32], prologue: &[u8], initiator: bool, e: Option<[u8; 32]>) -> R<Self> {
+        let e = e.unwrap_or_else(crate::crypto::random);
+        let hs = build(&s, prologue, initiator, e)?;
+        Ok(Handshake { hs, s, e, prologue: prologue.to_vec(), m1: vec![], p2: vec![] })
     }
 
-    fn e_pub(&self) -> [u8; 32] {
-        PublicKey::from(&self.e).to_bytes()
+    /// Refuses low-order points (snow doesn't): their DH output is known to everyone.
+    fn contributory(&self, key: &[u8]) -> R<()> {
+        let k = <[u8; 32]>::try_from(key.get(..32).ok_or(Error)?).map_err(|_| Error)?;
+        StaticSecret::from(self.s).diffie_hellman(&PublicKey::from(k)).was_contributory().then_some(()).ok_or(Error)
+    }
+
+    fn write(&mut self, payload: &[u8]) -> R<Vec<u8>> {
+        let mut out = vec![0u8; MAX];
+        let n = self.hs.write_message(payload, &mut out)?;
+        out.truncate(n);
+        Ok(out)
+    }
+
+    fn read(&mut self, m: &[u8]) -> R<Vec<u8>> {
+        let mut out = vec![0u8; m.len()];
+        let n = self.hs.read_message(m, &mut out)?;
+        out.truncate(n);
+        if let Some(rs) = self.hs.get_remote_static() {
+            self.contributory(rs)?;
+        }
+        Ok(out)
     }
 
     // ---- initiator ----
     pub fn write1(&mut self, payload: &[u8]) -> R<Vec<u8>> {
-        let e = self.e_pub();
-        self.sym.mix_hash(&e);
-        self.sym.mix_key(&e); // psk modifier
-        Ok([&e[..], &self.sym.encrypt_and_hash(payload)?].concat())
+        self.write(payload)
     }
-    pub fn read2(&mut self, mut m: &[u8]) -> R<Vec<u8>> {
-        let re = take(&mut m, 32)?;
-        self.sym.mix_hash(re);
-        self.sym.mix_key(re);
-        let re = pubkey(re);
-        self.sym.mix_key(&dh(&self.e, &re)?); // ee
-        let rs = self.sym.decrypt_and_hash(take(&mut m, 48)?)?;
-        let rs = pubkey(&rs);
-        self.sym.mix_key(&dh(&self.e, &rs)?); // es
-        self.re = Some(re);
-        self.rs = Some(rs.to_bytes());
-        self.sym.decrypt_and_hash(m)
+    pub fn read2(&mut self, m: &[u8]) -> R<Vec<u8>> {
+        self.contributory(m)?; // re
+        self.read(m)
     }
     pub fn write3(&mut self, payload: &[u8], psk: &[u8; 32]) -> R<Vec<u8>> {
-        let s = PublicKey::from(&self.s).to_bytes();
-        let cs = self.sym.encrypt_and_hash(&s)?;
-        self.sym.mix_key(&dh(&self.s, self.re.as_ref().ok_or(Error)?)?); // se
-        self.sym.mix_key_and_hash(psk);
-        Ok([cs, self.sym.encrypt_and_hash(payload)?].concat())
+        self.hs.set_psk(3, psk)?;
+        self.write(payload)
     }
 
     // ---- responder ----
-    pub fn read1(&mut self, mut m: &[u8]) -> R<Vec<u8>> {
-        let re = take(&mut m, 32)?;
-        self.sym.mix_hash(re);
-        self.sym.mix_key(re);
-        self.re = Some(pubkey(re));
-        self.sym.decrypt_and_hash(m)
+    pub fn read1(&mut self, m: &[u8]) -> R<Vec<u8>> {
+        self.contributory(m)?; // re
+        self.m1 = m.to_vec();
+        self.read(m)
     }
     pub fn write2(&mut self, payload: &[u8]) -> R<Vec<u8>> {
-        let re = self.re.ok_or(Error)?;
-        let e = self.e_pub();
-        self.sym.mix_hash(&e);
-        self.sym.mix_key(&e);
-        self.sym.mix_key(&dh(&self.e, &re)?); // ee
-        let s = PublicKey::from(&self.s).to_bytes();
-        let cs = self.sym.encrypt_and_hash(&s)?;
-        self.sym.mix_key(&dh(&self.s, &re)?); // es
-        Ok([&e[..], &cs, &self.sym.encrypt_and_hash(payload)?].concat())
+        self.p2 = payload.to_vec();
+        self.write(payload)
     }
     /// Tries each candidate psk; returns which one matched. Unknown psk => Err.
-    pub fn read3(&mut self, mut m: &[u8], psks: &[[u8; 32]]) -> R<(usize, Vec<u8>)> {
-        let rs = self.sym.decrypt_and_hash(take(&mut m, 48)?)?;
-        let rs = pubkey(&rs);
-        self.sym.mix_key(&dh(&self.e, &rs)?); // se
-        self.rs = Some(rs.to_bytes());
+    /// A failed read leaves snow's cipher key changed, so every try after the first
+    /// rebuilds the responder from the same ephemeral and replays messages 1 and 2.
+    pub fn read3(&mut self, m: &[u8], psks: &[[u8; 32]]) -> R<(usize, Vec<u8>)> {
         for (i, psk) in psks.iter().enumerate() {
-            let mut trial = self.sym.clone();
-            trial.mix_key_and_hash(psk);
-            if let Ok(p) = trial.decrypt_and_hash(m) {
-                self.sym = trial;
+            if i > 0 {
+                self.hs = build(&self.s, &self.prologue, false, self.e)?;
+                self.hs.read_message(&self.m1, &mut vec![0u8; self.m1.len()])?;
+                self.hs.write_message(&self.p2, &mut vec![0u8; MAX])?;
+            }
+            self.hs.set_psk(3, psk)?;
+            if let Ok(p) = self.read(m) {
                 return Ok((i, p));
             }
         }
         Err(Error)
     }
 
-    /// (initiator->responder, responder->initiator) ciphers.
-    pub fn split(&self) -> (Cipher, Cipher) {
-        let [a, b, _] = kdf(&self.sym.ck, &[]);
-        (Cipher::new(Some(a)), Cipher::new(Some(b)))
+    /// (send, recv, remote static key) once the handshake is done.
+    pub fn split(self) -> R<(Cipher, Cipher, [u8; 32])> {
+        let rs = self.hs.get_remote_static().ok_or(Error)?.try_into().map_err(|_| Error)?;
+        let t = Arc::new(self.hs.into_stateless_transport_mode()?);
+        Ok((Cipher { t: t.clone(), n: 0 }, Cipher { t, n: 0 }, rs))
     }
     #[cfg(test)]
     pub fn hash(&self) -> [u8; 32] {
-        self.sym.h
+        self.hs.get_handshake_hash().try_into().unwrap()
     }
 }
-
 
 pub fn public_key(secret: &[u8; 32]) -> [u8; 32] {
     PublicKey::from(&StaticSecret::from(*secret)).to_bytes()
@@ -240,13 +192,17 @@ mod tests {
         let mut i = Handshake::new(
             h32("e61ef9919cde45dd5f82166404bd08e38bceb5dfdfded0a34c8df7ed542214d1"),
             &prologue,
+            true,
             Some(h32("893e28b9dc6ca8d611ab664754b8ceb7bac5117349a4439a6b0569da977c464a")),
-        );
+        )
+        .unwrap();
         let mut r = Handshake::new(
             h32("4a3acbfdb163dec651dfa3194dece676d437029c62a408b4c5ea9114246e4893"),
             &prologue,
+            false,
             Some(h32("bbdb4cdbd309f1a1f2e1456967fe288cadd6f712d65dc7b7793d5e63da6b375b")),
-        );
+        )
+        .unwrap();
         let msgs = [
             ("4c756477696720766f6e204d69736573", "ca35def5ae56cec33dc2036731ab14896bc4c75dbb07a61f879f8e3afa4c7944c9f5ff0e8079630cb7e270c20bbf480821b77a384a645c71a2fd9b3db1c16a5f"),
             ("4d757272617920526f746862617264", "95ebc60d2b1fa672c1f46a8aa265ef51bfe38e7ccb39ec5be34069f144808843b123def17f71e6ae8e57e0e1dec5949c5f7415c6f33517398747d821a06dc23ad430aa1fd7381d46195c378a819fd574425462cbb2d4ca339e738a0b7001dc91423fbf55a99af0c6f1df21012ceb2f"),
@@ -269,15 +225,15 @@ mod tests {
         assert_eq!(hex(&i.hash()), "a477edf6a131bbdb54707f6ea30eab6cd935d9b560f0e5fd1f053a95a99669fb");
         assert_eq!(i.hash(), r.hash());
 
-        let (mut i_tx, mut i_rx) = i.split();
-        let (mut r_rx, mut r_tx) = r.split();
-        let c3 = r_tx.encrypt(&[], &p(3)).unwrap();
+        let (mut i_tx, mut i_rx, _) = i.split().unwrap();
+        let (mut r_tx, mut r_rx, _) = r.split().unwrap();
+        let c3 = r_tx.encrypt(&p(3)).unwrap();
         assert_eq!(hex(&c3), msgs[3].1);
-        assert_eq!(i_rx.decrypt(&[], &c3).unwrap(), p(3));
-        let c4 = i_tx.encrypt(&[], &p(4)).unwrap();
+        assert_eq!(i_rx.decrypt(&c3).unwrap(), p(3));
+        let c4 = i_tx.encrypt(&p(4)).unwrap();
         assert_eq!(hex(&c4), msgs[4].1);
-        assert_eq!(r_rx.decrypt(&[], &c4).unwrap(), p(4));
-        assert_eq!(hex(&r_tx.encrypt(&[], &p(5)).unwrap()), msgs[5].1);
+        assert_eq!(r_rx.decrypt(&c4).unwrap(), p(4));
+        assert_eq!(hex(&r_tx.encrypt(&p(5)).unwrap()), msgs[5].1);
     }
 
     struct Rng(u64);
@@ -319,8 +275,8 @@ mod tests {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let psk = [5u8; 32];
         for round in 0..3000 {
-            let mut i = Handshake::new([1; 32], b"p", Some([3; 32]));
-            let mut r = Handshake::new([2; 32], b"p", Some([4; 32]));
+            let mut i = Handshake::new([1; 32], b"p", true, Some([3; 32])).unwrap();
+            let mut r = Handshake::new([2; 32], b"p", false, Some([4; 32])).unwrap();
             let m1 = i.write1(b"").unwrap();
             let which = round % 3;
             let m1x = if which == 0 { mutate(&mut rng, &m1) } else { m1.clone() };
@@ -352,32 +308,33 @@ mod tests {
 
     fn pair() -> ((Cipher, Cipher), (Cipher, Cipher)) {
         let psk = [5u8; 32];
-        let mut i = Handshake::new([1; 32], b"", None);
-        let mut r = Handshake::new([2; 32], b"", None);
+        let mut i = Handshake::new([1; 32], b"", true, None).unwrap();
+        let mut r = Handshake::new([2; 32], b"", false, None).unwrap();
         r.read1(&i.write1(b"").unwrap()).unwrap();
         i.read2(&r.write2(b"").unwrap()).unwrap();
         r.read3(&i.write3(b"", &psk).unwrap(), &[psk]).unwrap();
-        (i.split(), r.split())
+        let ((a, b, _), (c, d, _)) = (i.split().unwrap(), r.split().unwrap());
+        ((a, b), (d, c))
     }
 
     #[test]
     fn transport_refuses_replay_reorder_and_tampering() {
         let ((mut tx, _), (mut rx, _)) = pair();
-        let a = tx.encrypt(&[], b"first").unwrap();
-        let b = tx.encrypt(&[], b"second").unwrap();
+        let a = tx.encrypt(b"first").unwrap();
+        let b = tx.encrypt(b"second").unwrap();
         // reordered: the second message can't be read first
         let mut rx2 = rx.clone();
-        assert!(rx2.decrypt(&[], &b).is_err());
-        assert_eq!(rx.decrypt(&[], &a).unwrap(), b"first");
-        assert!(rx.clone().decrypt(&[], &a).is_err(), "replay accepted");
+        assert!(rx2.decrypt(&b).is_err());
+        assert_eq!(rx.decrypt(&a).unwrap(), b"first");
+        assert!(rx.clone().decrypt(&a).is_err(), "replay accepted");
         let mut rng = Rng(42);
         for _ in 0..2000 {
             let bx = mutate(&mut rng, &b);
             if bx != b {
-                assert!(rx.clone().decrypt(&[], &bx).is_err(), "tampered frame accepted");
+                assert!(rx.clone().decrypt(&bx).is_err(), "tampered frame accepted");
             }
         }
-        assert_eq!(rx.decrypt(&[], &b).unwrap(), b"second");
+        assert_eq!(rx.decrypt(&b).unwrap(), b"second");
     }
 
     #[test]
@@ -385,16 +342,30 @@ mod tests {
         let ((mut tx, _), (mut rx, _)) = pair();
         tx.n = u64::MAX - 1;
         rx.n = u64::MAX - 1;
-        let last = tx.encrypt(&[], b"last").unwrap();
-        assert!(tx.encrypt(&[], b"one more").is_err());
-        assert_eq!(rx.decrypt(&[], &last).unwrap(), b"last");
-        assert!(rx.decrypt(&[], &last).is_err());
+        let last = tx.encrypt(b"last").unwrap();
+        assert!(tx.encrypt(b"one more").is_err());
+        assert_eq!(rx.decrypt(&last).unwrap(), b"last");
+        assert!(rx.decrypt(&last).is_err());
+    }
+
+    /// snow accepts low-order points; hilo must not (their DH output is public).
+    #[test]
+    fn low_order_points_are_refused() {
+        let hs = Handshake::new([2; 32], b"", false, None).unwrap();
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        let order8 = h32("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800");
+        for p in [[0u8; 32], one, order8] {
+            assert!(hs.contributory(&p).is_err());
+        }
+        assert!(hs.contributory(&public_key(&[9; 32])).is_ok());
+        assert!(hs.contributory(&[1, 2, 3]).is_err());
     }
 
     #[test]
     fn wrong_psk_fails() {
-        let mut i = Handshake::new([1; 32], b"", None);
-        let mut r = Handshake::new([2; 32], b"", None);
+        let mut i = Handshake::new([1; 32], b"", true, None).unwrap();
+        let mut r = Handshake::new([2; 32], b"", false, None).unwrap();
         r.read1(&i.write1(b"").unwrap()).unwrap();
         i.read2(&r.write2(b"").unwrap()).unwrap();
         let m3 = i.write3(b"", &[9; 32]).unwrap();
