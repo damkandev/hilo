@@ -39,9 +39,11 @@ pub struct Config(Vec<(String, String)>);
 
 impl Config {
     pub fn load() -> Config {
+        Config::parse(&read("config"))
+    }
+    fn parse(s: &str) -> Config {
         Config(
-            read("config")
-                .lines()
+            s.lines()
                 .filter_map(|l| l.split_once('='))
                 .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
                 .collect(),
@@ -64,6 +66,10 @@ impl Config {
         if !self.all(k).contains(&v) {
             self.0.push((k.into(), v.into()));
         }
+    }
+    /// `drive = <label> <absolute path>` lines; the path is the rest of the line (spaces allowed).
+    pub fn drives(&self) -> Vec<(String, PathBuf)> {
+        self.all("drive").into_iter().filter_map(|v| v.split_once(' ')).map(|(l, p)| (l.to_string(), PathBuf::from(p.trim_start()))).filter(|(_, p)| p.is_absolute()).collect()
     }
     pub fn save(&self) -> io::Result<()> {
         let s: String = self.0.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
@@ -250,4 +256,18 @@ pub fn parse_code(code: &str) -> Option<(String, String)> {
 
 pub fn format_code(t: &str, addr: &str) -> String {
     format!("HILO-{}-{}-{}@{addr}", &t[..4], &t[4..8], &t[8..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drive_lines() {
+        let c = Config::parse("folder = /a/code\ndrive = notes /Users/x/My Notes \ndrive=docs   /srv/d\ndrive = bad\ndrive = rel some/where\n");
+        assert_eq!(c.drives(), [("notes".into(), PathBuf::from("/Users/x/My Notes")), ("docs".into(), PathBuf::from("/srv/d"))]);
+        let mut c = Config::default();
+        c.add("drive", "my-notes /tmp/with space/x");
+        assert_eq!(Config::parse(&c.0.iter().map(|(k, v)| format!("{k} = {v}\n")).collect::<String>()).drives(), [("my-notes".into(), PathBuf::from("/tmp/with space/x"))]);
+    }
 }
