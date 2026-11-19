@@ -113,18 +113,82 @@ pub fn folder_label(p: &Path) -> String {
     p.file_name().map_or(String::new(), |n| n.to_string_lossy().to_lowercase())
 }
 
-struct Wt {
-    root: PathBuf,
+/// What `hilo add` makes of `path` when it would be a drive, and its label: `mode` "drive" forces
+/// it, "auto" picks it for a folder that is not a repo and has no repos directly inside.
+pub fn drive_label(path: &Path, mode: &str, label: &str) -> Option<String> {
+    let top = git::toplevel(path).and_then(|t| std::fs::canonicalize(t).ok()).is_some_and(|t| t == path);
+    let auto = mode == "auto" && !top && crate::repos_in(path).is_empty();
+    (mode == "drive" || auto).then(|| if label.is_empty() { folder_label(path) } else { label.to_string() })
+}
+
+/// Linked folders, repos and drives in `cfg` that `path` would sit inside or around.
+pub fn overlap(cfg: &Config, path: &Path, kinds: &[&str]) -> Option<String> {
+    let mut roots: Vec<(&str, PathBuf)> = vec![];
+    for k in ["folder", "repo"] {
+        roots.extend(cfg.all(k).into_iter().map(|p| (k, PathBuf::from(p))));
+    }
+    roots.extend(cfg.drives().into_iter().map(|d| ("drive", d.1)));
+    let (k, r) = roots.into_iter().filter(|(k, _)| kinds.contains(k)).map(|(k, r)| (k, std::fs::canonicalize(&r).unwrap_or(r))).find(|(_, r)| path.starts_with(r) || r.starts_with(path))?;
+    Some(format!("{} overlaps the {k} {} (synced roots never nest)", crate::tui::tilde(path), crate::tui::tilde(&r)))
+}
+
+/// Checks and records `drive = <label> <path>` (`path` canonical). Ok(false): it was already there.
+pub fn register_drive(cfg: &mut Config, path: &Path, label: &str) -> Result<bool, String> {
+    let drives = cfg.drives();
+    if drives.iter().any(|(l, p)| l == label && p == path) {
+        return Ok(false);
+    }
+    if !crate::sync::safe_name(label) || label.contains(char::is_whitespace) {
+        return Err(format!("\"{label}\" can't be a drive label; pick one with --as LABEL"));
+    }
+    if drives.iter().any(|d| d.0 == label) {
+        return Err(format!("another drive is already called \"{label}\"; pick another with --as LABEL"));
+    }
+    if let Some(t) = git::toplevel(path) {
+        return Err(format!("{} is inside the git repo {}; add the repo instead", crate::tui::tilde(path), crate::tui::tilde(&t)));
+    }
+    if let Some(e) = overlap(cfg, path, &["folder", "repo", "drive"]) {
+        return Err(e);
+    }
+    cfg.add("drive", &format!("{label} {}", path.display()));
+    Ok(true)
+}
+
+struct GitWt {
     gitdir: PathBuf,
     common: PathBuf,
     repo: String,
     branch: Option<String>, // None = detached HEAD: not synced in v1
+}
+
+/// A unit of sync: a git worktree, or a drive (any folder, matched across machines by label).
+enum Unit {
+    Git(GitWt),
+    Drive(String),
+}
+
+struct Wt {
+    root: PathBuf,
+    unit: Unit,
     scanner: Scanner,
 }
 
 impl Wt {
     fn id(&self) -> Option<String> {
-        self.branch.as_ref().map(|b| format!("{}:{b}", self.repo))
+        match &self.unit {
+            Unit::Git(g) => g.branch.as_ref().map(|b| format!("{}:{b}", g.repo)),
+            Unit::Drive(l) => Some(format!("drive:{l}")),
+        }
+    }
+    fn git(&self) -> Option<&GitWt> {
+        match &self.unit {
+            Unit::Git(g) => Some(g),
+            Unit::Drive(_) => None,
+        }
+    }
+    /// Drives: is `path` inside a repo nested in the drive? (skipped here, so never written)
+    fn in_nested_repo(&self, path: &str) -> bool {
+        self.git().is_none() && path.match_indices('/').any(|(i, _)| std::fs::symlink_metadata(self.root.join(&path[..i]).join(".git")).is_ok())
     }
 }
 
@@ -272,7 +336,7 @@ impl D {
                 log!("{} is gone; no longer syncing it here", r.root.display());
             }
             self.repos.retain(|r| !gone.contains(&r.id));
-            self.wts.retain(|w| !gone.contains(&w.repo));
+            self.wts.retain(|w| w.git().is_none_or(|g| !gone.contains(&g.repo)));
             self.publish_roots();
             self.rebuild_watcher();
         }
@@ -362,10 +426,25 @@ impl D {
         }
     }
 
-    /// `hilo add <path>`: a folder of repos, or one repo.
-    fn add_path(&mut self, p: &str) -> (u8, String) {
+    /// `hilo add <path>`: a folder of repos, one repo, or (`mode`, see `drive_label`) a drive.
+    fn add_path(&mut self, p: &str, mode: &str, label: &str) -> (u8, String) {
         let Ok(path) = std::fs::canonicalize(p) else { return (1, format!("{p}: no such folder")) };
         let mut cfg = Config::load();
+        if let Some(label) = drive_label(&path, mode, label) {
+            return match register_drive(&mut cfg, &path, &label) {
+                Err(e) => (1, e),
+                Ok(false) => (0, format!("{} is already the drive {label}", crate::tui::tilde(&path))),
+                Ok(true) => {
+                    let _ = cfg.save();
+                    let wi = self.add_drive(&path, &label);
+                    self.rebuild_watcher();
+                    (0, format!("drive {label}: syncing {} ({} files)", crate::tui::tilde(&path), self.wts[wi].scanner.files.len()))
+                }
+            };
+        }
+        if let Some(e) = overlap(&cfg, &path, &["drive"]) {
+            return (1, e);
+        }
         if git::toplevel(&path).is_some_and(|t| std::fs::canonicalize(t).ok() == Some(path.clone())) {
             if git::repo_id(&path).is_err() {
                 return (1, "that repo needs at least one commit first".into());
@@ -386,10 +465,8 @@ impl D {
         cfg.add("folder", &path.to_string_lossy());
         let _ = cfg.save();
         self.folders.push((path.clone(), label));
-        let before = self.repos.len();
         self.scan_folders();
         self.send(Msg::Resync { wt: "repo:*".into() }); // repos the others already announced
-        let _ = before;
         let n = self.repos.iter().filter(|r| r.root.parent() == Some(path.as_path())).count();
         (0, format!("linked {} ({n} repos; new ones sync on their own)", crate::tui::tilde(&path)))
     }
@@ -493,7 +570,7 @@ impl D {
     }
 
     fn scan_wt(&mut self, wi: usize, rels: Option<&[String]>) {
-        if self.wts[wi].branch.is_none() {
+        if self.wts[wi].id().is_none() {
             return;
         }
         let res = match rels {
@@ -546,7 +623,7 @@ impl D {
             let Ok(list) = git::worktrees(&root) else { continue };
             let roots: Vec<PathBuf> = list.iter().filter_map(|(p, _)| std::fs::canonicalize(p).ok()).collect();
             let before = self.wts.len();
-            self.wts.retain(|w| w.repo != id || roots.contains(&w.root));
+            self.wts.retain(|w| w.git().is_none_or(|g| g.repo != id) || roots.contains(&w.root));
             changed |= before != self.wts.len();
             for r in roots {
                 if !self.wts.iter().any(|w| w.root == r) {
@@ -565,25 +642,33 @@ impl D {
         let gitdir = git::gitdir(root).ok()?;
         let common = git::common_dir(root).ok()?;
         let branch = git::branch(&gitdir);
-        let mut scanner = Scanner::new(root);
-        let wt = Wt { root: root.into(), gitdir, common, repo: repo.into(), branch, scanner: Scanner::new(root) };
+        log!("watching {} ({})", root.display(), branch.as_deref().unwrap_or("detached HEAD, paused"));
+        Some(self.add_unit(Wt { root: root.into(), unit: Unit::Git(GitWt { gitdir, common, repo: repo.into(), branch }), scanner: Scanner::new(root) }))
+    }
+
+    /// A drive (`root` canonical). The caller rebuilds the watcher.
+    fn add_drive(&mut self, root: &Path, label: &str) -> usize {
+        log!("syncing drive {label} ({})", root.display());
+        self.add_unit(Wt { root: root.into(), unit: Unit::Drive(label.into()), scanner: Scanner::drive(root, label) })
+    }
+
+    fn add_unit(&mut self, mut wt: Wt) -> usize {
         if let Some(id) = wt.id() {
             // index entries the replica doesn't agree with get re-read
             let stale: Vec<String> =
-                scanner.files.iter().filter(|(rel, (_, h))| self.r.confirmed.get(&(id.clone(), rel.to_string())) != Some(h)).map(|(r, _)| r.clone()).collect();
-            stale.iter().for_each(|r| scanner.forget(r));
+                wt.scanner.files.iter().filter(|(rel, (_, h))| self.r.confirmed.get(&(id.clone(), rel.to_string())) != Some(h)).map(|(r, _)| r.clone()).collect();
+            stale.iter().for_each(|r| wt.scanner.forget(r));
             if !self.r.confirmed.keys().any(|k| k.0 == id) {
                 self.needs_resync.insert(id.clone());
             }
         }
-        log!("watching {} ({})", root.display(), wt.branch.as_deref().unwrap_or("detached HEAD, paused"));
-        self.wts.push(Wt { scanner, ..wt });
+        self.wts.push(wt);
         let wi = self.wts.len() - 1;
         self.publish_roots();
         self.materialize_all(wi);
         self.resync_pending();
         self.scan_wt(wi, None);
-        Some(wi)
+        wi
     }
 
     fn resync_pending(&mut self) {
@@ -607,12 +692,15 @@ impl D {
         }
         self.discover();
         for wi in 0..self.wts.len() {
-            let b = git::branch(&self.wts[wi].gitdir);
-            if b != self.wts[wi].branch {
+            let Some(g) = self.wts[wi].git() else { continue };
+            let b = git::branch(&g.gitdir);
+            if b != g.branch {
                 // ponytail: one tick of grace for a checkout to settle; watch index.lock if checkouts race scans.
                 log!("{}: branch is now {}", self.wts[wi].root.display(), b.as_deref().unwrap_or("detached (paused)"));
                 let root = self.wts[wi].root.clone();
-                self.wts[wi].branch = b;
+                if let Unit::Git(g) = &mut self.wts[wi].unit {
+                    g.branch = b;
+                }
                 self.wts[wi].scanner = Scanner::new(&root);
                 if let Some(id) = self.wts[wi].id() {
                     if !self.r.confirmed.keys().any(|k| k.0 == id) {
@@ -628,8 +716,10 @@ impl D {
     }
 
     fn check_ref(&mut self, wi: usize) {
-        let (Some(id), Some(branch)) = (self.wts[wi].id(), self.wts[wi].branch.clone()) else { return };
-        let Some(tip) = git::read_ref(&self.wts[wi].common, &branch) else { return };
+        let Some(g) = self.wts[wi].git() else { return };
+        let (common, repo) = (g.common.clone(), g.repo.clone());
+        let (Some(id), Some(branch)) = (self.wts[wi].id(), g.branch.clone()) else { return };
+        let Some(tip) = git::read_ref(&common, &branch) else { return };
         let h = ref_hash(&tip);
         if h == self.r.expected(&(id.clone(), REF.into())) {
             return;
@@ -640,7 +730,7 @@ impl D {
         let old = self.ref_sha.get(&id).cloned();
         let exclude: Vec<String> = match &old {
             Some(o) => vec![o.clone()],
-            None => self.wts.iter().filter(|w| w.repo == self.wts[wi].repo).filter_map(|w| self.ref_sha.get(&w.id()?).cloned()).collect(),
+            None => self.wts.iter().filter(|w| w.git().is_some_and(|g| g.repo == repo)).filter_map(|w| self.ref_sha.get(&w.id()?).cloned()).collect(),
         };
         let bundle = match git::bundle(&root, &tip, &exclude, &self.tmp) {
             Ok(b) => b.filter(|b| b.len() < MAX_MSG - (1 << 20)),
@@ -730,6 +820,10 @@ impl D {
             log!("refused remote change to {:?}", op.path);
             return self.bump(op.seq);
         }
+        if self.wts[wi].in_nested_repo(&op.path) {
+            self.log_once(format!("nested {}", op.path), format!("not writing {}: it is inside a git repo in the drive", op.path));
+            return self.bump(op.seq);
+        }
         let k = (op.wt.clone(), op.path.clone());
         let root = self.wts[wi].root.clone();
         let disk = read_disk(&root, &op.path);
@@ -795,7 +889,7 @@ impl D {
 
     fn apply_file(&mut self, wi: usize, path: &str, fx: Vec<Effect>, origin: &str, approved: bool) {
         let root = self.wts[wi].root.clone();
-        let branch = self.wts[wi].branch.clone().unwrap_or_else(|| "detached".into());
+        let branch = self.wts[wi].git().map(|g| g.branch.clone().unwrap_or_else(|| "detached".into())); // None = a drive
         let id = self.wts[wi].id().unwrap_or_default();
         for e in fx {
             match e {
@@ -805,25 +899,26 @@ impl D {
                         log!("conflict on {path}: could not keep this machine's version in history ({e}); leaving the file alone");
                         return;
                     }
-                    if git::in_head(&root, path, c) {
-                        continue; // already in a commit: nothing to lose
-                    }
-                    match git::save_conflict(&root, &branch, path, c, &self.tmp) {
-                        Ok(b) => {
-                            let who = if origin.is_empty() { "another machine" } else { origin };
-                            log!("conflict on {path}: {who} won; this machine's version is on {b}");
-                            let author = self.sh.authors.lock().unwrap().get(&(id.clone(), path.into())).cloned();
-                            self.sh.notify_session(
-                                author,
-                                format!("hilo: while you were editing {path}, an agent on {who} saved it first. Your version is on branch {b} (`git show {b}:{path}`); the file now has theirs. Re-read it before editing again."),
-                            );
-                        }
-                        Err(e) => {
-                            // never overwrite what we could not save
-                            log!("conflict on {path}: could not save this machine's version ({e}); leaving the file alone");
-                            return;
-                        }
-                    }
+                    // a drive keeps it in the history only; a repo also on a conflict branch
+                    let (kept, how) = match &branch {
+                        None => ("in hilo's history".to_string(), format!("`hilo log {path}`, `hilo restore {path} --conflict`")),
+                        Some(_) if git::in_head(&root, path, c) => continue, // already in a commit: nothing to lose
+                        Some(branch) => match git::save_conflict(&root, branch, path, c, &self.tmp) {
+                            Ok(b) => (format!("on branch {b}"), format!("`git show {b}:{path}`")),
+                            Err(e) => {
+                                // never overwrite what we could not save
+                                log!("conflict on {path}: could not save this machine's version ({e}); leaving the file alone");
+                                return;
+                            }
+                        },
+                    };
+                    let who = if origin.is_empty() { "another machine" } else { origin };
+                    log!("conflict on {path}: {who} won; this machine's version is {kept}");
+                    let author = self.sh.authors.lock().unwrap().get(&(id.clone(), path.into())).cloned();
+                    self.sh.notify_session(
+                        author,
+                        format!("hilo: while you were editing {path}, an agent on {who} saved it first. Your version is {kept} ({how}); the file now has theirs. Re-read it before editing again."),
+                    );
                 }
                 Effect::Write(d) => {
                     let Some(c) = d.content() else { continue };
@@ -862,6 +957,9 @@ impl D {
         }
         let Some(wi) = self.wt_index(&rej.wt) else { return };
         if rej.path == REF {
+            if self.wts[wi].git().is_none() {
+                return;
+            }
             if let Some(Some((sha, _, _))) = rej.data.content().map(|c| c.and_then(parse_ref)) {
                 self.ref_sha.insert(rej.wt.clone(), sha);
             }
@@ -869,7 +967,7 @@ impl D {
             let fx = self.r.rejected(&rej, dh, disk);
             return self.apply_ref(wi, fx, &rej.origin, false);
         }
-        if !valid_path(&rej.path) || excluded(&rej.path) || hash_of(rej.data.content().flatten()) != rej.current {
+        if !valid_path(&rej.path) || excluded(&rej.path) || hash_of(rej.data.content().flatten()) != rej.current || self.wts[wi].in_nested_repo(&rej.path) {
             return;
         }
         let disk = read_disk(&self.wts[wi].root, &rej.path);
@@ -881,7 +979,7 @@ impl D {
 
     fn ref_disk(&self, wi: usize) -> (Hash, Data) {
         let w = &self.wts[wi];
-        match w.branch.as_ref().and_then(|b| git::read_ref(&w.common, b)) {
+        match w.git().and_then(|g| git::read_ref(&g.common, g.branch.as_ref()?)) {
             Some(t) => (ref_hash(&t), Data::Full(ref_payload(&t, false, None))),
             None => (NONE, Data::Absent),
         }
@@ -899,6 +997,9 @@ impl D {
                 None => return self.bump(op.seq),
             },
         };
+        if self.wts[wi].git().is_none() {
+            return self.bump(op.seq); // drives have no branch
+        }
         self.ref_sha.insert(op.wt.clone(), sha);
         let (dh, disk) = self.ref_disk(wi);
         let fx = self.r.applied(&op, dh, disk);
@@ -908,7 +1009,8 @@ impl D {
     fn apply_ref(&mut self, wi: usize, fx: Vec<Effect>, origin: &str, approved: bool) {
         let root = self.wts[wi].root.clone();
         let id = self.wts[wi].id().unwrap_or_default();
-        let branch = self.wts[wi].branch.clone().unwrap_or_default();
+        let Some(g) = self.wts[wi].git() else { return };
+        let (branch, common) = (g.branch.clone().unwrap_or_default(), g.common.clone());
         for e in fx {
             let Some(Some((sha, _, bundle))) = (match &e {
                 Effect::Save(d) | Effect::Write(d) => d.content().map(|c| c.and_then(parse_ref)),
@@ -945,7 +1047,7 @@ impl D {
                         log!("{branch}: commit {} is missing here (try `git fetch`)", &sha[..7]);
                         return;
                     }
-                    if git::read_ref(&self.wts[wi].common, &branch).as_deref() != Some(&sha) {
+                    if git::read_ref(&common, &branch).as_deref() != Some(&sha) {
                         match git::reset_mixed(&root, &sha) {
                             Ok(()) => log!("{branch} -> {}", &sha[..7]),
                             Err(e) => log!("{branch}: {e}"),
@@ -969,7 +1071,7 @@ impl D {
     }
 
     fn on_env(&mut self, wi: usize, rel: &str, data: Option<Vec<u8>>, ignored: bool) {
-        let repo = self.wts[wi].repo.clone();
+        let Some(repo) = self.wts[wi].git().map(|g| g.repo.clone()) else { return };
         let root_s = self.wts[wi].root.to_string_lossy().to_string();
         let mk = (root_s.clone(), rel.to_string());
         let Some(data) = data else {
@@ -1083,7 +1185,7 @@ impl D {
     }
 
     fn materialize_all(&mut self, wi: usize) {
-        let repo = self.wts[wi].repo.clone();
+        let Some(repo) = self.wts[wi].git().map(|g| g.repo.clone()) else { return };
         for f in self.vault(&repo).files() {
             self.materialize_one(&repo, &f, wi);
         }
@@ -1092,7 +1194,7 @@ impl D {
 
     fn materialize(&mut self, repo: &str, file: &str, skip: Option<usize>) {
         for wi in 0..self.wts.len() {
-            if self.wts[wi].repo == repo && Some(wi) != skip {
+            if self.wts[wi].git().is_some_and(|g| g.repo == repo) && Some(wi) != skip {
                 self.materialize_one(repo, file, wi);
             }
         }
@@ -1101,7 +1203,7 @@ impl D {
 
     /// Writes `file` in worktree `wi` so it holds the effective values. Only where git ignores it.
     fn materialize_one(&mut self, repo: &str, file: &str, wi: usize) {
-        if self.strict || self.wts[wi].branch.is_none() {
+        if self.strict || self.wts[wi].git().is_none_or(|g| g.branch.is_none()) {
             return;
         }
         let keys = self.vkeys.clone();
@@ -1225,7 +1327,8 @@ impl D {
         let a: Vec<&str> = a.iter().map(String::as_str).collect();
         match a.as_slice() {
             ["status", rest @ ..] => (0, self.status(rest.contains(&"--latency"))),
-            ["add", path] => self.add_path(path),
+            ["add", path] => self.add_path(path, "", ""),
+            ["add", path, mode, label] => self.add_path(path, mode, label),
             ["progress"] => {
                 let pending = self.r.caught_up().len();
                 (0, format!("pending={pending} caught={} repos={} worktrees={} online={}", self.caught as u8, self.repos.len(), self.wts.len(), self.peers.join(",")))
@@ -1314,15 +1417,20 @@ impl D {
             let n = self.repos.iter().filter(|r| r.root.parent() == Some(f.as_path())).count();
             s += &format!("folder    {} ({n} repos; new repos here sync on their own)\n", crate::tui::tilde(f));
         }
+        let pending = self.r.caught_up();
+        let waiting = |w: &Wt| match w.id().map_or(0, |id| pending.iter().filter(|o| o.wt == id).count()) {
+            0 => String::new(),
+            n => format!(" {n} changes waiting to send"),
+        };
+        for w in &self.wts {
+            if let Unit::Drive(l) = &w.unit {
+                s += &format!("drive     {} ({l}, {} files){}\n", crate::tui::tilde(&w.root), w.scanner.files.len(), waiting(w));
+            }
+        }
         s += "worktrees\n";
         for w in &self.wts {
-            let pend = w.id().map_or(0, |id| self.r.caught_up().iter().filter(|o| o.wt == id).count());
-            s += &format!(
-                "  {} [{}]{}\n",
-                w.root.display(),
-                w.branch.as_deref().unwrap_or("detached, paused"),
-                if pend > 0 { format!(" {pend} changes waiting to send") } else { String::new() }
-            );
+            let Some(g) = w.git() else { continue };
+            s += &format!("  {} [{}]{}\n", w.root.display(), g.branch.as_deref().unwrap_or("detached, paused"), waiting(w));
         }
         let leases = self.sh.leases.lock().unwrap().snapshot();
         s += &format!("leases    {}\n", leases.len());
@@ -1331,6 +1439,9 @@ impl D {
         }
         let conflicts: usize = self.repos.iter().map(|r| git::conflict_branches(&r.root)).sum();
         s += &format!("conflicts {conflicts} saved branch(es) (git branch --list 'hilo/conflict/*')\n");
+        if self.wts.iter().any(|w| w.git().is_none()) {
+            s += &format!("          {} in drives, kept in the history (hilo log PATH)\n", self.store.conflicts("drive:"));
+        }
         let (n, bytes) = self.store.totals();
         s += &format!("history   {n} versions, {:.1} MB (hilo log PATH)\n", bytes as f64 / 1048576.0);
         if self.store.broken() {
@@ -1355,7 +1466,7 @@ impl D {
 
     fn env_cmd(&mut self, cwd: &str, file: &str, cmd: &str, args: &[&str]) -> Result<String, String> {
         let wi = self.wt_for_cwd(cwd).ok_or("not inside a synced worktree")?;
-        let repo = self.wts[wi].repo.clone();
+        let repo = self.wts[wi].git().ok_or("env files don't sync in a drive")?.repo.clone();
         let reldir = canonical_maybe_missing(Path::new(cwd)).strip_prefix(&self.wts[wi].root).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
         let file = if file.is_empty() { ".env".to_string() } else { file.to_string() };
         let file = if reldir.is_empty() || file.contains('/') { file } else { format!("{reldir}/{file}") };
@@ -1586,10 +1697,10 @@ fn connect_loop(addr: String, key: [u8; 32], anchor_key: [u8; 32], tx: Sender<Ev
 }
 
 pub fn run() -> io::Result<()> {
+    config::ensure_home()?; // before the key: a fresh HILO_HOME has no secrets/ yet
     let cfg = Config::load();
     let key = crate::secret::waiting_note(config::key)?;
     let name = config::name();
-    config::ensure_home()?;
     let store = crate::store::Store::open()?; // before the socket: a second daemon stops here
     let sh = Arc::new(Shared {
         name: name.clone(),
@@ -1706,8 +1817,19 @@ pub fn run() -> io::Result<()> {
         }
     }
     d.prune();
+    for (label, p) in cfg.drives() {
+        match std::fs::canonicalize(&p) {
+            Ok(root) => {
+                d.add_drive(&root, &label);
+            }
+            Err(e) => log!("drive {label}: {}: {e}; not syncing it", p.display()),
+        }
+    }
     d.scan_folders();
     d.discover();
+    if d.watcher.is_none() && !d.wts.is_empty() {
+        d.rebuild_watcher(); // drives only: discover() had nothing to watch
+    }
 
     let (mut last_tick, mut last_full, mut last_save, mut last_time, mut last_prune) = (Instant::now(), Instant::now(), Instant::now(), Instant::now(), Instant::now());
     loop {
@@ -1766,5 +1888,36 @@ mod tests {
         assert!(sh.notices_for("b").is_empty()); // b started later: not a fake block on its first edit
         sh.notify_session(None, "new hold".into());
         assert_eq!(sh.notices_for("b"), ["new hold"]);
+    }
+
+    #[test]
+    fn drive_roots_never_nest() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("hilo-ov-{}", crate::crypto::hex(&crate::crypto::random::<4>())));
+        for d in ["code/app", "notes/sub", "docs", "solo", "My Stuff", "empty"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let p = |d: &str| base.join(d);
+        let mut cfg = Config::default();
+        cfg.add("folder", &p("code").to_string_lossy());
+        cfg.add("repo", &p("solo").to_string_lossy());
+        assert_eq!(register_drive(&mut cfg, &p("notes"), "notes"), Ok(true));
+        assert_eq!(register_drive(&mut cfg, &p("notes"), "notes"), Ok(false)); // again: nothing to do
+        for (path, label) in [("notes/sub", "sub"), ("code/app", "app"), ("code", "c2"), ("solo", "s"), ("docs", "notes"), ("docs", ".x"), ("docs", "a b")] {
+            assert!(register_drive(&mut cfg, &p(path), label).is_err(), "{path} as {label}");
+        }
+        assert!(register_drive(&mut cfg, &base, "all").is_err()); // around everything
+        assert_eq!(register_drive(&mut cfg, &p("My Stuff"), "stuff"), Ok(true));
+        assert_eq!(cfg.drives().iter().map(|d| d.0.as_str()).collect::<Vec<_>>(), ["notes", "stuff"]);
+        // the other way round: a folder or repo inside or around a drive
+        assert!(overlap(&cfg, &p("notes/sub"), &["drive"]).is_some() && overlap(&cfg, &base, &["drive"]).is_some());
+        assert!(overlap(&cfg, &p("docs"), &["drive"]).is_none());
+        // `hilo add` picks a drive only for a folder without repos
+        assert_eq!(drive_label(&p("empty"), "auto", ""), Some("empty".into()));
+        assert_eq!(drive_label(&p("My Stuff"), "auto", "mine"), Some("mine".into()));
+        assert_eq!(drive_label(&p("empty"), "", ""), None);
+        std::fs::create_dir_all(p("code/app/.git")).unwrap();
+        assert_eq!(drive_label(&p("code"), "auto", ""), None);
+        assert_eq!(drive_label(&p("code"), "drive", ""), Some("code".into()));
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

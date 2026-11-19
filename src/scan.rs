@@ -1,5 +1,6 @@
 //! Finds what changed in a worktree: either a full walk (startup, every 30 s, or the plan-B poll)
 //! or just the paths the watcher / a hook reported. Compares (mtime, size, inode) before reading.
+//! A drive (a plain folder) scans the same way, minus envs and any repo nested in it.
 #![forbid(unsafe_code)]
 use crate::crypto::{hex, sha256};
 use crate::fsops::{self, has_secret, is_dotgit, is_env_name, is_secret, Stamp, MAX_FILE, TMP_PREFIX};
@@ -30,6 +31,8 @@ pub struct Scanner {
     gitignores: HashMap<String, Stamp>,
     warned: HashSet<String>,
     dirty_index: bool,
+    /// drives: the empty bare repo `git check-ignore` runs against
+    drive: Option<PathBuf>,
 }
 
 fn index_path(root: &Path) -> String {
@@ -47,6 +50,7 @@ impl Scanner {
             gitignores: HashMap::new(),
             warned: HashSet::new(),
             dirty_index: false,
+            drive: None,
         };
         // Persistent index: a restart doesn't re-hash the whole repo.
         let raw = std::fs::read(crate::config::path(&index_path(root))).unwrap_or_default();
@@ -54,6 +58,12 @@ impl Scanner {
         while let (Some(p), Some(a), Some(b), Some(c), Some(d), Some(h)) = (r.str(), r.u64(), r.u64(), r.u64(), r.u64(), r.hash()) {
             s.files.insert(p, ((a as i64, b as i64, c, d), h));
         }
+        s
+    }
+
+    pub fn drive(root: &Path, label: &str) -> Self {
+        let mut s = Scanner::new(root);
+        s.drive = Some(crate::config::path(&format!("tmp/drive-ignore/{label}.git")));
         s
     }
 
@@ -97,7 +107,10 @@ impl Scanner {
             return Ok(*v);
         }
         if self.ignore.is_none() {
-            self.ignore = Some(Ignore::new(&self.root)?);
+            self.ignore = Some(match &self.drive {
+                Some(g) => Ignore::drive(&self.root, g)?,
+                None => Ignore::new(&self.root)?,
+            });
         }
         let v = self.ignore.as_mut().unwrap().ignored(rel);
         if v.is_err() {
@@ -112,6 +125,15 @@ impl Scanner {
         if self.warned.insert(rel.into()) {
             log!("skip {rel}: {why}");
         }
+    }
+
+    /// Drives: a directory holding a repo is skipped (that repo syncs on its own, if added).
+    fn nested(&mut self, rel: &str) -> bool {
+        let yes = self.drive.is_some() && std::fs::symlink_metadata(self.root.join(rel).join(".git")).is_ok();
+        if yes {
+            self.warn(&format!("{rel}/"), "a git repo inside a drive; add it with `hilo add`");
+        }
+        yes
     }
 
     pub fn scan(&mut self) -> io::Result<Changes> {
@@ -146,7 +168,10 @@ impl Scanner {
 
     /// Look at `prefix` ("" = everything): a file, a directory, or something now gone.
     fn walk(&mut self, prefix: &str) -> io::Result<Changes> {
-        if !self.root.join(".git").exists() {
+        if self.drive.is_some() && !self.root.is_dir() {
+            return Err(io::Error::other(format!("drive folder {} is gone", self.root.display())));
+        }
+        if self.drive.is_none() && !self.root.join(".git").exists() {
             return Err(io::Error::other(format!("{} is not a git worktree anymore", self.root.display())));
         }
         let mut out = Changes::default();
@@ -158,7 +183,7 @@ impl Scanner {
         let ancestors_ok = (|| -> io::Result<bool> {
             let parts: Vec<&str> = prefix.split('/').collect();
             for i in 1..parts.len() {
-                if self.is_ignored(&format!("{}/", parts[..i].join("/")))? {
+                if self.nested(&parts[..i].join("/")) || self.is_ignored(&format!("{}/", parts[..i].join("/")))? {
                     return Ok(false);
                 }
             }
@@ -169,7 +194,7 @@ impl Scanner {
         } else if ancestors_ok {
             match std::fs::symlink_metadata(self.root.join(prefix)) {
                 Ok(m) if m.is_dir() => {
-                    if !self.is_ignored(&format!("{prefix}/"))? {
+                    if !self.nested(prefix) && !self.is_ignored(&format!("{prefix}/"))? {
                         out.dirs.push(prefix.to_string());
                         stack.push(prefix.to_string());
                     }
@@ -199,7 +224,7 @@ impl Scanner {
                     continue;
                 };
                 if m.is_dir() {
-                    if !m.file_type().is_symlink() && !self.is_ignored(&format!("{rel}/"))? {
+                    if !m.file_type().is_symlink() && !self.nested(&rel) && !self.is_ignored(&format!("{rel}/"))? {
                         out.dirs.push(rel.clone());
                         stack.push(rel);
                     }
@@ -246,6 +271,10 @@ impl Scanner {
         }
         let name = rel.rsplit('/').next().unwrap_or(rel);
         let st = fsops::stamp(m);
+        if is_env_name(name) && self.drive.is_some() {
+            self.warn(rel, "env files never sync from a drive");
+            return Ok(());
+        }
         if is_env_name(name) {
             seen.insert(rel.to_string());
             if self.env.get(rel) != Some(&st) {
@@ -304,7 +333,7 @@ mod tests {
     fn scan_sees_changes_and_respects_ignores() {
         let d = crate::git::tests::temp_repo();
         std::fs::write(d.join(".gitignore"), "node_modules/\n*.log\n.env*\n").unwrap();
-        let mut s = Scanner { root: d.clone(), ignore: None, ignored: HashMap::new(), files: HashMap::new(), env: HashMap::new(), gitignores: HashMap::new(), warned: HashSet::new(), dirty_index: false };
+        let mut s = Scanner { root: d.clone(), ignore: None, ignored: HashMap::new(), files: HashMap::new(), env: HashMap::new(), gitignores: HashMap::new(), warned: HashSet::new(), dirty_index: false, drive: None };
         let mut first: Vec<String> = s.scan().unwrap().files.into_iter().map(|c| c.0).collect();
         first.sort();
         assert_eq!(first, [".gitignore", "a.txt"]);
@@ -330,5 +359,49 @@ mod tests {
         s.note("w.txt", st, sha256(b"mine"));
         assert!(s.check(&["w.txt".into()]).unwrap().files.is_empty());
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn drive_scan() {
+        let d = std::env::temp_dir().join(format!("hilo-drive-{}", hex(&crate::crypto::random::<4>())));
+        let w = |p: &str, c: &str| {
+            std::fs::create_dir_all(d.join(p).parent().unwrap()).unwrap();
+            std::fs::write(d.join(p), c).unwrap();
+        };
+        w(".gitignore", "*.log\n");
+        w("a.txt", "a");
+        w("sub/.gitignore", "secret.txt\n!keep.log\n"); // nested .gitignore files count, negations too
+        w("sub/b.txt", "b");
+        w("sub/x.log", "x");
+        w("sub/keep.log", "k");
+        w("sub/secret.txt", "s");
+        w("sub/deep/c.txt", "c");
+        w("node_modules/m.js", "m"); // built-in excludes
+        w(".DS_Store", "x");
+        w("sub/.hilo-thing", "x");
+        w(".env", "K=1"); // never from a drive, no vault here
+        w("sub/.env.local", "K=1");
+        w("id.pem", "x");
+        w("nested/.git/HEAD", "ref: refs/heads/main\n"); // a repo inside: skipped whole
+        w("nested/n.txt", "n");
+        let d = std::fs::canonicalize(&d).unwrap();
+        let mut s = Scanner::drive(&d, &format!("t{}", hex(&crate::crypto::random::<4>())));
+        let names = |c: &Changes| {
+            let mut v: Vec<String> = c.files.iter().map(|f| f.0.clone()).collect();
+            v.sort();
+            v
+        };
+        let c = s.scan().unwrap();
+        assert_eq!(names(&c), [".gitignore", "a.txt", "sub/.gitignore", "sub/b.txt", "sub/deep/c.txt", "sub/keep.log"]);
+        assert!(c.env.is_empty());
+        assert!(s.check(&["nested/n.txt".into(), "nested".into(), ".env".into()]).unwrap().files.is_empty());
+        // a .gitignore change re-reads everything: x.log now syncs, deep/ stops (still on disk: not a deletion)
+        std::fs::write(d.join(".gitignore"), "deep/\n").unwrap();
+        assert_eq!(names(&s.scan().unwrap()), [".gitignore", "sub/x.log"]);
+        assert!(!s.files.contains_key("sub/deep/c.txt"));
+        std::fs::remove_file(d.join("a.txt")).unwrap();
+        assert_eq!(s.check(&["a.txt".into()]).unwrap().files, vec![("a.txt".to_string(), None)]);
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(s.scan().is_err()); // the folder is gone: an error, not every file deleted
     }
 }

@@ -218,6 +218,11 @@ impl Store {
         (self.entries.len(), self.sizes.values().sum())
     }
 
+    /// Conflict versions kept for units whose id starts with `prefix`.
+    pub fn conflicts(&self, prefix: &str) -> usize {
+        self.entries.iter().filter(|e| e.kind == Kind::Conflict && e.unit.starts_with(prefix)).count()
+    }
+
     /// Newest first.
     pub fn history(&self, unit: &str, path: &str) -> Vec<&Entry> {
         self.by_key.get(&(unit.to_string(), path.to_string())).map_or(vec![], |v| v.iter().rev().map(|&i| &self.entries[i]).collect())

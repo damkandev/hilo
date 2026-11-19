@@ -65,6 +65,7 @@ See [Deployment](docs/deployment.md) for addresses, services and platforms.
 | **Agents hear about it first** | Before an agent edits a file another agent is editing, Claude Code blocks the edit and tells it who has the file, where, and for how long. |
 | **Branches and commits** | Commits travel with the files, branches move on every machine, and a new worktree on one machine appears on the others. |
 | **New repos on their own** | `git init` a repo in a linked folder, make the first commit, and it shows up on the other machine with its history and uncommitted files. |
+| **Plain folders too** | `hilo add ~/notes` on a folder with no repos makes it a [drive](docs/architecture.md#drive-folders): it syncs as it is, and every version stays in `hilo log`. |
 | **`.env` without copying** | Variables are encrypted, synced key by key, and written into every worktree that needs them. Keys can stay per machine or production-only. |
 | **Cloud agents too** | Claude Code on the web, Codex, Cursor and Codespaces sandboxes join with a token, and their branch shows up on your Mac while they work. [How →](docs/cloud-agents.md) |
 

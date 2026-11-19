@@ -74,9 +74,29 @@ pub struct Ignore {
     out: BufReader<ChildStdout>,
 }
 
+/// What a drive never syncs, on top of its `.gitignore` files.
+const DRIVE_EXCLUDES: &str = ".DS_Store\nnode_modules/\n.hilo-*\n";
+
 impl Ignore {
     pub fn new(root: &Path) -> io::Result<Self> {
+        Self::spawn(cmd(root))
+    }
+
+    /// A folder that is not a repo: its `.gitignore` files apply through an empty bare repo
+    /// (`gitdir`, made on first use) whose `info/exclude` holds the built-in excludes.
+    pub fn drive(root: &Path, gitdir: &Path) -> io::Result<Self> {
+        if !gitdir.join("HEAD").exists() {
+            std::fs::create_dir_all(gitdir)?;
+            git(gitdir, &["init", "-q", "--bare"])?;
+        }
+        std::fs::create_dir_all(gitdir.join("info"))?;
+        std::fs::write(gitdir.join("info/exclude"), DRIVE_EXCLUDES)?;
         let mut c = cmd(root);
+        c.env("GIT_DIR", gitdir).env("GIT_WORK_TREE", root);
+        Self::spawn(c)
+    }
+
+    fn spawn(mut c: Command) -> io::Result<Self> {
         c.args(["check-ignore", "--stdin", "-z", "--non-matching", "-v"])
             .env("GIT_FLUSH", "1")
             .stdin(Stdio::piped())
