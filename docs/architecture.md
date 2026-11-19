@@ -76,13 +76,18 @@ files.
 
 ## Drive folders
 
-Any folder can sync without being a repo: `hilo add` on a folder with no repos in it (or
+Any folder can sync without being a repo: `hilo add` on a folder with files and no repos (or
 `hilo add --drive`) makes it a drive, unit `drive:<label>`. Machines match drives by label, the
 folder's name lowercased or `--as LABEL`, and a drive only syncs between machines that added it.
 Its files follow [the rule](#the-rule) like any other; there are no branches or commits. Its
 `.gitignore` files apply, plus `.DS_Store`, `node_modules/` and hilo's own temp files. `.env` files
-and secrets never leave it, and a repo inside it is skipped (add it with `hilo add`). Synced roots
-never nest: a drive can't sit inside or around a linked folder, a repo or another drive.
+and secrets never leave it, nor does hilo's own folder. A repo inside it is skipped; `hilo add` it
+to sync it as a repo. Otherwise synced folders don't nest: a drive can't sit inside a linked folder,
+a repo or another drive, nor hold a linked folder or another drive.
+
+If a drive's folder disappears or another folder takes its place (an unmounted disk, a folder moved
+and recreated), the drive pauses instead of reading that as every file deleted, and catches up when
+the same folder is back. `hilo add --drive` on the new folder makes it the drive.
 
 With no branch to save to, the version that loses a conflict goes to hilo's history on that
 machine: `hilo log PATH` lists it and `hilo restore PATH --conflict` brings it back.

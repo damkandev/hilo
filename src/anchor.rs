@@ -622,6 +622,8 @@ mod tests {
         for d in ["anchor/blobs", "tmp", "secrets", "vault", "index"] {
             std::fs::create_dir_all(home.join(d)).unwrap();
         }
+        let _lock = config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("HILO_HOME");
         std::env::set_var("HILO_HOME", &home);
         let now = unix_now();
         let notes = |p: &str| Some(Scope { unit: "drive:notes".into(), prefix: p.into() });
@@ -764,6 +766,7 @@ mod tests {
         config::save_cloud_tokens(&ts).unwrap();
         core.handle(In::Tick);
         assert!(!core.clients.contains_key(&s) && core.clients.contains_key(&w) && core.clients.contains_key(&r));
+        old.map_or_else(|| std::env::remove_var("HILO_HOME"), |o| std::env::set_var("HILO_HOME", o));
         let _ = std::fs::remove_dir_all(&home);
     }
 }

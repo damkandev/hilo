@@ -114,22 +114,41 @@ pub fn folder_label(p: &Path) -> String {
 }
 
 /// What `hilo add` makes of `path` when it would be a drive, and its label: `mode` "drive" forces
-/// it, "auto" picks it for a folder that is not a repo and has no repos directly inside.
+/// it, "auto" picks it for a folder with files in it, no repos directly inside, and not a repo
+/// itself (an empty folder stays a folder that receives repos).
 pub fn drive_label(path: &Path, mode: &str, label: &str) -> Option<String> {
     let top = git::toplevel(path).and_then(|t| std::fs::canonicalize(t).ok()).is_some_and(|t| t == path);
-    let auto = mode == "auto" && !top && crate::repos_in(path).is_empty();
+    let files = std::fs::read_dir(path).into_iter().flatten().flatten().any(|e| !e.file_name().to_string_lossy().starts_with('.'));
+    let auto = mode == "auto" && !top && files && crate::repos_in(path).is_empty();
     (mode == "drive" || auto).then(|| if label.is_empty() { folder_label(path) } else { label.to_string() })
 }
 
-/// Linked folders, repos and drives in `cfg` that `path` would sit inside or around.
-pub fn overlap(cfg: &Config, path: &Path, kinds: &[&str]) -> Option<String> {
+/// Why `path`, added as a `kind` ("drive", "folder" or "repo"), would nest with a drive, or a drive
+/// with a linked folder or repo. A repo may sit inside a drive: the drive skips it.
+pub fn nests(cfg: &Config, path: &Path, kind: &str) -> Option<String> {
     let mut roots: Vec<(&str, PathBuf)> = vec![];
     for k in ["folder", "repo"] {
         roots.extend(cfg.all(k).into_iter().map(|p| (k, PathBuf::from(p))));
     }
     roots.extend(cfg.drives().into_iter().map(|d| ("drive", d.1)));
-    let (k, r) = roots.into_iter().filter(|(k, _)| kinds.contains(k)).map(|(k, r)| (k, std::fs::canonicalize(&r).unwrap_or(r))).find(|(_, r)| path.starts_with(r) || r.starts_with(path))?;
-    Some(format!("{} overlaps the {k} {} (synced roots never nest)", crate::tui::tilde(path), crate::tui::tilde(&r)))
+    roots.into_iter().filter(|(k, _)| kind == "drive" || *k == "drive").find_map(|(k, r)| {
+        let r = std::fs::canonicalize(&r).unwrap_or(r);
+        let (p, rr) = (crate::tui::tilde(path), crate::tui::tilde(&r));
+        if path.starts_with(&r) && !(kind == "repo" && k == "drive" && path != r) {
+            Some(format!("{p} is inside the {k} {rr}; synced folders don't nest"))
+        } else if r.starts_with(path) && !(kind == "drive" && k == "repo" && path != r) {
+            Some(format!("{p} holds the {k} {rr}; synced folders don't nest"))
+        } else {
+            None
+        }
+    })
+}
+
+/// A drive must not hold hilo's own folder (its keys and history) nor sit inside it.
+pub fn holds_home(path: &Path) -> Option<String> {
+    let home = canonical_maybe_missing(&config::home());
+    (path.starts_with(&home) || home.starts_with(path))
+        .then(|| format!("{} and hilo's own folder {} overlap: hilo's keys and history never sync. Pick another folder (--folder DIR)", crate::tui::tilde(path), crate::tui::tilde(&home)))
 }
 
 /// Checks and records `drive = <label> <path>` (`path` canonical). Ok(false): it was already there.
@@ -147,7 +166,7 @@ pub fn register_drive(cfg: &mut Config, path: &Path, label: &str) -> Result<bool
     if let Some(t) = git::toplevel(path) {
         return Err(format!("{} is inside the git repo {}; add the repo instead", crate::tui::tilde(path), crate::tui::tilde(&t)));
     }
-    if let Some(e) = overlap(cfg, path, &["folder", "repo", "drive"]) {
+    if let Some(e) = holds_home(path).or_else(|| nests(cfg, path, "drive")) {
         return Err(e);
     }
     cfg.add("drive", &format!("{label} {}", path.display()));
@@ -254,6 +273,7 @@ struct D {
     atx: Option<Sender<anchor::In>>,
     dirty: bool,
     warned: HashSet<String>,
+    paused: Vec<Wt>, // drives whose folder is gone or another folder now: back when the same one is
     scope: Option<(config::Scope, bool)>, // from the anchor, when this sandbox joined with a scoped token (+ read-only)
     outside: HashMap<Key, Hash>,          // files changed here that the token may not sync: they stay here
     tmp: PathBuf,
@@ -328,9 +348,59 @@ impl D {
         Some(ri)
     }
 
+    /// Drives whose folder went away or was swapped stop syncing (remote changes for them wait in
+    /// the anchor), so nothing is read as deleted and nothing is written where the folder was.
+    fn pause_drives(&mut self) {
+        let before = self.wts.len();
+        for mut w in std::mem::take(&mut self.wts) {
+            if w.git().is_some() || w.scanner.root_ok().is_ok() {
+                self.wts.push(w);
+                continue;
+            }
+            let _ = w.scanner.save_index();
+            let id = w.id().unwrap_or_default();
+            // unsent edits go; the stale index entries make them be read again on the way back
+            for k in self.r.caught_up().into_iter().filter(|o| o.wt == id).map(|o| (o.wt, o.path)) {
+                self.r.drop_pending(&k);
+            }
+            self.outstanding.retain(|k, _| k.0 != id);
+            self.paused.push(w);
+        }
+        if self.wts.len() != before {
+            self.publish_roots();
+            self.rebuild_watcher();
+        }
+        self.resume_drives();
+    }
+
+    /// Paused drives whose folder is back, the same one as before. They resync: they may have missed changes.
+    fn resume_drives(&mut self) {
+        let mut back = false;
+        for w in std::mem::take(&mut self.paused) {
+            let Unit::Drive(label) = &w.unit else { continue };
+            let label = label.clone();
+            match w.scanner.root_ok() {
+                Ok(_) => {
+                    log!("syncing drive {label} ({})", w.root.display());
+                    self.warned.retain(|k| !k.starts_with(&format!("paused {label}\0")));
+                    self.add_unit(w);
+                    back = true;
+                }
+                Err(e) => {
+                    self.log_once(format!("paused {label}\0{e}"), format!("drive {label} paused: {e}"));
+                    self.paused.push(w);
+                }
+            }
+        }
+        if back {
+            self.rebuild_watcher();
+        }
+    }
+
     /// Picks up new repos in linked folders (one level deep; they need a first commit).
     fn scan_folders(&mut self) {
         self.last_folders = Instant::now();
+        self.pause_drives();
         // repos deleted from disk: stop watching them (their history stays on the anchor)
         let gone: Vec<String> = self.repos.iter().filter(|r| !r.root.join(".git").exists()).map(|r| r.id.clone()).collect();
         if !gone.is_empty() {
@@ -435,19 +505,27 @@ impl D {
         if let Some(label) = drive_label(&path, mode, label) {
             return match register_drive(&mut cfg, &path, &label) {
                 Err(e) => (1, e),
-                Ok(false) => (0, format!("{} is already the drive {label}", crate::tui::tilde(&path))),
-                Ok(true) => {
+                Ok(added) => {
                     let _ = cfg.save();
-                    let wi = self.add_drive(&path, &label);
-                    self.rebuild_watcher();
-                    (0, format!("drive {label}: syncing {} ({} files)", crate::tui::tilde(&path), self.wts[wi].scanner.files.len()))
+                    match self.paused.iter().position(|w| w.root == path) {
+                        // added again: whatever folder is there now is the drive
+                        Some(i) => self.paused[i].scanner.reset_root(),
+                        None if added => self.paused.push(Wt { root: path.clone(), unit: Unit::Drive(label.clone()), scanner: Scanner::drive(&path, &label) }),
+                        None => return (0, format!("{} is already the drive {label}", crate::tui::tilde(&path))),
+                    }
+                    self.resume_drives();
+                    match self.wt_index(&format!("drive:{label}")) {
+                        Some(wi) => (0, format!("drive {label}: syncing {} ({} files)", crate::tui::tilde(&path), self.wts[wi].scanner.files.len())),
+                        None => (1, format!("drive {label}: added, but paused (see `hilo status`)")),
+                    }
                 }
             };
         }
-        if let Some(e) = overlap(&cfg, &path, &["drive"]) {
+        let top = git::toplevel(&path).is_some_and(|t| std::fs::canonicalize(t).ok() == Some(path.clone()));
+        if let Some(e) = nests(&cfg, &path, if top { "repo" } else { "folder" }) {
             return (1, e);
         }
-        if git::toplevel(&path).is_some_and(|t| std::fs::canonicalize(t).ok() == Some(path.clone())) {
+        if top {
             if git::repo_id(&path).is_err() {
                 return (1, "that repo needs at least one commit first".into());
             }
@@ -470,7 +548,8 @@ impl D {
         self.scan_folders();
         self.send(Msg::Resync { wt: "repo:*".into() }); // repos the others already announced
         let n = self.repos.iter().filter(|r| r.root.parent() == Some(path.as_path())).count();
-        (0, format!("linked {} ({n} repos; new ones sync on their own)", crate::tui::tilde(&path)))
+        let hint = if n == 0 { format!("; to sync its files instead: hilo add --drive {}", crate::tui::tilde(&path)) } else { String::new() };
+        (0, format!("linked {} ({n} repos; new ones sync on their own{hint})", crate::tui::tilde(&path)))
     }
 
     fn publish_roots(&self) {
@@ -695,19 +774,14 @@ impl D {
         Some(self.add_unit(Wt { root: root.into(), unit: Unit::Git(GitWt { gitdir, common, repo: repo.into(), branch }), scanner: Scanner::new(root) }))
     }
 
-    /// A drive (`root` canonical). The caller rebuilds the watcher.
-    fn add_drive(&mut self, root: &Path, label: &str) -> usize {
-        log!("syncing drive {label} ({})", root.display());
-        self.add_unit(Wt { root: root.into(), unit: Unit::Drive(label.into()), scanner: Scanner::drive(root, label) })
-    }
-
     fn add_unit(&mut self, mut wt: Wt) -> usize {
         if let Some(id) = wt.id() {
             // index entries the replica doesn't agree with get re-read
             let stale: Vec<String> =
                 wt.scanner.files.iter().filter(|(rel, (_, h))| self.r.confirmed.get(&(id.clone(), rel.to_string())) != Some(h)).map(|(r, _)| r.clone()).collect();
             stale.iter().for_each(|r| wt.scanner.forget(r));
-            if !self.r.confirmed.keys().any(|k| k.0 == id) {
+            // a drive may have been paused or away: it always asks for what it missed
+            if wt.git().is_none() || !self.r.confirmed.keys().any(|k| k.0 == id) {
                 self.needs_resync.insert(id.clone());
             }
         }
@@ -898,8 +972,20 @@ impl D {
             }
         }
         self.outstanding.remove(&k);
+        let before = self.r.confirmed.get(&k).copied();
         let fx = self.r.applied(&op, dh, Data::from_opt(disk));
-        self.apply_file(wi, &op.path, fx, &op.origin, false);
+        if !self.apply_file(wi, &op.path, fx, &op.origin, false) {
+            self.unconfirm(k, before);
+        }
+    }
+
+    /// A version this machine could not apply is not what it has: confirmed goes back, so the file
+    /// is neither trusted as up to date nor sent as a fresh edit on top of a version it never had.
+    fn unconfirm(&mut self, k: Key, before: Option<Hash>) {
+        match before {
+            Some(h) => self.r.confirmed.insert(k, h),
+            None => self.r.confirmed.remove(&k),
+        };
     }
 
     fn hold_reason(&self, wi: usize, path: &str, origin: &str, new: Option<&[u8]>) -> Option<String> {
@@ -936,7 +1022,11 @@ impl D {
         self.dirty = true;
     }
 
-    fn apply_file(&mut self, wi: usize, path: &str, fx: Vec<Effect>, origin: &str, approved: bool) {
+    /// False if something could not be done (the file is left alone).
+    fn apply_file(&mut self, wi: usize, path: &str, fx: Vec<Effect>, origin: &str, approved: bool) -> bool {
+        if self.wts[wi].git().is_none() && self.wts[wi].scanner.root_ok().is_err() {
+            return false; // the drive's folder is gone: it gets paused and resyncs on its way back
+        }
         let root = self.wts[wi].root.clone();
         let branch = self.wts[wi].git().map(|g| g.branch.clone().unwrap_or_else(|| "detached".into())); // None = a drive
         let id = self.wts[wi].id().unwrap_or_default();
@@ -944,9 +1034,12 @@ impl D {
             match e {
                 Effect::Save(d) => {
                     let Some(c) = d.content() else { continue };
+                    if c.is_none() && branch.is_none() {
+                        continue; // a drive's deletion lost: the file just comes back, nothing to keep
+                    }
                     if let Err(e) = self.store.put(&id, path, c, Kind::Conflict, &self.sh.name) {
                         log!("conflict on {path}: could not keep this machine's version in history ({e}); leaving the file alone");
-                        return;
+                        return false;
                     }
                     // a drive keeps it in the history only; a repo also on a conflict branch
                     let (kept, how) = match &branch {
@@ -957,7 +1050,7 @@ impl D {
                             Err(e) => {
                                 // never overwrite what we could not save
                                 log!("conflict on {path}: could not save this machine's version ({e}); leaving the file alone");
-                                return;
+                                return false;
                             }
                         },
                     };
@@ -988,12 +1081,13 @@ impl D {
                         Ok(st) => self.wts[wi].scanner.note(path, st, hash_of(c)),
                         Err(e) => {
                             log!("could not write {path}: {e}; leaving the file alone");
-                            return;
+                            return false;
                         }
                     }
                 }
             }
         }
+        true
     }
 
     fn on_reject(&mut self, rej: Reject) {
@@ -1027,8 +1121,12 @@ impl D {
             return;
         }
         let disk = read_disk(&self.wts[wi].root, &rej.path);
+        let k = (rej.wt.clone(), rej.path.clone());
+        let before = self.r.confirmed.get(&k).copied();
         let fx = self.r.rejected(&rej, hash_of(disk.as_deref()), Data::from_opt(disk));
-        self.apply_file(wi, &rej.path, fx, &rej.origin, false);
+        if !self.apply_file(wi, &rej.path, fx, &rej.origin, false) {
+            self.unconfirm(k, before);
+        }
     }
 
     // ---------- commits ----------
@@ -1492,6 +1590,9 @@ impl D {
                 s += &format!("drive     {} ({l}, {} files){}\n", crate::tui::tilde(&w.root), w.scanner.files.len(), waiting(w));
             }
         }
+        for w in &self.paused {
+            s += &format!("drive     {} (paused: {})\n", crate::tui::tilde(&w.root), w.scanner.root_ok().err().map_or("starting".into(), |e| e.to_string()));
+        }
         s += "worktrees\n";
         for w in &self.wts {
             let Some(g) = w.git() else { continue };
@@ -1868,6 +1969,7 @@ pub fn run() -> io::Result<()> {
         atx: atx_keep,
         dirty: false,
         warned: HashSet::new(),
+        paused: vec![],
         scope: None,
         outside: HashMap::new(),
         tmp: config::path("tmp"),
@@ -1886,13 +1988,13 @@ pub fn run() -> io::Result<()> {
     }
     d.prune();
     for (label, p) in cfg.drives() {
-        match std::fs::canonicalize(&p) {
-            Ok(root) => {
-                d.add_drive(&root, &label);
-            }
-            Err(e) => log!("drive {label}: {}: {e}; not syncing it", p.display()),
+        let root = std::fs::canonicalize(&p).unwrap_or(p);
+        match holds_home(&root) {
+            Some(e) => log!("drive {label}: {e}; not syncing it"),
+            None => d.paused.push(Wt { scanner: Scanner::drive(&root, &label), root, unit: Unit::Drive(label) }),
         }
     }
+    d.resume_drives();
     d.scan_folders();
     d.discover();
     if d.watcher.is_none() && !d.wts.is_empty() {
@@ -1961,28 +2063,39 @@ mod tests {
     #[test]
     fn drive_roots_never_nest() {
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("hilo-ov-{}", crate::crypto::hex(&crate::crypto::random::<4>())));
-        for d in ["code/app", "notes/sub", "docs", "solo", "My Stuff", "empty"] {
+        for d in ["code/app", "notes/sub", "docs/r", "solo", "My Stuff", "empty"] {
             std::fs::create_dir_all(base.join(d)).unwrap();
         }
+        std::fs::write(base.join("My Stuff/a.md"), "a").unwrap();
         let p = |d: &str| base.join(d);
         let mut cfg = Config::default();
         cfg.add("folder", &p("code").to_string_lossy());
         cfg.add("repo", &p("solo").to_string_lossy());
+        cfg.add("repo", &p("docs/r").to_string_lossy());
         assert_eq!(register_drive(&mut cfg, &p("notes"), "notes"), Ok(true));
         assert_eq!(register_drive(&mut cfg, &p("notes"), "notes"), Ok(false)); // again: nothing to do
-        for (path, label) in [("notes/sub", "sub"), ("code/app", "app"), ("code", "c2"), ("solo", "s"), ("docs", "notes"), ("docs", ".x"), ("docs", "a b")] {
+        for (path, label) in [("notes/sub", "sub"), ("code/app", "app"), ("code", "c2"), ("solo", "s"), ("docs/r/x", "x"), ("empty", "notes"), ("empty", ".x"), ("empty", "a b")] {
+            std::fs::create_dir_all(p(path)).unwrap();
             assert!(register_drive(&mut cfg, &p(path), label).is_err(), "{path} as {label}");
         }
         assert!(register_drive(&mut cfg, &base, "all").is_err()); // around everything
+        assert_eq!(register_drive(&mut cfg, &p("docs"), "docs"), Ok(true)); // a repo inside a drive is fine: the drive skips it
         assert_eq!(register_drive(&mut cfg, &p("My Stuff"), "stuff"), Ok(true));
-        assert_eq!(cfg.drives().iter().map(|d| d.0.as_str()).collect::<Vec<_>>(), ["notes", "stuff"]);
-        // the other way round: a folder or repo inside or around a drive
-        assert!(overlap(&cfg, &p("notes/sub"), &["drive"]).is_some() && overlap(&cfg, &base, &["drive"]).is_some());
-        assert!(overlap(&cfg, &p("docs"), &["drive"]).is_none());
-        // `hilo add` picks a drive only for a folder without repos
-        assert_eq!(drive_label(&p("empty"), "auto", ""), Some("empty".into()));
+        assert_eq!(cfg.drives().iter().map(|d| d.0.as_str()).collect::<Vec<_>>(), ["notes", "docs", "stuff"]);
+        // the other way round
+        assert!(nests(&cfg, &p("notes/sub"), "folder").is_some() && nests(&cfg, &base, "folder").is_some());
+        assert!(nests(&cfg, &base, "repo").is_some() && nests(&cfg, &p("notes"), "repo").is_some());
+        assert_eq!(nests(&cfg, &p("notes/sub"), "repo"), None); // `hilo add` a repo found inside a drive
+        assert_eq!(nests(&cfg, &p("empty"), "folder"), None);
+        // never around or inside hilo's own folder
+        let home = canonical_maybe_missing(&config::home());
+        assert!(holds_home(&home).is_some() && holds_home(home.parent().unwrap()).is_some() && holds_home(&home.join("x")).is_some());
+        assert_eq!(holds_home(&p("empty")), None);
+        // `hilo add` picks a drive only for a folder with files and without repos
+        assert_eq!(drive_label(&p("empty"), "auto", ""), None); // empty: a folder that receives repos
+        assert_eq!(drive_label(&p("empty"), "drive", ""), Some("empty".into()));
         assert_eq!(drive_label(&p("My Stuff"), "auto", "mine"), Some("mine".into()));
-        assert_eq!(drive_label(&p("empty"), "", ""), None);
+        assert_eq!(drive_label(&p("My Stuff"), "", ""), None);
         std::fs::create_dir_all(p("code/app/.git")).unwrap();
         assert_eq!(drive_label(&p("code"), "auto", ""), None);
         assert_eq!(drive_label(&p("code"), "drive", ""), Some("code".into()));

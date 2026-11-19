@@ -90,8 +90,8 @@ Or by hand:
 Both link the folder you run them in (or --folder DIR): every repo in it syncs, and new repos you
 create there appear on the other machines on their own. The rest is optional:
 
-  hilo add FOLDER [--as LABEL]              link another folder of repos, a single repo, or any other
-                                            folder as a drive (--drive: always a drive)
+  hilo add FOLDER [--drive] [--as LABEL]    link another folder of repos, a single repo, or a folder
+                                            of files as a drive (--drive or --as: always a drive)
 
 Cloud agents (Claude Code on the web, Codex, Cursor, Codespaces, dev containers…):
 
@@ -168,10 +168,10 @@ fn register(cfg: &mut Config, path: &Path, drive: Option<&str>) -> Result<String
         daemon::register_drive(cfg, &path, label)?;
         return Ok(format!("drive    {} ({label})", tui::tilde(&path)));
     }
-    if let Some(e) = daemon::overlap(cfg, &path, &["drive"]) {
+    let top = git::toplevel(&path).and_then(|t| std::fs::canonicalize(t).ok());
+    if let Some(e) = daemon::nests(cfg, &path, if top.as_deref() == Some(path.as_path()) { "repo" } else { "folder" }) {
         return Err(e);
     }
-    let top = git::toplevel(&path).and_then(|t| std::fs::canonicalize(t).ok());
     if top.as_deref() == Some(path.as_path()) {
         git::repo_id(&path).map_err(|_| format!("{} needs at least one commit", path.display()))?;
         cfg.add("repo", &path.to_string_lossy());
@@ -183,7 +183,9 @@ fn register(cfg: &mut Config, path: &Path, drive: Option<&str>) -> Result<String
         return Err(format!("another linked folder is already called \"{label}\""));
     }
     cfg.add("folder", &path.to_string_lossy());
-    Ok(format!("folder   {} ({} repos; new ones sync on their own)", tui::tilde(&path), repos_in(&path).len()))
+    let n = repos_in(&path).len();
+    let hint = if n == 0 { format!("; to sync its files instead: hilo add --drive {}", tui::tilde(&path)) } else { String::new() };
+    Ok(format!("folder   {} ({n} repos; new ones sync on their own{hint})", tui::tilde(&path)))
 }
 
 fn daemon_up() -> bool {
@@ -560,7 +562,7 @@ fn add(args: &[String]) -> Result<(), String> {
     let usage = "usage: hilo add [--drive] FOLDER [--as LABEL]";
     let label = flag(args, "--as").unwrap_or_default();
     let p = args.iter().enumerate().find(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--as")).ok_or(usage)?.1;
-    let mode = if args.iter().any(|a| a == "--drive") { "drive" } else { "auto" };
+    let mode = if args.iter().any(|a| a == "--drive") || !label.is_empty() { "drive" } else { "auto" }; // only drives have labels
     let path = std::fs::canonicalize(p).map_err(|_| format!("{p}: no such folder"))?;
     if !path.is_dir() {
         return Err(format!("{p} is not a folder"));

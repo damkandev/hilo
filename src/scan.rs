@@ -33,6 +33,11 @@ pub struct Scanner {
     dirty_index: bool,
     /// drives: the empty bare repo `git check-ignore` runs against
     drive: Option<PathBuf>,
+    /// drives: (device, inode) of the root, kept in the index, so a folder swapped in at the same
+    /// path (unmounted, moved and recreated) is never read as "every file was deleted"
+    root_id: Option<(u64, u64)>,
+    /// hilo's own folder (keys, history): never scanned, whatever holds it
+    home: PathBuf,
 }
 
 fn index_path(root: &Path) -> String {
@@ -51,14 +56,41 @@ impl Scanner {
             warned: HashSet::new(),
             dirty_index: false,
             drive: None,
+            root_id: None,
+            home: crate::daemon::canonical_maybe_missing(&crate::config::home()),
         };
-        // Persistent index: a restart doesn't re-hash the whole repo.
+        // Persistent index: a restart doesn't re-hash the whole repo. Path "" holds the root's identity.
         let raw = std::fs::read(crate::config::path(&index_path(root))).unwrap_or_default();
         let mut r = Rd(&raw);
         while let (Some(p), Some(a), Some(b), Some(c), Some(d), Some(h)) = (r.str(), r.u64(), r.u64(), r.u64(), r.u64(), r.hash()) {
-            s.files.insert(p, ((a as i64, b as i64, c, d), h));
+            if p.is_empty() {
+                s.root_id = Some((a, b));
+            } else {
+                s.files.insert(p, ((a as i64, b as i64, c, d), h));
+            }
         }
         s
+    }
+
+    /// Drives: the root is a folder, and the same folder the index was built from.
+    pub fn root_ok(&self) -> io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let gone = || io::Error::other(format!("drive folder {} is gone", self.root.display()));
+        let m = std::fs::metadata(&self.root).ok().filter(|m| m.is_dir()).ok_or_else(gone)?;
+        match (m.dev(), m.ino()) {
+            id if self.root_id.is_some_and(|r| r != id) => {
+                Err(io::Error::other(format!("{} is another folder now (unmounted, or moved and recreated); `hilo add --drive` it to sync this one", self.root.display())))
+            }
+            id => Ok(id),
+        }
+    }
+
+    /// The user says the folder there now is the drive: forget the old one's index, so files it
+    /// doesn't have are fetched again instead of deleted everywhere.
+    pub fn reset_root(&mut self) {
+        self.root_id = None;
+        self.files.clear();
+        self.dirty_index = true;
     }
 
     pub fn drive(root: &Path, label: &str) -> Self {
@@ -74,6 +106,9 @@ impl Scanner {
         let mut w = W::default();
         for (p, ((a, b, c, d), h)) in &self.files {
             w.str(p).u64(*a as u64).u64(*b as u64).u64(*c).u64(*d).hash(h);
+        }
+        if let Some((dev, ino)) = self.root_id {
+            w.str("").u64(dev).u64(ino).u64(0).u64(0).hash(&[0; 32]);
         }
         self.dirty_index = false;
         crate::config::write_private(&index_path(&self.root), &w.0)
@@ -168,8 +203,18 @@ impl Scanner {
 
     /// Look at `prefix` ("" = everything): a file, a directory, or something now gone.
     fn walk(&mut self, prefix: &str) -> io::Result<Changes> {
-        if self.drive.is_some() && !self.root.is_dir() {
-            return Err(io::Error::other(format!("drive folder {} is gone", self.root.display())));
+        if self.root.starts_with(&self.home) {
+            return Err(io::Error::other(format!("{} is inside hilo's own folder; not syncing it", self.root.display())));
+        }
+        if !prefix.is_empty() && self.root.join(prefix).starts_with(&self.home) {
+            return Ok(Changes::default());
+        }
+        if self.drive.is_some() {
+            let id = self.root_ok()?;
+            if self.root_id.is_none() {
+                self.root_id = Some(id);
+                self.dirty_index = true;
+            }
         }
         if self.drive.is_none() && !self.root.join(".git").exists() {
             return Err(io::Error::other(format!("{} is not a git worktree anymore", self.root.display())));
@@ -224,7 +269,7 @@ impl Scanner {
                     continue;
                 };
                 if m.is_dir() {
-                    if !m.file_type().is_symlink() && !self.nested(&rel) && !self.is_ignored(&format!("{rel}/"))? {
+                    if !m.file_type().is_symlink() && self.root.join(&rel) != self.home && !self.nested(&rel) && !self.is_ignored(&format!("{rel}/"))? {
                         out.dirs.push(rel.clone());
                         stack.push(rel);
                     }
@@ -232,6 +277,14 @@ impl Scanner {
                 }
                 self.look(&rel, &m, &mut out, &mut seen, &mut rules_changed)?;
             }
+        }
+        if complete && prefix.is_empty() && self.drive.is_some() && seen.is_empty() && !self.files.is_empty() {
+            // an unmounted or emptied-at-once drive must not turn into deletions on every machine
+            return Err(io::Error::other(format!(
+                "drive folder {} is empty but had {} files; not deleting them everywhere (files deleted one at a time still sync)",
+                self.root.display(),
+                self.files.len()
+            )));
         }
         if complete {
             let under = |k: &str| prefix.is_empty() || k == prefix || k.starts_with(&format!("{prefix}/"));
@@ -333,7 +386,7 @@ mod tests {
     fn scan_sees_changes_and_respects_ignores() {
         let d = crate::git::tests::temp_repo();
         std::fs::write(d.join(".gitignore"), "node_modules/\n*.log\n.env*\n").unwrap();
-        let mut s = Scanner { root: d.clone(), ignore: None, ignored: HashMap::new(), files: HashMap::new(), env: HashMap::new(), gitignores: HashMap::new(), warned: HashSet::new(), dirty_index: false, drive: None };
+        let mut s = Scanner { root: d.clone(), ignore: None, ignored: HashMap::new(), files: HashMap::new(), env: HashMap::new(), gitignores: HashMap::new(), warned: HashSet::new(), dirty_index: false, drive: None, root_id: None, home: PathBuf::from("/nonexistent") };
         let mut first: Vec<String> = s.scan().unwrap().files.into_iter().map(|c| c.0).collect();
         first.sort();
         assert_eq!(first, [".gitignore", "a.txt"]);
@@ -363,6 +416,7 @@ mod tests {
 
     #[test]
     fn drive_scan() {
+        let _home = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner()); // its ignore repo lives there
         let d = std::env::temp_dir().join(format!("hilo-drive-{}", hex(&crate::crypto::random::<4>())));
         let w = |p: &str, c: &str| {
             std::fs::create_dir_all(d.join(p).parent().unwrap()).unwrap();
@@ -403,5 +457,49 @@ mod tests {
         assert_eq!(s.check(&["a.txt".into()]).unwrap().files, vec![("a.txt".to_string(), None)]);
         std::fs::remove_dir_all(&d).unwrap();
         assert!(s.scan().is_err()); // the folder is gone: an error, not every file deleted
+    }
+
+    #[test]
+    fn drive_root_swapped_or_emptied() {
+        let _home = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        crate::config::ensure_home().unwrap(); // the index lives there
+        let d = std::env::temp_dir().join(format!("hilo-swap-{}", hex(&crate::crypto::random::<4>())));
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("a.txt"), "a").unwrap();
+        std::fs::write(d.join("sub/b.txt"), "b").unwrap();
+        let d = std::fs::canonicalize(&d).unwrap();
+        let label = format!("t{}", hex(&crate::crypto::random::<4>()));
+        let mut s = Scanner::drive(&d, &label);
+        assert_eq!(s.scan().unwrap().files.len(), 2);
+        s.save_index().unwrap();
+        // everything deleted at once (or the volume's contents vanished): not a mass delete
+        std::fs::remove_file(d.join("a.txt")).unwrap();
+        std::fs::remove_file(d.join("sub/b.txt")).unwrap();
+        assert!(s.scan().is_err());
+        // deletions the watcher reports one by one still sync
+        assert_eq!(s.check(&["a.txt".into()]).unwrap().files, vec![("a.txt".to_string(), None)]);
+        std::fs::write(d.join("a.txt"), "a").unwrap();
+        std::fs::write(d.join("sub/b.txt"), "b").unwrap();
+        s.scan().unwrap();
+        s.save_index().unwrap();
+        // the folder moved away and an empty one took its place (or an unmounted mount point)
+        let away = d.with_extension("away");
+        std::fs::rename(&d, &away).unwrap();
+        std::fs::create_dir(&d).unwrap();
+        assert!(s.scan().is_err() && s.root_ok().is_err());
+        let mut again = Scanner::drive(&d, &label); // a restart remembers which folder it was
+        assert!(again.root_ok().is_err() && again.scan().is_err());
+        // the same folder back: fine
+        std::fs::remove_dir(&d).unwrap();
+        std::fs::rename(&away, &d).unwrap();
+        assert!(Scanner::drive(&d, &label).root_ok().is_ok());
+        // re-added on purpose: the new folder is the drive, and what it lacks is not "deleted"
+        std::fs::rename(&d, &away).unwrap();
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("c.txt"), "c").unwrap();
+        again.reset_root();
+        assert_eq!(again.scan().unwrap().files, vec![("c.txt".to_string(), Some(b"c".to_vec()))]);
+        std::fs::remove_dir_all(&d).unwrap();
+        std::fs::remove_dir_all(&away).unwrap();
     }
 }

@@ -15,8 +15,8 @@ línea de comandos está en inglés.
 | `hilo setup HOST [--folder DIR]` | el asistente sin preguntas: configura `HOST` por SSH y empareja esta máquina con él |
 | `hilo init [--listen IP:PUERTO] [--public] [--bind IP:PUERTO]` | deja esta máquina como ancla e imprime un código de unión ([Despliegue](deployment.es.md)) |
 | `hilo join CÓDIGO@IP:PUERTO` | se une a un ancla |
-| `hilo add DIR [--as ETIQUETA]` | vincula otra carpeta de repos, o un solo repo. Una carpeta sin repos adentro queda como [drive](architecture.es.md#carpetas-drive): sus archivos se sincronizan tal cual, y las máquinas la reconocen por `ETIQUETA` (por defecto, el nombre de la carpeta en minúsculas) |
-| `hilo add --drive DIR [--as ETIQUETA]` | vincula `DIR` como drive aunque tenga repos adentro (se saltan: agrega cada uno con `hilo add`) |
+| `hilo add DIR` | vincula otra carpeta de repos, o un solo repo. Una carpeta con archivos y sin repos adentro queda como [drive](architecture.es.md#carpetas-drive): sus archivos se sincronizan tal cual. Una carpeta vacía queda como carpeta que recibe repos |
+| `hilo add --drive DIR [--as ETIQUETA]` | vincula `DIR` como drive, vacía o con repos adentro (se saltan; `hilo add` sobre uno lo sincroniza como repo). Las máquinas reconocen un drive por `ETIQUETA`, por defecto el nombre de la carpeta en minúsculas; `--as` solo también significa drive. Sobre un drive cuya carpeta se desmontó o se reemplazó, deja como drive la carpeta que está ahí ahora |
 | `hilo up [--read-only] [--drive ETIQUETA]` | en el script de setup de un sandbox: une, vincula, arranca y espera a quedar al día ([Agentes en la nube](cloud-agents.es.md)). `--drive ETIQUETA` vincula la carpeta (la crea si no existe) como ese drive |
 | `hilo uninstall` | quita el servicio, los hooks y la configuración; tus repos quedan como repos git normales |
 
