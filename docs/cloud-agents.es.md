@@ -30,6 +30,26 @@ Después, en la plataforma:
 (sin systemd ni launchd) y espera a quedar sincronizado. `HILO_NAME` define el nombre de la máquina
 (por defecto `cloud-<host>`).
 
+## Una carpeta, por un rato, solo lectura
+
+Un token puede ver menos que todo:
+
+```sh
+hilo token create --addr hilo.example.com:7710 --path ~/notas/planes --expires 24h --read-only
+```
+
+- `--path P` limita el sandbox a un solo lugar, resuelto en el ancla: dentro de un drive, esa carpeta
+  (o el drive entero); dentro de un repo, el repo entero (un repo se comparte completo). Nada de
+  afuera le llega: ni los archivos, ni los leases, ni el historial con que se pone al día. Lo que
+  escribe afuera se descarta.
+- `--expires 30m|24h|7d` vence el token: ningún sandbox nuevo entra con él, y los conectados quedan
+  fuera en menos de 30 segundos.
+- `--read-only`: el ancla rechaza toda escritura del sandbox (su versión queda en su propio historial
+  como conflicto y el archivo vuelve atrás). Corre `sh -s -- up --read-only` (o define
+  `HILO_READONLY=1`) para que las herramientas del propio sandbox rechacen la escritura antes.
+
+`hilo token ls` muestra qué ve cada token, cuándo vence y si es de solo lectura.
+
 ## Proxies
 
 Los sandboxes que solo salen a internet a través de un proxy funcionan tal cual: hilo pasa por
@@ -43,4 +63,4 @@ Tailscale en modo userspace también sirve.
 | **Alcance** | El sandbox tiene que llegar al ancla: usa un VPS como ancla, un puerto abierto en el router o un dominio, y permítelo en la configuración de red de la plataforma. Si la plataforma corta la red al terminar el setup, hilo solo sincroniza durante el setup. Mira [Despliegue](deployment.es.md). |
 | **Mismo repo, cualquier clon** | Un repo es su primer commit más `dueño/repo`, así que un clon hecho a través del proxy de git de la plataforma sigue siendo el mismo repo. |
 | **Secretos** | Sin `--env`, un sandbox nunca recibe las llaves de la bóveda. Con `--env` recibe la capa compartida; las claves de `hilo env prod` nunca salen de tu máquina. |
-| **Limpieza** | Los sandboxes que no se conectan en 7 días se olvidan. `hilo token revoke ID` corta de una vez a todos los que usaron ese token. |
+| **Limpieza** | Los sandboxes que no se conectan en 7 días se olvidan. `hilo token revoke ID` corta de una vez a todos los que usaron ese token; un token vencido hace lo mismo solo. |

@@ -20,6 +20,11 @@ a description of the design and its tests, not as a guarantee.
 - **Pairing:** a single-use, 10-minute code mixed into a `Noise_XXpsk3_25519_ChaChaPoly_SHA256` handshake (run by `snow`), tested against the official cacophony vectors. After pairing, only known keys connect, and each side pins the other's key.
 - **The anchor** listens only on the private address you choose. A public one needs `--public`. Before a peer authenticates: a 1 MiB frame cap, a 5-second handshake timeout and at most 16 pending connections.
 
+## Scoped tokens
+
+- **A token made with `--path`** sees one folder of a drive (or the whole drive), or one whole repo: its branches, its announcement and its sealed `.env` values (the vault keys still need `--env`). The anchor filters every message it sends that sandbox (catch-up, live changes, re-sends, leases) through one check, and drops its changes, claims and releases outside the scope without answering, because an answer would carry the content. What it can still see: the names of the machines online and the anchor's change counter.
+- **`--read-only`:** the anchor turns down each write with the current version and ignores its claims. **`--expires`** and **`hilo token revoke`:** the token leaves the handshake list, a sandbox that joined with it can't reconnect, and a connected one is cut within 30 seconds.
+
 ## Files
 
 - **Every receiver checks every path itself.** It refuses `.git` in any case or Unicode disguise, opens each parent with `openat(O_NOFOLLOW)`, creates temp files with `O_EXCL`, never sets setuid, and refuses names that collide on a case-insensitive disk.
