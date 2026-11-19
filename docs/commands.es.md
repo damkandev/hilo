@@ -26,8 +26,11 @@ línea de comandos está en inglés.
 
 | Comando | |
 | --- | --- |
-| `hilo status [--latency]` | máquinas conectadas, carpetas vinculadas, leases, conflictos, aprobaciones pendientes, latencia p50/p95 |
+| `hilo status [--latency]` | máquinas conectadas, carpetas vinculadas, leases, conflictos, historial, aprobaciones pendientes, latencia p50/p95 |
 | `hilo approve [RUTA \| --all \| --deny RUTA]` | revisa un cambio remoto a una ruta que ejecuta código |
+| `hilo log RUTA` | todas las versiones de un archivo que guardó esta máquina, de la más nueva a la más vieja: cuándo, cómo (`local`, `remote`, `conflict`, `replaced`, `restored`), quién, tamaño |
+| `hilo restore RUTA [--at N \| --conflict]` | trae de vuelta una versión: la más nueva que difiere del archivo, la línea `N` de `hilo log`, o la que perdió el último conflicto. Se sincroniza como una escritura nueva |
+| `hilo trash [DIR]` | archivos borrados dentro de `DIR` (por defecto: todo el repo) que hilo puede traer de vuelta |
 | `hilo run -- npm run dev` | corre con las variables, sin escribir ningún archivo |
 
 ## Variables de entorno
@@ -59,6 +62,8 @@ línea de comandos está en inglés.
 | `env = strict` | nunca escribe archivos `.env`; las variables solo llegan a `hilo run` |
 | `readonly` | máquinas que no pueden escribir aquí (`hilo trust`) |
 | `bind` | escucha en una dirección distinta de la que anuncia (NAT, contenedores) |
+| `history_days` | cuánto tiempo quedan las versiones viejas en `~/.hilo/store` (por defecto `30`); la versión más nueva de cada archivo queda siempre |
+| `history_max_mb` | lo máximo que puede ocupar el historial, en MB (por defecto `5120`); primero se van las versiones más viejas |
 
 ## Entorno
 

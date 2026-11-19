@@ -10,6 +10,7 @@ use crate::lease;
 use crate::log;
 use crate::net;
 use crate::scan::{Changes, Scanner};
+use crate::store::Kind;
 use crate::sync::{hash_of, meta_hash, meta_payload, parse_meta, parse_ref, ref_hash, ref_payload, Data, Effect, Hash, Key, Op, Reject, Replica, META, NONE, REF};
 use crate::vault::{self, Store};
 use crate::watch::Watcher;
@@ -27,6 +28,7 @@ const VERIFY: Duration = Duration::from_secs(30); // full walk even with a watch
 const POLL: Duration = Duration::from_secs(1); // plan B without a watcher
 const SAVE: Duration = Duration::from_secs(2);
 const TIME_SYNC: Duration = Duration::from_secs(30);
+const PRUNE: Duration = Duration::from_secs(3600);
 
 pub enum Ev {
     Up(Sender<Msg>),
@@ -161,6 +163,7 @@ struct D {
     last_folders: Instant,
     wts: Vec<Wt>,
     vaults: HashMap<String, Store>,
+    store: crate::store::Store,
     vkeys: BTreeMap<u32, [u8; 32]>,
     held: Vec<Held>,
     cache: Cache,
@@ -190,6 +193,14 @@ fn read_disk(root: &Path, rel: &str) -> Option<Vec<u8>> {
     let p = root.join(rel);
     std::fs::symlink_metadata(&p).ok().filter(|m| m.is_file())?;
     std::fs::read(p).ok()
+}
+
+fn human(n: u64) -> String {
+    match n {
+        0..1024 => format!("{n} B"),
+        1024..1048576 => format!("{:.1} KB", n as f64 / 1024.0),
+        _ => format!("{:.1} MB", n as f64 / 1048576.0),
+    }
 }
 
 fn safe_dir(b: &str) -> String {
@@ -449,6 +460,15 @@ impl D {
                 continue; // waiting for approval: don't overwrite it from here
             }
             let h = hash_of(data.as_deref());
+            if h == self.r.expected(&(id.clone(), path.clone())) {
+                continue;
+            }
+            // a restore was already recorded with this content
+            if self.store.history(&id, &path).first().map(|e| e.hash) != Some(h) {
+                if let Err(e) = self.store.put(&id, &path, data.as_deref(), Kind::Local, &self.sh.name) {
+                    self.log_once(format!("store {e}"), format!("history: cannot keep {path}: {e}"));
+                }
+            }
             if let Some(op) = self.r.local(&id, &path, h, Data::from_opt(data)) {
                 self.send_op(op);
             }
@@ -777,6 +797,10 @@ impl D {
             match e {
                 Effect::Save(d) => {
                     let Some(c) = d.content() else { continue };
+                    if let Err(e) = self.store.put(&id, path, c, Kind::Conflict, &self.sh.name) {
+                        log!("conflict on {path}: could not keep this machine's version in history ({e}); leaving the file alone");
+                        return;
+                    }
                     if git::in_head(&root, path, c) {
                         continue; // already in a commit: nothing to lose
                     }
@@ -805,9 +829,12 @@ impl D {
                             continue;
                         }
                     }
-                    match fsops::write(&root, path, c) {
+                    match self.store.keep_and_write(&root, &id, path, c, Kind::Remote, origin) {
                         Ok(st) => self.wts[wi].scanner.note(path, st, hash_of(c)),
-                        Err(e) => log!("could not write {path}: {e}"),
+                        Err(e) => {
+                            log!("could not write {path}: {e}; leaving the file alone");
+                            return;
+                        }
                     }
                 }
             }
@@ -1100,6 +1127,86 @@ impl D {
         }
     }
 
+    // ---------- history ----------
+
+    fn prune(&mut self) {
+        let cfg = Config::load();
+        let days = cfg.get("history_days").and_then(|v| v.parse().ok()).unwrap_or(30);
+        let mb: u64 = cfg.get("history_max_mb").and_then(|v| v.parse().ok()).unwrap_or(5120);
+        match self.store.prune(days, mb << 20) {
+            Ok((0, 0)) => {}
+            Ok((n, b)) => log!("history: pruned {n} old versions, freed {} MB", b >> 20),
+            Err(e) => log!("history: prune failed: {e}"),
+        }
+    }
+
+    /// (worktree index, unit id, path inside it) for a path from the CLI.
+    fn locate(&self, p: &str) -> Option<(usize, String, String)> {
+        let wi = self.wt_for_cwd(p)?;
+        let rel = canonical_maybe_missing(Path::new(p)).strip_prefix(&self.wts[wi].root).ok()?.to_str()?.to_string();
+        Some((wi, self.wts[wi].id()?, rel))
+    }
+
+    fn history_cmd(&mut self, a: &[&str]) -> Result<String, String> {
+        let file = |d: &Self, p: &str| d.locate(p).filter(|x| valid_path(&x.2)).ok_or(format!("{p} is not a file in a synced worktree"));
+        match a {
+            ["log", p] => {
+                let (_, id, rel) = file(self, p)?;
+                let h = self.store.history(&id, &rel);
+                if h.is_empty() {
+                    return Ok(format!("no history for {rel}"));
+                }
+                Ok(h.iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let size = if e.hash == NONE { "deleted".into() } else { self.store.size(&e.hash).map_or("-".into(), human) };
+                        let who = if e.origin.is_empty() { "-" } else { &e.origin };
+                        format!("{:>3}  {}  {:<8}  {who:<12}  {size:>9}  {}", i + 1, crate::date(e.t_ms / 1000), e.kind.name(), &crate::crypto::hex(&e.hash)[..8])
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            ["restore", p, mode @ ..] => {
+                let (wi, id, rel) = file(self, p)?;
+                let root = self.wts[wi].root.clone();
+                let disk = hash_of(read_disk(&root, &rel).as_deref());
+                let h = self.store.history(&id, &rel);
+                let e = match mode {
+                    [] => h.iter().find(|e| e.hash != NONE && e.hash != disk).ok_or("no other version to restore")?,
+                    ["--conflict"] => h.iter().find(|e| e.hash != NONE && e.kind == Kind::Conflict).ok_or("no conflict on record for this file")?,
+                    ["--at", n] => h.get(n.parse::<usize>().map_err(|_| "--at wants a line number from `hilo log`")?.wrapping_sub(1)).ok_or("no such version")?,
+                    _ => return Err("usage: hilo restore PATH [--at N | --conflict]".into()),
+                };
+                if e.hash == NONE {
+                    return Err("that version is a deletion; nothing to restore".into());
+                }
+                let (hash, when) = (e.hash, crate::date(e.t_ms / 1000));
+                let data = self.store.get(&hash).ok().flatten().filter(|d| sha256(d) == hash).ok_or("that version is missing from the store")?;
+                if hash == disk {
+                    return Ok(format!("{rel} already has that version"));
+                }
+                self.store.keep_and_write(&root, &id, &rel, Some(&data), Kind::Restored, &self.sh.name).map_err(|e| format!("could not restore {rel}: {e}"))?;
+                self.scan_wt(wi, Some(&[rel.clone()])); // syncs as a new write
+                Ok(format!("{rel}: restored the version from {when}"))
+            }
+            ["trash", dir, rest @ ..] => {
+                let (wi, id, rel) = self.locate(dir).ok_or(format!("{dir} is not in a synced worktree"))?;
+                let prefix = if rest == ["--unit"] { "" } else { &rel };
+                let root = self.wts[wi].root.clone();
+                let out: Vec<String> = self
+                    .store
+                    .deleted(&id, prefix)
+                    .into_iter()
+                    .filter(|e| self.store.history(&id, &e.path).iter().any(|v| v.hash != NONE))
+                    .filter(|e| !root.join(&e.path).exists())
+                    .map(|e| format!("{}  {}  deleted by {}", crate::date(e.t_ms / 1000), e.path, if e.origin.is_empty() { "?" } else { &e.origin }))
+                    .collect();
+                Ok(if out.is_empty() { "nothing deleted here is in the history".into() } else { format!("{}\n\nhilo restore PATH brings one back", out.join("\n")) })
+            }
+            _ => Err("unknown request".into()),
+        }
+    }
+
     // ---------- the socket's slow path ----------
 
     fn wt_for_cwd(&self, cwd: &str) -> Option<usize> {
@@ -1121,6 +1228,10 @@ impl D {
                 Err(e) => (1, e),
             },
             ["approve", args @ ..] => self.approve(args),
+            ["log" | "restore" | "trash", ..] => match self.history_cmd(&a) {
+                Ok(s) => (0, s),
+                Err(e) => (1, e),
+            },
             ["trust", name, mode] => {
                 let mut cfg = Config::load();
                 let mut ro: Vec<String> = cfg.all("readonly").into_iter().map(str::to_string).filter(|n| n != name).collect();
@@ -1191,6 +1302,8 @@ impl D {
         }
         let conflicts: usize = self.repos.iter().map(|r| git::conflict_branches(&r.root)).sum();
         s += &format!("conflicts {conflicts} saved branch(es) (git branch --list 'hilo/conflict/*')\n");
+        let (n, bytes) = self.store.totals();
+        s += &format!("history   {n} versions, {:.1} MB (hilo log PATH)\n", bytes as f64 / 1048576.0);
         s += &format!("approve   {} change(s) waiting{}\n", self.held.len(), if self.held.is_empty() { "" } else { " — run `hilo approve`" });
         if latency {
             let pct = |mut v: Vec<u64>, p: usize| {
@@ -1517,6 +1630,7 @@ pub fn run() -> io::Result<()> {
         last_folders: Instant::now() - Duration::from_secs(60),
         wts: vec![],
         vaults: HashMap::new(),
+        store: crate::store::Store::open()?,
         vkeys: crate::secret::waiting_note(vault::keys),
         held: load_held(),
         cache: Cache::default(),
@@ -1553,10 +1667,11 @@ pub fn run() -> io::Result<()> {
             }
         }
     }
+    d.prune();
     d.scan_folders();
     d.discover();
 
-    let (mut last_tick, mut last_full, mut last_save, mut last_time) = (Instant::now(), Instant::now(), Instant::now(), Instant::now());
+    let (mut last_tick, mut last_full, mut last_save, mut last_time, mut last_prune) = (Instant::now(), Instant::now(), Instant::now(), Instant::now(), Instant::now());
     loop {
         match rx.recv_timeout(TICK.saturating_sub(last_tick.elapsed())) {
             Ok(ev) => {
@@ -1580,6 +1695,10 @@ pub fn run() -> io::Result<()> {
         if d.role == "member" && d.out.is_some() && last_time.elapsed() >= TIME_SYNC {
             last_time = Instant::now();
             d.send(Msg::Time { t0: now_ms(), t1: 0 });
+        }
+        if last_prune.elapsed() >= PRUNE {
+            last_prune = Instant::now();
+            d.prune();
         }
         if last_save.elapsed() >= SAVE {
             last_save = Instant::now();

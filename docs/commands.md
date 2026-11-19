@@ -25,8 +25,11 @@ You only need `hilo`. Everything else is there when you want to look or change s
 
 | Command | |
 | --- | --- |
-| `hilo status [--latency]` | machines online, linked folders, leases, conflicts, waiting approvals, p50/p95 latency |
+| `hilo status [--latency]` | machines online, linked folders, leases, conflicts, history, waiting approvals, p50/p95 latency |
 | `hilo approve [PATH \| --all \| --deny PATH]` | review a remote change to a path that runs code |
+| `hilo log PATH` | every version of a file this machine kept, newest first: when, how (`local`, `remote`, `conflict`, `replaced`, `restored`), who, size |
+| `hilo restore PATH [--at N \| --conflict]` | bring a version back: the newest one that differs from the file, line `N` of `hilo log`, or the one that lost the last conflict. It syncs as a new write |
+| `hilo trash [DIR]` | files deleted under `DIR` (default: the whole repo) that hilo can bring back |
 | `hilo run -- npm run dev` | run with the variables, without writing any file |
 
 ## Environment variables
@@ -58,6 +61,8 @@ You only need `hilo`. Everything else is there when you want to look or change s
 | `env = strict` | never write `.env` files; variables only reach `hilo run` |
 | `readonly` | machines that may not write here (`hilo trust`) |
 | `bind` | listen on a different address than the one you advertise (NAT, containers) |
+| `history_days` | how long old versions stay in `~/.hilo/store` (default `30`); the newest version of each file always stays |
+| `history_max_mb` | the most that history may take, in MB (default `5120`); the oldest versions go first |
 
 ## Environment
 

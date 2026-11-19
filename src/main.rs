@@ -15,6 +15,7 @@ mod noise;
 mod scan;
 mod secret;
 mod setup;
+mod store;
 mod sync;
 mod tui;
 mod vault;
@@ -28,7 +29,17 @@ use std::process::ExitCode;
 /// UTC timestamp: `2026-11-13 14:37:33` for logs, `20261113-143733-123456789` for ref names.
 pub fn stamp(compact: bool) -> String {
     let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-    let (secs, nanos) = (d.as_secs() as i64, d.subsec_nanos());
+    let s = date(d.as_secs());
+    if compact {
+        format!("{}-{:09}", s.replace(['-', ':'], "").replace(' ', "-"), d.subsec_nanos())
+    } else {
+        s
+    }
+}
+
+/// `2026-11-13 14:37:33` (UTC) for unix seconds.
+pub fn date(secs: u64) -> String {
+    let secs = secs as i64;
     let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
     // civil-from-days (Howard Hinnant)
     let z = days + 719468;
@@ -41,11 +52,7 @@ pub fn stamp(compact: bool) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     let (h, m, s) = (rem / 3600, rem % 3600 / 60, rem % 60);
-    if compact {
-        format!("{year}{month:02}{day:02}-{h:02}{m:02}{s:02}-{nanos:09}")
-    } else {
-        format!("{year}-{month:02}-{day:02} {h:02}:{m:02}:{s:02}")
-    }
+    format!("{year}-{month:02}-{day:02} {h:02}:{m:02}:{s:02}")
 }
 
 #[macro_export]
@@ -96,6 +103,9 @@ Cloud agents (Claude Code on the web, Codex, Cursor, Codespaces, dev containersâ
   hilo env ls | history [KEY] | revert KEY [N]
   hilo run -- CMD ...                       run with the vault's variables, without writing files
   hilo approve [PATH | --all | --deny PATH] review changes to paths that run code
+  hilo log PATH                             every version of a file hilo kept, newest first
+  hilo restore PATH [--at N | --conflict]   bring a version back (default: the newest that differs)
+  hilo trash [DIR]                          files deleted here that hilo can bring back
   hilo trust MACHINE read-only|full         stop (or allow) a machine writing here
   hilo invite                               a new join code (anchor)
   hilo unpair MACHINE                       cut a machine off and rotate the vault key (anchor)
@@ -498,6 +508,11 @@ fn info() {
     }
 }
 
+/// A CLI path made absolute against the cwd (the daemon's cwd is not ours).
+fn abs(p: &str) -> String {
+    std::env::current_dir().map_or(PathBuf::from(p), |c| c.join(p)).to_string_lossy().into_owned()
+}
+
 fn daemon_call(a: &[&str]) -> Result<(), String> {
     match ipc::call(&ipc::args(a), std::time::Duration::from_secs(60)) {
         Ok((0, t)) => {
@@ -640,6 +655,23 @@ fn main() -> ExitCode {
         Some("run") => match run_cmd(rest) {
             Ok(code) => return ExitCode::from(code as u8),
             Err(e) => Err(e),
+        },
+        Some("log") => match rest {
+            [p] => daemon_call(&["log", &abs(p)]),
+            _ => Err("usage: hilo log PATH".into()),
+        },
+        Some("restore") => match rest {
+            [p, mode @ ..] => {
+                let mut a = vec!["restore".to_string(), abs(p)];
+                a.extend(mode.iter().cloned());
+                daemon_call(&a.iter().map(String::as_str).collect::<Vec<_>>())
+            }
+            _ => Err("usage: hilo restore PATH [--at N | --conflict]".into()),
+        },
+        Some("trash") => match rest {
+            [] => daemon_call(&["trash", &abs("."), "--unit"]),
+            [d] => daemon_call(&["trash", &abs(d)]),
+            _ => Err("usage: hilo trash [DIR]".into()),
         },
         Some("approve") => {
             let mut a = vec!["approve"];
