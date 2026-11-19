@@ -134,7 +134,7 @@ fn validate(mut op: Op) -> Option<Op> {
     if op.path == REF {
         let Data::Full(p) = &op.data else { return None };
         let (sha, _, _) = parse_ref(p)?;
-        return (p.len() <= MAX_MSG && op.new == ref_hash(&sha) && !op.wt.starts_with("vault:")).then_some(op);
+        return (p.len() <= MAX_MSG && op.new == ref_hash(&sha) && !op.wt.starts_with("vault:") && !op.wt.starts_with("drive:")).then_some(op);
     }
     if op.wt.starts_with("vault:") {
         let (file, key) = vault::split_path(&op.path)?;

@@ -1254,7 +1254,7 @@ impl D {
     }
 
     fn history_cmd(&mut self, a: &[&str]) -> Result<String, String> {
-        let file = |d: &Self, p: &str| d.locate(p).filter(|x| valid_path(&x.2)).ok_or(format!("{p} is not a file in a synced worktree"));
+        let file = |d: &Self, p: &str| d.locate(p).filter(|x| valid_path(&x.2)).ok_or(format!("{p} is not a file in a synced folder"));
         match a {
             ["log", p] => {
                 let (_, id, rel) = file(self, p)?;
@@ -1282,7 +1282,10 @@ impl D {
                 let h = self.store.history(&id, &rel);
                 let e = match mode {
                     [] => h.iter().find(|e| e.hash != NONE && e.hash != disk).ok_or("no other version to restore")?,
-                    ["--conflict"] => h.iter().find(|e| e.hash != NONE && e.kind == Kind::Conflict).ok_or("no conflict on record for this file")?,
+                    ["--conflict"] => match h.iter().find(|e| e.kind == Kind::Conflict) {
+                        Some(e) if e.hash == NONE => return Err("the version that lost was a deletion: nothing to bring back (`hilo log PATH`)".into()),
+                        e => e.ok_or("no conflict on record for this file")?,
+                    },
                     ["--at", n] => h.get(n.parse::<usize>().map_err(|_| "--at wants a line number from `hilo log`")?.wrapping_sub(1)).ok_or("no such version")?,
                     _ => return Err("usage: hilo restore PATH [--at N | --conflict]".into()),
                 };
@@ -1299,7 +1302,7 @@ impl D {
                 Ok(format!("{rel}: restored the version from {when}"))
             }
             ["trash", dir, rest @ ..] => {
-                let (wi, id, rel) = self.locate(dir).ok_or(format!("{dir} is not in a synced worktree"))?;
+                let (wi, id, rel) = self.locate(dir).ok_or(format!("{dir} is not in a synced folder"))?;
                 let prefix = if rest == ["--unit"] { "" } else { &rel };
                 let root = self.wts[wi].root.clone();
                 let out: Vec<String> = self
