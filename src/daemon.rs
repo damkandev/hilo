@@ -254,6 +254,8 @@ struct D {
     atx: Option<Sender<anchor::In>>,
     dirty: bool,
     warned: HashSet<String>,
+    scope: Option<(config::Scope, bool)>, // from the anchor, when this sandbox joined with a scoped token (+ read-only)
+    outside: HashMap<Key, Hash>,          // files changed here that the token may not sync: they stay here
     tmp: PathBuf,
 }
 
@@ -514,7 +516,48 @@ impl D {
         }
     }
 
+    /// A sandbox with a scoped token only sends what the anchor would take (the anchor drops the rest
+    /// without a word, so it would wait here forever).
+    fn may_send(&self, wt: &str, path: &str) -> bool {
+        self.scope.as_ref().is_none_or(|(s, _)| config::may_write(s, wt, path))
+    }
+
+    /// A file the token may not sync: it stays here, and whoever wrote it hears so once per version.
+    fn keep_here(&mut self, key: Key, h: Hash) {
+        if self.outside.insert(key.clone(), h) == Some(h) {
+            return;
+        }
+        let Some((s, _)) = &self.scope else { return };
+        let msg = format!("{} is outside what this sandbox's token may sync ({s}): it stays on this machine only", key.1);
+        self.log_once(format!("outside {}\0{}", key.0, key.1), msg.clone());
+        let author = self.sh.authors.lock().unwrap().get(&key).cloned();
+        self.sh.notify_session(author, format!("hilo: {msg}"));
+    }
+
+    /// The anchor said what this sandbox may sync: what waits to be sent outside it never will be.
+    fn on_scope(&mut self, s: config::Scope, ro: bool) {
+        log!("this sandbox's token syncs {s}{}", if ro { ", read-only" } else { "" });
+        self.scope = Some((s, ro));
+        let mut keys: Vec<Key> = self.r.caught_up().into_iter().map(|o| (o.wt, o.path)).filter(|k| !self.may_send(&k.0, &k.1)).collect();
+        keys.dedup();
+        for k in keys {
+            let h = self.r.expected(&k);
+            self.r.drop_pending(&k);
+            if k.1 != REF && self.wt_index(&k.0).is_some() {
+                self.keep_here(k, h);
+            } else {
+                log!("not sending {} {:?}: outside what this sandbox's token may sync", k.0, k.1);
+            }
+        }
+        self.dirty = true;
+    }
+
     fn send_op(&mut self, mut op: Op) {
+        if !self.may_send(&op.wt, &op.path) {
+            // a branch move, .env value or repo announcement outside the scope (files never get here)
+            self.r.drop_pending(&(op.wt.clone(), op.path.clone()));
+            return self.log_once(format!("outside {}\0{}", op.wt, op.path), format!("not sending {} {:?}: outside what this sandbox's token may sync", op.wt, op.path));
+        }
         if let Some(Some(d)) = op.data.content() {
             let d = d.to_vec();
             self.cache.put(op.new, &d);
@@ -541,7 +584,9 @@ impl D {
                 continue; // waiting for approval: don't overwrite it from here
             }
             let h = hash_of(data.as_deref());
-            if h == self.r.expected(&(id.clone(), path.clone())) {
+            let key = (id.clone(), path.clone());
+            if h == self.r.expected(&key) {
+                self.outside.remove(&key);
                 continue;
             }
             // a restore was already recorded with this content
@@ -549,6 +594,10 @@ impl D {
                 if let Err(e) = self.store.put(&id, &path, data.as_deref(), Kind::Local, &self.sh.name) {
                     self.log_once(format!("store {e}"), format!("history: cannot keep {path}: {e}"));
                 }
+            }
+            if !self.may_send(&id, &path) {
+                self.keep_here(key, h);
+                continue;
             }
             if let Some(op) = self.r.local(&id, &path, h, Data::from_opt(data)) {
                 self.send_op(op);
@@ -913,8 +962,15 @@ impl D {
                         },
                     };
                     let who = if origin.is_empty() { "another machine" } else { origin };
-                    log!("conflict on {path}: {who} won; this machine's version is {kept}");
                     let author = self.sh.authors.lock().unwrap().get(&(id.clone(), path.into())).cloned();
+                    if self.scope.as_ref().is_some_and(|s| s.1) {
+                        // nobody won: the anchor turns down every write from a read-only sandbox
+                        let msg = format!("this sandbox's token is read-only: your edit to {path} was reverted; your version is in `hilo log {path}`");
+                        self.log_once(format!("ro {id}\0{path}"), msg.clone());
+                        self.sh.notify_session(author, format!("hilo: {msg}"));
+                        continue;
+                    }
+                    log!("conflict on {path}: {who} won; this machine's version is {kept}");
                     self.sh.notify_session(
                         author,
                         format!("hilo: while you were editing {path}, an agent on {who} saved it first. Your version is {kept} ({how}); the file now has theirs. Re-read it before editing again."),
@@ -1420,6 +1476,12 @@ impl D {
             let n = self.repos.iter().filter(|r| r.root.parent() == Some(f.as_path())).count();
             s += &format!("folder    {} ({n} repos; new repos here sync on their own)\n", crate::tui::tilde(f));
         }
+        if let Some((sc, ro)) = &self.scope {
+            s += &format!("scope     {sc}{}\n", if *ro { ", read-only" } else { "" });
+            if !self.outside.is_empty() {
+                s += &format!("          {} files outside the scope, kept here only\n", self.outside.len());
+            }
+        }
         let pending = self.r.caught_up();
         let waiting = |w: &Wt| match w.id().map_or(0, |id| pending.iter().filter(|o| o.wt == id).count()) {
             0 => String::new(),
@@ -1646,6 +1708,7 @@ impl D {
                 self.offset = t1 as i64 - ((t0 + t2) / 2) as i64;
             }
             Ev::Net(Msg::Peers(p)) => self.peers = p,
+            Ev::Net(Msg::Scope { unit, prefix, ro }) => self.on_scope(config::Scope { unit, prefix }, ro),
             Ev::Net(_) => {}
             Ev::Fs(paths) => self.on_fs(paths),
             Ev::Touched(p) => {
@@ -1805,6 +1868,8 @@ pub fn run() -> io::Result<()> {
         atx: atx_keep,
         dirty: false,
         warned: HashSet::new(),
+        scope: None,
+        outside: HashMap::new(),
         tmp: config::path("tmp"),
     };
     // confirmed branch tips: needed to build small bundles

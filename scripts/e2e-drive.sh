@@ -138,6 +138,30 @@ on_a log "$A/a.txt" | grep -q " local " || fail "local entry on mac"
 on_a log "$A/a.txt" | sed 's/^/     /'
 ok "logs show local and remote entries"
 
+echo "== a sandbox whose token only sees notes/clientes"
+mkdir -p "$T/c/home" "$T/c/hilo" "$T/c/code" "$T/c/notes" "$A/clientes"
+C=$T/c/notes
+on_c() { run_on c "$@"; }
+echo "for the client" >"$A/clientes/plan.md"
+TOKEN=$(on_a token create --addr "127.0.0.1:$PORT" --path "$A/clientes" 2>/dev/null | awk '/^token/ {print $2}')
+on_c join "$TOKEN" --no-service --name sbx --folder "$T/c/code" >/dev/null
+start c
+wait_for "sandbox daemon up" up c
+on_c add "$C" --as notes | sed 's/^/     /'
+wait_for "its folder reaches the sandbox" has "$C/clientes/plan.md" "for the client"
+for f in a.txt marker.txt c.txt deep/er/n.md; do gone "$C/$f" || fail "$f is outside the token's folder and reached the sandbox"; done
+ok "nothing outside notes/clientes reaches the sandbox"
+echo out >"$C/fuera.md"
+echo in >"$C/clientes/nuevo.md"
+wait_for "a file it writes inside reaches mac" has "$A/clientes/nuevo.md" in
+kept_here() { run_on c status | grep -q "1 files outside the scope, kept here only" && ! run_on c status | grep -q "waiting to send"; }
+wait_for "a file it writes outside stays there, and nothing waits forever" kept_here
+gone "$A/fuera.md" || fail "fuera.md reached mac"
+on_c status | grep -E "^(scope|  )" | sed 's/^/     /'
+on_c status | grep -q "^scope     drive:notes/clientes$" || fail "status shows the scope"
+grep -q "fuera.md is outside what this sandbox's token may sync (drive:notes/clientes)" "$T/c/daemon.log" || fail "the sandbox logs why"
+ok "the sandbox's status and log say why fuera.md stays there"
+
 echo "== status"
 on_a status | sed 's/^/     /'
 on_b status | grep -E "^(drive|conflicts| )" | sed 's/^/     /'

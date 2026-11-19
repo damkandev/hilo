@@ -191,6 +191,16 @@ pub struct Scope {
     pub prefix: String, // inside a drive, "" = all of it; always "" for a repo
 }
 
+/// `drive:notes/clientes`, `repo:<id>`
+impl std::fmt::Display for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self.prefix.trim_end_matches('/') {
+            "" => write!(f, "{}", self.unit),
+            p => write!(f, "{}/{p}", self.unit),
+        }
+    }
+}
+
 /// Is key (`wt`, `path`) inside the scope? Anything unknown is outside.
 pub fn in_scope(s: &Scope, wt: &str, path: &str) -> bool {
     match s.unit.split_once(':') {
@@ -204,6 +214,12 @@ pub fn in_scope(s: &Scope, wt: &str, path: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// May a sandbox with this scope change (`wt`, `path`)? In scope, and never a repo announcement
+/// (it says where the other machines clone the repo from). The anchor and the sandbox share this rule.
+pub fn may_write(s: &Scope, wt: &str, path: &str) -> bool {
+    in_scope(s, wt, path) && !wt.starts_with("repo:")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -337,6 +353,10 @@ mod tests {
         for wt in ["R2:main", "R", "vault:R2", "repo:R2", "drive:R", "X:R:main", ":main"] {
             assert!(!in_scope(&r, wt, "src/a.rs"), "{wt}");
         }
+        // send or keep here: a sandbox never sends a repo announcement, even of its own repo
+        assert!(may_write(&r, "R:main", "src/a.rs") && may_write(&r, "vault:R", "x") && !may_write(&r, "repo:R", "\0meta"));
+        assert!(may_write(&d("a"), "drive:notes", "a/x") && !may_write(&d("a"), "drive:notes", "fuera.md"));
+        assert_eq!((d("clientes/").to_string(), r.to_string()), ("drive:notes/clientes".into(), "repo:R".into()));
         for bad in ["repo:", "drive:", "", "other:R", "R"] {
             assert!(!in_scope(&Scope { unit: bad.into(), prefix: String::new() }, "R:main", "a"), "{bad}");
         }

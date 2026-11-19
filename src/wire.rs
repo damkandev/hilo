@@ -31,6 +31,9 @@ pub enum Msg {
     VaultKey { epoch: u32, key: Hash },
     Time { t0: u64, t1: u64 },
     Peers(Vec<String>),
+    /// Anchor -> a sandbox with a scoped token, before catch-up: what it may sync. Only scoped
+    /// clients get it, and they run a binary that knows it (`hilo up` installs the latest).
+    Scope { unit: String, prefix: String, ro: bool },
 }
 
 #[derive(Default)]
@@ -156,6 +159,7 @@ pub fn encode(m: &Msg) -> Vec<u8> {
             }
             &mut w
         }
+        Msg::Scope { unit, prefix, ro } => w.u8(14).str(unit).str(prefix).u8(*ro as u8),
     };
     w.0
 }
@@ -200,6 +204,15 @@ pub fn decode(b: &[u8]) -> Option<Msg> {
             }
             Msg::Peers(v)
         }
+        14 => Msg::Scope {
+            unit: r.str()?,
+            prefix: r.str()?,
+            ro: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+        },
         _ => return None,
     };
     r.0.is_empty().then_some(m)
@@ -248,6 +261,7 @@ mod tests {
             Msg::Ping,
             Msg::Lease(lease),
             Msg::Peers(vec!["a".into(), "b".into()]),
+            Msg::Scope { unit: "drive:notes".into(), prefix: "a b".into(), ro: true },
             Msg::VaultKey { epoch: 2, key: [7; 32] },
         ] {
             let e = encode(&m);
@@ -276,6 +290,7 @@ mod tests {
             Msg::Op(Op { seq: 1, wt: "r:main".into(), path: "a/b.ts".into(), base: [1; 32], new: [2; 32], data: Data::Full(b"x".to_vec()), origin: "m".into(), t_event: 1, t_seq: 2 }),
             Msg::Lease(Lease { wt: "w".into(), path: "p".into(), session: "s".into(), machine: "m".into(), age_ms: 1, ttl_ms: 2 }),
             Msg::Peers(vec!["a".into()]),
+            Msg::Scope { unit: "repo:R".into(), prefix: String::new(), ro: false },
             Msg::Time { t0: 1, t1: 2 },
         ]
         .iter()

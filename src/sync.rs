@@ -250,6 +250,11 @@ impl Replica {
         fx
     }
 
+    /// Forget what waits to be sent for `k` (the anchor would never take it); the file stays as it is.
+    pub fn drop_pending(&mut self, k: &Key) -> usize {
+        self.pending.remove(k).map_or(0, |q| q.len())
+    }
+
     /// Catch-up finished: whatever is still pending never reached the anchor. Resend it.
     pub fn caught_up(&self) -> Vec<Op> {
         self.pending.values().flatten().cloned().collect()
@@ -502,7 +507,22 @@ mod sim {
 
 #[cfg(test)]
 mod delta_tests {
-    use super::Data;
+    use super::*;
+    #[test]
+    fn drop_pending() {
+        let mut r = Replica::default();
+        let k: Key = ("drive:notes".into(), "fuera.md".into());
+        r.confirmed.insert(k.clone(), [1; 32]);
+        assert!(r.local(&k.0, &k.1, [2; 32], Data::Omitted).is_some());
+        assert!(r.local(&k.0, &k.1, [3; 32], Data::Omitted).is_some());
+        assert!(r.local("drive:notes", "in.md", [4; 32], Data::Omitted).is_some());
+        assert_eq!(r.drop_pending(&k), 2);
+        assert_eq!(r.expected(&k), [1; 32]); // back to what the anchor last confirmed
+        assert_eq!(r.caught_up().len(), 1); // the other key still goes out
+        assert_eq!(r.drop_pending(&k), 0);
+    }
+
+
     #[test]
     fn delta_roundtrip() {
         for (a, b) in [("hello world", "hello brave world"), ("aaaa", "aa"), ("", "x"), ("abc", "abc"), ("abcabc", "abc")] {

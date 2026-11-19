@@ -27,7 +27,7 @@ línea de comandos está en inglés.
 
 | Comando | |
 | --- | --- |
-| `hilo status [--latency]` | máquinas conectadas, carpetas vinculadas, leases, conflictos, historial, aprobaciones pendientes, latencia p50/p95 |
+| `hilo status [--latency]` | máquinas conectadas, carpetas vinculadas, leases, conflictos, historial, aprobaciones pendientes, latencia p50/p95; en un sandbox con un token con alcance, ese alcance y los archivos que se quedan ahí por estar fuera de él |
 | `hilo approve [RUTA \| --all \| --deny RUTA]` | revisa un cambio remoto a una ruta que ejecuta código |
 | `hilo log RUTA` | todas las versiones de un archivo que guardó esta máquina, de la más nueva a la más vieja: cuándo, cómo (`local`, `remote`, `conflict`, `replaced`, `restored`), quién, tamaño |
 | `hilo restore RUTA [--at N \| --conflict]` | trae de vuelta una versión: la más nueva que difiere del archivo, la línea `N` de `hilo log`, o la que perdió el último conflicto. Se sincroniza como una escritura nueva |
