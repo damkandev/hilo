@@ -64,10 +64,19 @@ fn abs(p: &str) -> String {
     }
 }
 
+/// Only a failed connection means the daemon is down; a slow answer is a timeout.
+fn failed(e: io::Error, what: &str) -> String {
+    match e.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => NOT_RUNNING.into(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => format!("{what} timed out"),
+        _ => format!("{what}: {e}"),
+    }
+}
+
 /// (unit root, path inside it) through the daemon; anything outside a synced unit is refused.
 fn locate(call: Call, p: &str) -> Result<(PathBuf, String), String> {
     match call(&["locate", p]) {
-        Err(_) => Err(NOT_RUNNING.into()),
+        Err(e) => Err(failed(e, "hilo daemon")),
         Ok((0, t)) => match t.split('\0').collect::<Vec<_>>()[..] {
             [_, root, rel] => Ok((PathBuf::from(root), rel.to_string())),
             _ => Err("bad answer from the daemon".into()),
@@ -94,6 +103,13 @@ fn render(data: &[u8], offset: usize, limit: Option<usize>) -> String {
     let mut out = String::new();
     let mut last = first - 1;
     for line in text.split_inclusive('\n').skip(first - 1).take(limit.unwrap_or(usize::MAX)) {
+        if out.is_empty() && line.len() > MAX_READ {
+            let mut n = MAX_READ;
+            while !line.is_char_boundary(n) {
+                n -= 1;
+            }
+            return format!("{}\n[line {first} cut at 256 KB of its {} bytes]", &line[..n], line.len());
+        }
         if out.len() + line.len() > MAX_READ {
             out += &format!("\n[cut at 256 KB after line {last} of {total}; read on with offset {}]", last + 1);
             return out;
@@ -156,6 +172,7 @@ fn call_tool(name: &str, args: &Json, session: &str, call: Call) -> (bool, Strin
             }
             let p = root.join(&rel);
             match std::fs::metadata(&p) {
+                Ok(m) if !m.is_file() => Err(format!("{rel}: not a regular file")), // a FIFO would block forever
                 Ok(m) if m.len() > fsops::MAX_FILE => Err(format!("{rel}: too large ({} bytes)", m.len())),
                 _ => std::fs::read(&p).map_err(|e| format!("{rel}: {e}")).map(|d| render(&d, num(args, "offset").unwrap_or(1), num(args, "limit"))),
             }
@@ -171,7 +188,7 @@ fn call_tool(name: &str, args: &Json, session: &str, call: Call) -> (bool, Strin
             }
             let mut notes = vec![];
             match call(&["claim", session, &path]) {
-                Err(_) => return Err(NOT_RUNNING.into()),
+                Err(e) => return Err(failed(e, "claim")),
                 // the busy answer is exactly lease::busy_message; anything else with code 2 is notices
                 Ok((2, t)) if t.starts_with(&format!("hilo: {rel} is being edited by another agent")) => return Err(t),
                 Ok((_, t)) => notes.push(t),
@@ -197,7 +214,7 @@ fn call_tool(name: &str, args: &Json, session: &str, call: Call) -> (bool, Strin
                 match call(&["grep", pat, &path, flags]) {
                     Ok((0, t)) => Ok(t),
                     Ok((_, t)) => Err(t),
-                    Err(_) => Err(NOT_RUNNING.into()),
+                    Err(e) => Err(failed(e, "search")),
                 }
             }),
         },
@@ -241,9 +258,15 @@ fn handle(line: &str, session: &str, call: Call) -> Option<Json> {
     Some(Json::obj(resp))
 }
 
+/// Random hex first: lease messages show a session's first 4 characters, as with Claude Code's UUIDs.
+fn session_id() -> String {
+    format!("{}-mcp-{}", crate::crypto::hex(&crate::crypto::random::<2>()), std::process::id())
+}
+
 pub fn run() -> i32 {
-    let session = format!("mcp-{}", std::process::id());
-    let call = |a: &[&str]| ipc::call(&ipc::args(a), Duration::from_secs(5));
+    let session = session_id();
+    // a search reads files and can take a while on a big folder; the rest is answered at once
+    let call = |a: &[&str]| ipc::call(&ipc::args(a), Duration::from_secs(if a[0] == "grep" { 60 } else { 5 }));
     let mut out = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -269,7 +292,7 @@ mod tests {
 
     #[test]
     fn tools() {
-        let down = |_: &[&str]| -> io::Result<(u8, String)> { Err(io::Error::other("no socket")) };
+        let down = |_: &[&str]| -> io::Result<(u8, String)> { Err(io::Error::from(io::ErrorKind::NotFound)) }; // no socket file
         let list = handle(r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#, "s", &down).unwrap();
         let names: Vec<&str> = list.at(&["result", "tools"]).unwrap().arr().iter().filter_map(|t| t.get("name").and_then(Json::str)).collect();
         assert_eq!(names, ["claim", "release", "who", "read", "write", "list", "search"]);
@@ -314,7 +337,36 @@ mod tests {
         assert_eq!(l, ".env  8 bytes\nimg.bin  6 bytes\nnew/\nnew/dir/\nsrc/\nsrc/a.txt  6 bytes\nsrc/deep/");
         assert_eq!(r("search", format!(r#"{{"pattern":"x","path":"{}"}}"#, root.display())), (false, "grep x".into()));
         assert!(r("search", r#"{"pattern":"x","path":"/etc"}"#.into()).0);
+        // a FIFO has no end: refused, not read (this used to hang the server)
+        assert!(std::process::Command::new("mkfifo").arg(root.join("pipe")).status().unwrap().success());
+        assert_eq!(r("read", format!(r#"{{"path":"{}"}}"#, at("pipe"))), (true, "pipe: not a regular file".into()));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn slow_daemon_is_not_a_dead_daemon() {
+        let slow = |a: &[&str]| -> io::Result<(u8, String)> {
+            match a[0] {
+                "locate" => Ok((0, "u\0/r\0f.txt".into())),
+                "grep" => Err(io::Error::from(io::ErrorKind::WouldBlock)), // what a read timeout gives
+                _ => Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            }
+        };
+        assert_eq!(call_tool("search", &Json::parse(r#"{"pattern":"x"}"#).unwrap(), "s", &slow), (true, "search timed out".into()));
+        // a refused connection is the one case that means the daemon is down (and nothing is written)
+        assert_eq!(call_tool("write", &Json::parse(r#"{"path":"/r/f.txt","content":"x"}"#).unwrap(), "s", &slow), (true, NOT_RUNNING.into()));
+    }
+
+    #[test]
+    fn sessions_differ_in_what_leases_show() {
+        let s = session_id();
+        assert!(s[..4].chars().all(|c| c.is_ascii_hexdigit()) && s.ends_with(&std::process::id().to_string()), "{s}");
+    }
+
+    #[test]
+    fn one_huge_line_still_reads() {
+        let out = render("é".repeat(MAX_READ).as_bytes(), 1, None); // 2 bytes per char: one line over the cap
+        assert!(out.starts_with("éé") && out.len() <= MAX_READ + 100 && out.ends_with(&format!("[line 1 cut at 256 KB of its {} bytes]", 2 * MAX_READ)), "{}", &out[out.len().saturating_sub(80)..]);
     }
 
     #[test]

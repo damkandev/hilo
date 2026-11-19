@@ -32,6 +32,10 @@ línea de comandos está en inglés.
 | `hilo log RUTA` | todas las versiones de un archivo que guardó esta máquina, de la más nueva a la más vieja: cuándo, cómo (`local`, `remote`, `conflict`, `replaced`, `restored`), quién, tamaño |
 | `hilo restore RUTA [--at N \| --conflict]` | trae de vuelta una versión: la más nueva que difiere del archivo, la línea `N` de `hilo log`, o la que perdió el último conflicto. Se sincroniza como una escritura nueva |
 | `hilo trash [DIR]` | archivos borrados dentro de `DIR` (por defecto: todo el repo) que hilo puede traer de vuelta |
+
+El historial empieza con la primera versión que hilo ve después de actualizar: un archivo que nadie
+ha tocado desde entonces todavía no tiene historial en esta máquina. Si borras uno de esos archivos
+aquí, las otras máquinas lo conservan, porque el borrado les llega como una versión `replaced`.
 | `hilo run -- npm run dev` | corre con las variables, sin escribir ningún archivo |
 | `hilo grep PATRÓN [DIR] [-i]` | búsqueda literal en los archivos sincronizados bajo `DIR` (por defecto, aquí); los ignorados no se buscan |
 

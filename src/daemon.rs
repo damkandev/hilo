@@ -1274,6 +1274,9 @@ impl D {
             }
             ["restore", p, mode @ ..] => {
                 let (wi, id, rel) = file(self, p)?;
+                if self.held.iter().any(|h| h.wt == id && h.path == rel) {
+                    return Err(format!("a change to {rel} is waiting for approval: run `hilo approve` (or `hilo approve --deny {rel}`) first"));
+                }
                 let root = self.wts[wi].root.clone();
                 let disk = hash_of(read_disk(&root, &rel).as_deref());
                 let h = self.store.history(&id, &rel);
@@ -1376,15 +1379,13 @@ impl D {
                     Err(_) => (1, "anchor did not answer".into()),
                 }
             }
-            ["grep", pattern, dir, flags] => (0, self.grep(pattern, dir, flags.contains('i'))),
             _ => (1, "unknown request".into()),
         }
     }
 
     /// `hilo grep` / MCP `search`: the synced files of every unit under `dir` (or containing it),
     /// shown relative to `dir`. Ignored and untracked files are never searched.
-    // ponytail: reads files on the main loop; move to a thread if big drives make it stall syncing.
-    fn grep(&self, pattern: &str, dir: &str, ignore_case: bool) -> String {
+    fn grep_files(&self, dir: &str) -> Vec<(PathBuf, String)> {
         let dir = canonical_maybe_missing(Path::new(dir));
         let mut files = vec![];
         for w in self.wts.iter().filter(|w| w.id().is_some()) {
@@ -1401,11 +1402,7 @@ impl D {
                 files.push((p, shown));
             }
         }
-        let mut hits = crate::grep::search(&files, pattern, ignore_case, crate::grep::MAX_RESULTS);
-        if hits.len() == crate::grep::MAX_RESULTS {
-            hits.push(format!("[stopped at {} results; narrow the folder or the pattern]", crate::grep::MAX_RESULTS));
-        }
-        if hits.is_empty() { "no matches".into() } else { hits.join("\n") }
+        files
     }
 
     fn status(&self, latency: bool) -> String {
@@ -1447,6 +1444,9 @@ impl D {
         }
         let (n, bytes) = self.store.totals();
         s += &format!("history   {n} versions, {:.1} MB (hilo log PATH)\n", bytes as f64 / 1048576.0);
+        if self.store.broken() {
+            s += "          the journal is damaged: changes from other machines are not written here (see the daemon log)\n";
+        }
         s += &format!("approve   {} change(s) waiting{}\n", self.held.len(), if self.held.is_empty() { "" } else { " — run `hilo approve`" });
         if latency {
             let pct = |mut v: Vec<u64>, p: usize| {
@@ -1654,6 +1654,11 @@ impl D {
                     }
                 }
             }
+            // the file list is cheap; reading the files happens off the main loop so syncing never waits on it
+            Ev::Ipc(a, reply) if a.len() == 4 && a[0] == "grep" => {
+                let files = self.grep_files(&a[2]);
+                std::thread::spawn(move || reply.send((0, crate::grep::answer(&files, &a[1], a[3].contains('i')))));
+            }
             Ev::Ipc(a, reply) => {
                 let r = self.ipc(a);
                 let _ = reply.send(r);
@@ -1696,6 +1701,7 @@ pub fn run() -> io::Result<()> {
     let cfg = Config::load();
     let key = crate::secret::waiting_note(config::key)?;
     let name = config::name();
+    let store = crate::store::Store::open()?; // before the socket: a second daemon stops here
     let sh = Arc::new(Shared {
         name: name.clone(),
         leases: Mutex::new(lease::Table::default()),
@@ -1773,7 +1779,7 @@ pub fn run() -> io::Result<()> {
         last_folders: Instant::now() - Duration::from_secs(60),
         wts: vec![],
         vaults: HashMap::new(),
-        store: crate::store::Store::open()?,
+        store,
         vkeys: crate::secret::waiting_note(vault::keys),
         held: load_held(),
         cache: Cache::default(),
