@@ -403,11 +403,7 @@ fn token_scope(cfg: &Config, p: &str) -> Result<config::Scope, String> {
 
 /// `drive:notes/plans, read-only, expires in 6 h` for `hilo token create` and `ls`.
 fn token_limits(t: &config::CloudToken) -> String {
-    let mut v = vec![match &t.scope {
-        None => "everything".to_string(),
-        Some(s) if s.prefix.is_empty() => s.unit.clone(),
-        Some(s) => format!("{}/{}", s.unit, s.prefix),
-    }];
+    let mut v = vec![t.scope.as_ref().map_or("everything".to_string(), |s| s.to_string())];
     if t.ro {
         v.push("read-only".into());
     }

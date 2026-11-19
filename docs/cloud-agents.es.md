@@ -41,7 +41,7 @@ hilo token create --addr hilo.example.com:7710 --path ~/notas/planes --expires 2
 - `--path P` limita el sandbox a un solo lugar, resuelto en el ancla: dentro de un drive, esa carpeta
   (o el drive entero); dentro de un repo, el repo entero (un repo se comparte completo). Nada de
   afuera le llega: ni los archivos, ni los leases, ni el historial con que se pone al día. Lo que
-  escribe afuera se descarta.
+  escribe afuera se queda en el sandbox: su log dice por qué, el agente que lo escribió se entera, y `hilo status` ahí lo cuenta ("N files outside the scope, kept here only") en vez de dejarlo "waiting to send".
 - `--expires 30m|24h|7d` vence el token: ningún sandbox nuevo entra con él, y los conectados quedan
   fuera en menos de 30 segundos.
 - `--read-only`: el ancla rechaza toda escritura del sandbox (su versión queda en su propio historial
