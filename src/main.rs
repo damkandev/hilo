@@ -87,7 +87,8 @@ create there appear on the other machines on their own. The rest is optional:
 Cloud agents (Claude Code on the web, Codex, Cursor, Codespaces, dev containers…):
 
   hilo token create [--env] [--addr H:P]    on the anchor: a reusable, revocable token for sandboxes
-  hilo up                                   in the sandbox's setup script, with HILO_TOKEN set
+      [--path P] [--expires 24h] [--read-only]   only one folder or repo, for a while, without writing
+  hilo up [--read-only]                     in the sandbox's setup script, with HILO_TOKEN set
   hilo token ls | revoke ID
 
   hilo status [--latency]                   machines, worktrees, leases, conflicts, waiting approvals
@@ -347,6 +348,57 @@ fn is_private_addr(addr: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok_and(is_private)
 }
 
+/// `30m`, `24h`, `7d` -> seconds.
+fn duration(s: &str) -> Option<u64> {
+    let (n, unit) = [("m", 60), ("h", 3600), ("d", 86400)].into_iter().find_map(|(u, k)| Some((s.strip_suffix(u)?, k)))?;
+    n.parse::<u64>().ok()?.checked_mul(unit).filter(|&x| x > 0)
+}
+
+/// `--path` on the anchor -> what the token may see: a folder of a drive, or a whole repo.
+fn token_scope(cfg: &Config, p: &str) -> Result<config::Scope, String> {
+    let path = std::fs::canonicalize(p).map_err(|e| format!("{p}: {e}"))?;
+    let dir = if path.is_dir() { path.clone() } else { path.parent().map(Path::to_path_buf).unwrap_or_default() };
+    let repo = git::toplevel(&dir).and_then(|t| std::fs::canonicalize(t).ok());
+    for d in cfg.all("drive") {
+        // `drive = <label> <absolute path>`: the path starts at the first " /"
+        let Some((label, root)) = d.split_once(" /") else { continue };
+        let root = std::fs::canonicalize(format!("/{root}")).unwrap_or_else(|_| PathBuf::from(format!("/{root}")));
+        let Ok(rest) = path.strip_prefix(&root) else { continue };
+        if repo.as_ref().is_some_and(|r| r.starts_with(&root)) {
+            break; // a repo inside the drive: the drive skips it, it syncs as a repo
+        }
+        let prefix = rest.to_str().ok_or(format!("{}: not UTF-8", path.display()))?;
+        return Ok(config::Scope { unit: format!("drive:{}", label.trim()), prefix: prefix.to_string() });
+    }
+    let top = repo.ok_or(format!("{} is not inside a drive or a repo", path.display()))?;
+    if top != path {
+        eprintln!("note: a repo is shared whole; the token sees all of {}", top.display());
+    }
+    let id = git::repo_id(&top).map_err(|e| format!("{}: {e}", top.display()))?;
+    Ok(config::Scope { unit: format!("repo:{id}"), prefix: String::new() })
+}
+
+/// `drive:notes/plans, read-only, expires in 6 h` for `hilo token create` and `ls`.
+fn token_limits(t: &config::CloudToken) -> String {
+    let mut v = vec![match &t.scope {
+        None => "everything".to_string(),
+        Some(s) if s.prefix.is_empty() => s.unit.clone(),
+        Some(s) => format!("{}/{}", s.unit, s.prefix),
+    }];
+    if t.ro {
+        v.push("read-only".into());
+    }
+    let now = config::now();
+    match t.expires {
+        0 => {}
+        e if e <= now => v.push("EXPIRED".into()),
+        e if e - now < 3600 => v.push(format!("expires in {} min", (e - now).div_ceil(60))),
+        e if e - now < 2 * 86400 => v.push(format!("expires in {} h", (e - now) / 3600)),
+        e => v.push(format!("expires in {} days", (e - now) / 86400)),
+    }
+    v.join(", ")
+}
+
 /// `hilo token create | ls | revoke ID` (on the anchor).
 fn token(args: &[String]) -> Result<(), String> {
     let cfg = Config::load();
@@ -358,11 +410,19 @@ fn token(args: &[String]) -> Result<(), String> {
             let name = flag(args, "--name").unwrap_or_else(|| "cloud".into());
             let env = args.iter().any(|a| a == "--env");
             let addr = flag(args, "--addr").or_else(|| cfg.get("listen").map(str::to_string)).ok_or("no address: pass --addr HOST:PORT")?;
-            let t = config::new_cloud_token(&name, env).map_err(|e| e.to_string())?;
+            let scope = flag(args, "--path").map(|p| token_scope(&cfg, &p)).transpose()?;
+            let expires = match flag(args, "--expires") {
+                Some(d) => config::now() + duration(&d).ok_or(format!("--expires {d}: use something like 30m, 24h or 7d"))?,
+                None => 0,
+            };
+            let ro = args.iter().any(|a| a == "--read-only");
+            let t = config::new_cloud_token(&name, env, scope, expires, ro).map_err(|e| e.to_string())?;
             let code = config::format_cloud(&t.secret, &addr);
             println!("token  {code}");
-            println!("id     {} ({name}, {})\n", t.id, if env { "gets .env values" } else { "no .env values" });
-            cloud_instructions(&code).iter().for_each(|l| println!("{l}"));
+            println!("id     {} ({name}, {})", t.id, if env { "gets .env values" } else { "no .env values" });
+            println!("sees   {}\n", token_limits(&t));
+            // a read-only sandbox's own tools refuse writes too (the anchor turns them down either way)
+            cloud_instructions(&code).iter().for_each(|l| println!("{l}{}", if ro && l.ends_with(" up") { " --read-only" } else { "" }));
             if is_private_addr(&addr) {
                 eprintln!("\nnote: {addr} is a private address; cloud sandboxes can't reach it. Pass --addr with a public host:port (a VPS, a port forward, a domain).");
             }
@@ -377,7 +437,7 @@ fn token(args: &[String]) -> Result<(), String> {
             let peers = config::peers();
             for t in ts {
                 let n = peers.iter().filter(|p| p.cloud_token() == Some(t.id.as_str())).count();
-                println!("{}  {:<16} {}  {} machine(s){}", t.id, t.name, if t.env { "env   " } else { "no env" }, n, if t.revoked { "  REVOKED" } else { "" });
+                println!("{}  {:<16} {}  {} machine(s)  {}{}", t.id, t.name, if t.env { "env   " } else { "no env" }, n, token_limits(&t), if t.revoked { "  REVOKED" } else { "" });
             }
             Ok(())
         }
@@ -395,7 +455,7 @@ fn token(args: &[String]) -> Result<(), String> {
             println!("token {id} revoked");
             Ok(())
         }
-        _ => Err("usage: hilo token create [--name N] [--env] [--addr HOST:PORT] | ls | revoke ID".into()),
+        _ => Err("usage: hilo token create [--name N] [--env] [--addr HOST:PORT] [--path P] [--expires 24h] [--read-only] | ls | revoke ID".into()),
     }
 }
 
@@ -435,6 +495,12 @@ fn up(args: &[String]) -> Result<(), String> {
     } else {
         let mut cfg = cfg;
         register(&mut cfg, &folder)?;
+        cfg.save().map_err(|e| e.to_string())?;
+    }
+    // the anchor turns down this machine's writes either way; this makes its own tools refuse them first
+    if args.iter().any(|a| a == "--read-only") || std::env::var("HILO_READONLY").as_deref() == Ok("1") {
+        let mut cfg = Config::load();
+        cfg.set("scope_ro", "1");
         cfg.save().map_err(|e| e.to_string())?;
     }
     if !daemon_up() {
