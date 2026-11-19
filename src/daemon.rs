@@ -67,7 +67,8 @@ impl Shared {
         let mut v = self.notices.lock().unwrap().remove(session).unwrap_or_default();
         let mut b = self.broadcast.lock().unwrap();
         let (msgs, seen) = &mut *b;
-        let n = seen.entry(session.to_string()).or_insert(0);
+        // a session first seen now starts at the end: older broadcasts (holds since approved) are history
+        let n = seen.entry(session.to_string()).or_insert(msgs.len());
         v.extend(msgs[*n..].iter().cloned());
         *n = msgs.len();
         v
@@ -1584,5 +1585,29 @@ pub fn run() -> io::Result<()> {
             last_save = Instant::now();
             d.save();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn new_session_skips_old_broadcasts() {
+        let sh = Shared {
+            name: String::new(),
+            leases: Mutex::new(lease::Table::default()),
+            roots: RwLock::new(vec![]),
+            out: Mutex::new(None),
+            notices: Mutex::new(HashMap::new()),
+            authors: Mutex::new(HashMap::new()),
+            broadcast: Mutex::new((vec![], HashMap::new())),
+        };
+        assert!(sh.notices_for("a").is_empty());
+        sh.notify_session(None, "old hold".into());
+        assert_eq!(sh.notices_for("a"), ["old hold"]); // a was around: it hears it, once
+        assert!(sh.notices_for("a").is_empty());
+        assert!(sh.notices_for("b").is_empty()); // b started later: not a fake block on its first edit
+        sh.notify_session(None, "new hold".into());
+        assert_eq!(sh.notices_for("b"), ["new hold"]);
     }
 }
