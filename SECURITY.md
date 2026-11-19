@@ -24,6 +24,8 @@ a description of the design and its tests, not as a guarantee.
 
 - **A token made with `--path`** sees one folder of a drive (or the whole drive), or one whole repo: its branches, its announcement and its sealed `.env` values (the vault keys still need `--env`). The anchor filters every message it sends that sandbox (catch-up, live changes, re-sends, leases) through one check, and drops its changes, claims and releases outside the scope without answering, because an answer would carry the content. What it can still see: the names of the machines online and the anchor's change counter.
 - **`--read-only`:** the anchor turns down each write with the current version and ignores its claims. **`--expires`** and **`hilo token revoke`:** the token leaves the handshake list, a sandbox that joined with it can't reconnect, and a connected one is cut within 30 seconds.
+- **Also refused from a scoped sandbox:** a repo announcement (it says where the other machines clone the repo from), a delta on anything but the current version (turned down before its base is read, so the answer can't tell which blobs the anchor holds), and claims or releases for a lease session another machine holds.
+- **Known limits.** A scoped token with `--env` gets the vault keys, which are global: only in-scope ciphertexts ever reach it, but the keys would open the others too (per-repo keys would be the hardening). Revoking a token doesn't rotate the vault key; `hilo unpair` does.
 
 ## Files
 
