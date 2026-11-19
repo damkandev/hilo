@@ -1276,15 +1276,13 @@ impl D {
                     Err(_) => (1, "anchor did not answer".into()),
                 }
             }
-            ["grep", pattern, dir, flags] => (0, self.grep(pattern, dir, flags.contains('i'))),
             _ => (1, "unknown request".into()),
         }
     }
 
     /// `hilo grep` / MCP `search`: the synced files of every unit under `dir` (or containing it),
     /// shown relative to `dir`. Ignored and untracked files are never searched.
-    // ponytail: reads files on the main loop; move to a thread if big drives make it stall syncing.
-    fn grep(&self, pattern: &str, dir: &str, ignore_case: bool) -> String {
+    fn grep_files(&self, dir: &str) -> Vec<(PathBuf, String)> {
         let dir = canonical_maybe_missing(Path::new(dir));
         let mut files = vec![];
         for w in self.wts.iter().filter(|w| w.id().is_some()) {
@@ -1301,11 +1299,7 @@ impl D {
                 files.push((p, shown));
             }
         }
-        let mut hits = crate::grep::search(&files, pattern, ignore_case, crate::grep::MAX_RESULTS);
-        if hits.len() == crate::grep::MAX_RESULTS {
-            hits.push(format!("[stopped at {} results; narrow the folder or the pattern]", crate::grep::MAX_RESULTS));
-        }
-        if hits.is_empty() { "no matches".into() } else { hits.join("\n") }
+        files
     }
 
     fn status(&self, latency: bool) -> String {
@@ -1548,6 +1542,11 @@ impl D {
                         self.scan_wt(wi, Some(&[rel]));
                     }
                 }
+            }
+            // the file list is cheap; reading the files happens off the main loop so syncing never waits on it
+            Ev::Ipc(a, reply) if a.len() == 4 && a[0] == "grep" => {
+                let files = self.grep_files(&a[2]);
+                std::thread::spawn(move || reply.send((0, crate::grep::answer(&files, &a[1], a[3].contains('i')))));
             }
             Ev::Ipc(a, reply) => {
                 let r = self.ipc(a);

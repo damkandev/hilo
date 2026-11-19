@@ -42,6 +42,15 @@ pub fn search(files: &[(PathBuf, String)], pattern: &str, ignore_case: bool, max
     out
 }
 
+/// The text `hilo grep` and MCP `search` answer with.
+pub fn answer(files: &[(PathBuf, String)], pattern: &str, ignore_case: bool) -> String {
+    let mut hits = search(files, pattern, ignore_case, MAX_RESULTS);
+    if hits.len() == MAX_RESULTS {
+        hits.push(format!("[stopped at {MAX_RESULTS} results; narrow the folder or the pattern]"));
+    }
+    if hits.is_empty() { "no matches".into() } else { hits.join("\n") }
+}
+
 /// At most MAX_LINE bytes of `line` around the match at byte `at`.
 fn clip(line: &str, at: usize) -> String {
     let line = line.trim_end();
