@@ -1883,4 +1883,35 @@ mod tests {
         sh.notify_session(None, "new hold".into());
         assert_eq!(sh.notices_for("b"), ["new hold"]);
     }
+
+    #[test]
+    fn drive_roots_never_nest() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("hilo-ov-{}", crate::crypto::hex(&crate::crypto::random::<4>())));
+        for d in ["code/app", "notes/sub", "docs", "solo", "My Stuff", "empty"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let p = |d: &str| base.join(d);
+        let mut cfg = Config::default();
+        cfg.add("folder", &p("code").to_string_lossy());
+        cfg.add("repo", &p("solo").to_string_lossy());
+        assert_eq!(register_drive(&mut cfg, &p("notes"), "notes"), Ok(true));
+        assert_eq!(register_drive(&mut cfg, &p("notes"), "notes"), Ok(false)); // again: nothing to do
+        for (path, label) in [("notes/sub", "sub"), ("code/app", "app"), ("code", "c2"), ("solo", "s"), ("docs", "notes"), ("docs", ".x"), ("docs", "a b")] {
+            assert!(register_drive(&mut cfg, &p(path), label).is_err(), "{path} as {label}");
+        }
+        assert!(register_drive(&mut cfg, &base, "all").is_err()); // around everything
+        assert_eq!(register_drive(&mut cfg, &p("My Stuff"), "stuff"), Ok(true));
+        assert_eq!(cfg.drives().iter().map(|d| d.0.as_str()).collect::<Vec<_>>(), ["notes", "stuff"]);
+        // the other way round: a folder or repo inside or around a drive
+        assert!(overlap(&cfg, &p("notes/sub"), &["drive"]).is_some() && overlap(&cfg, &base, &["drive"]).is_some());
+        assert!(overlap(&cfg, &p("docs"), &["drive"]).is_none());
+        // `hilo add` picks a drive only for a folder without repos
+        assert_eq!(drive_label(&p("empty"), "auto", ""), Some("empty".into()));
+        assert_eq!(drive_label(&p("My Stuff"), "auto", "mine"), Some("mine".into()));
+        assert_eq!(drive_label(&p("empty"), "", ""), None);
+        std::fs::create_dir_all(p("code/app/.git")).unwrap();
+        assert_eq!(drive_label(&p("code"), "auto", ""), None);
+        assert_eq!(drive_label(&p("code"), "drive", ""), Some("code".into()));
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

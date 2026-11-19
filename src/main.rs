@@ -90,12 +90,14 @@ Or by hand:
 Both link the folder you run them in (or --folder DIR): every repo in it syncs, and new repos you
 create there appear on the other machines on their own. The rest is optional:
 
-  hilo add FOLDER                           link another folder (or a single repo)
+  hilo add FOLDER [--as LABEL]              link another folder of repos, a single repo, or any other
+                                            folder as a drive (--drive: always a drive)
 
 Cloud agents (Claude Code on the web, Codex, Cursor, Codespaces, dev containers…):
 
   hilo token create [--env] [--addr H:P]    on the anchor: a reusable, revocable token for sandboxes
-  hilo up                                   in the sandbox's setup script, with HILO_TOKEN set
+      [--path P] [--expires 24h] [--read-only]   only one folder or repo, for a while, without writing
+  hilo up [--read-only] [--drive LABEL]     in the sandbox's setup script, with HILO_TOKEN set
   hilo token ls | revoke ID
 
   hilo status [--latency]                   machines, worktrees, leases, conflicts, waiting approvals
@@ -126,6 +128,8 @@ pub struct Opts {
     pub listen: Option<String>,
     pub bind: Option<String>,
     pub public: bool,
+    /// link the folder as a drive with this label instead (`hilo up --drive`)
+    pub drive: Option<String>,
 }
 
 impl Opts {
@@ -137,6 +141,7 @@ impl Opts {
             listen: flag(args, "--listen"),
             bind: flag(args, "--bind"),
             public: args.iter().any(|a| a == "--public"),
+            drive: None,
         }
     }
 }
@@ -156,8 +161,16 @@ pub fn repos_in(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// One repo if `path` is a repo's top level; otherwise a linked folder (every repo in it, new ones too).
-fn register(cfg: &mut Config, path: &Path) -> Result<String, String> {
+/// With `drive`, a drive with that label.
+fn register(cfg: &mut Config, path: &Path, drive: Option<&str>) -> Result<String, String> {
     let path = std::fs::canonicalize(path).map_err(|_| format!("{}: no such folder", path.display()))?;
+    if let Some(label) = drive {
+        daemon::register_drive(cfg, &path, label)?;
+        return Ok(format!("drive    {} ({label})", tui::tilde(&path)));
+    }
+    if let Some(e) = daemon::overlap(cfg, &path, &["drive"]) {
+        return Err(e);
+    }
     let top = git::toplevel(&path).and_then(|t| std::fs::canonicalize(t).ok());
     if top.as_deref() == Some(path.as_path()) {
         git::repo_id(&path).map_err(|_| format!("{} needs at least one commit", path.display()))?;
@@ -251,7 +264,7 @@ pub fn init_core(o: &Opts) -> Result<(String, Vec<String>), String> {
         cfg.set("bind", b); // behind NAT/containers: listen here, advertise --listen
     }
     let folder = target_folder(o);
-    lines.push(register(&mut cfg, &folder)?);
+    lines.push(register(&mut cfg, &folder, o.drive.as_deref())?);
     cfg.save().map_err(|e| e.to_string())?;
     if vault::epoch() == 0 {
         vault::new_epoch().map_err(|e| e.to_string())?;
@@ -318,7 +331,7 @@ pub fn join_core(code: &str, o: &Opts) -> Result<Vec<String>, String> {
     cfg.set("anchor", &addr);
     cfg.set("anchor_key", &crypto::hex(&anchor_key));
     let folder = target_folder(o);
-    lines.push(register(&mut cfg, &folder)?);
+    lines.push(register(&mut cfg, &folder, o.drive.as_deref())?);
     cfg.save().map_err(|e| e.to_string())?;
     lines.extend(install::install(&bin(), o.service));
     if was_running {
@@ -360,6 +373,55 @@ fn is_private_addr(addr: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok_and(is_private)
 }
 
+/// `30m`, `24h`, `7d` -> seconds.
+fn duration(s: &str) -> Option<u64> {
+    let (n, unit) = [("m", 60), ("h", 3600), ("d", 86400)].into_iter().find_map(|(u, k)| Some((s.strip_suffix(u)?, k)))?;
+    n.parse::<u64>().ok()?.checked_mul(unit).filter(|&x| x > 0)
+}
+
+/// `--path` on the anchor -> what the token may see: a folder of a drive, or a whole repo.
+fn token_scope(cfg: &Config, p: &str) -> Result<config::Scope, String> {
+    let path = std::fs::canonicalize(p).map_err(|e| format!("{p}: {e}"))?;
+    let dir = if path.is_dir() { path.clone() } else { path.parent().map(Path::to_path_buf).unwrap_or_default() };
+    let repo = git::toplevel(&dir).and_then(|t| std::fs::canonicalize(t).ok());
+    for (label, root) in cfg.drives() {
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let Ok(rest) = path.strip_prefix(&root) else { continue };
+        if repo.as_ref().is_some_and(|r| r.starts_with(&root)) {
+            break; // a repo inside the drive: the drive skips it, it syncs as a repo
+        }
+        let prefix = rest.to_str().ok_or(format!("{}: not UTF-8", path.display()))?;
+        return Ok(config::Scope { unit: format!("drive:{label}"), prefix: prefix.to_string() });
+    }
+    let top = repo.ok_or(format!("{} is not inside a drive or a repo", path.display()))?;
+    if top != path {
+        eprintln!("note: a repo is shared whole; the token sees all of {}", top.display());
+    }
+    let id = git::repo_id(&top).map_err(|e| format!("{}: {e}", top.display()))?;
+    Ok(config::Scope { unit: format!("repo:{id}"), prefix: String::new() })
+}
+
+/// `drive:notes/plans, read-only, expires in 6 h` for `hilo token create` and `ls`.
+fn token_limits(t: &config::CloudToken) -> String {
+    let mut v = vec![match &t.scope {
+        None => "everything".to_string(),
+        Some(s) if s.prefix.is_empty() => s.unit.clone(),
+        Some(s) => format!("{}/{}", s.unit, s.prefix),
+    }];
+    if t.ro {
+        v.push("read-only".into());
+    }
+    let now = config::now();
+    match t.expires {
+        0 => {}
+        e if e <= now => v.push("EXPIRED".into()),
+        e if e - now < 3600 => v.push(format!("expires in {} min", (e - now).div_ceil(60))),
+        e if e - now < 2 * 86400 => v.push(format!("expires in {} h", (e - now) / 3600)),
+        e => v.push(format!("expires in {} days", (e - now) / 86400)),
+    }
+    v.join(", ")
+}
+
 /// `hilo token create | ls | revoke ID` (on the anchor).
 fn token(args: &[String]) -> Result<(), String> {
     let cfg = Config::load();
@@ -371,11 +433,19 @@ fn token(args: &[String]) -> Result<(), String> {
             let name = flag(args, "--name").unwrap_or_else(|| "cloud".into());
             let env = args.iter().any(|a| a == "--env");
             let addr = flag(args, "--addr").or_else(|| cfg.get("listen").map(str::to_string)).ok_or("no address: pass --addr HOST:PORT")?;
-            let t = config::new_cloud_token(&name, env).map_err(|e| e.to_string())?;
+            let scope = flag(args, "--path").map(|p| token_scope(&cfg, &p)).transpose()?;
+            let expires = match flag(args, "--expires") {
+                Some(d) => config::now() + duration(&d).ok_or(format!("--expires {d}: use something like 30m, 24h or 7d"))?,
+                None => 0,
+            };
+            let ro = args.iter().any(|a| a == "--read-only");
+            let t = config::new_cloud_token(&name, env, scope, expires, ro).map_err(|e| e.to_string())?;
             let code = config::format_cloud(&t.secret, &addr);
             println!("token  {code}");
-            println!("id     {} ({name}, {})\n", t.id, if env { "gets .env values" } else { "no .env values" });
-            cloud_instructions(&code).iter().for_each(|l| println!("{l}"));
+            println!("id     {} ({name}, {})", t.id, if env { "gets .env values" } else { "no .env values" });
+            println!("sees   {}\n", token_limits(&t));
+            // a read-only sandbox's own tools refuse writes too (the anchor turns them down either way)
+            cloud_instructions(&code).iter().for_each(|l| println!("{l}{}", if ro && l.ends_with(" up") { " --read-only" } else { "" }));
             if is_private_addr(&addr) {
                 eprintln!("\nnote: {addr} is a private address; cloud sandboxes can't reach it. Pass --addr with a public host:port (a VPS, a port forward, a domain).");
             }
@@ -390,7 +460,7 @@ fn token(args: &[String]) -> Result<(), String> {
             let peers = config::peers();
             for t in ts {
                 let n = peers.iter().filter(|p| p.cloud_token() == Some(t.id.as_str())).count();
-                println!("{}  {:<16} {}  {} machine(s){}", t.id, t.name, if t.env { "env   " } else { "no env" }, n, if t.revoked { "  REVOKED" } else { "" });
+                println!("{}  {:<16} {}  {} machine(s)  {}{}", t.id, t.name, if t.env { "env   " } else { "no env" }, n, token_limits(&t), if t.revoked { "  REVOKED" } else { "" });
             }
             Ok(())
         }
@@ -408,7 +478,7 @@ fn token(args: &[String]) -> Result<(), String> {
             println!("token {id} revoked");
             Ok(())
         }
-        _ => Err("usage: hilo token create [--name N] [--env] [--addr HOST:PORT] | ls | revoke ID".into()),
+        _ => Err("usage: hilo token create [--name N] [--env] [--addr HOST:PORT] [--path P] [--expires 24h] [--read-only] | ls | revoke ID".into()),
     }
 }
 
@@ -436,18 +506,31 @@ fn spawn_daemon() -> Result<(), String> {
 /// links the repo or folder you're in, starts the daemon in the background and waits until in sync.
 fn up(args: &[String]) -> Result<(), String> {
     let folder = flag(args, "--folder").map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    let drive = flag(args, "--drive");
+    if drive.is_some() {
+        std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    }
     let folder = std::fs::canonicalize(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
     let cfg = Config::load();
     if cfg.get("role").is_none() {
         let token = flag(args, "--token").or_else(|| std::env::var("HILO_TOKEN").ok()).ok_or("set HILO_TOKEN (from `hilo token create` on the anchor)")?;
         let name = flag(args, "--name").or_else(|| std::env::var("HILO_NAME").ok()).unwrap_or_else(|| format!("cloud-{}", config::name()));
-        join_core(token.trim(), &Opts { name: Some(name), folder: Some(folder.clone()), service: false, ..Default::default() })?;
+        join_core(token.trim(), &Opts { name: Some(name), folder: Some(folder.clone()), service: false, drive: drive.clone(), ..Default::default() })?;
         println!("hilo: joined {}", Config::load().get("anchor").unwrap_or_default());
     } else if daemon_up() {
-        tell_daemon(&folder);
+        match &drive {
+            Some(l) => daemon_call(&["add", &folder.to_string_lossy(), "drive", l])?,
+            None => tell_daemon(&folder),
+        }
     } else {
         let mut cfg = cfg;
-        register(&mut cfg, &folder)?;
+        register(&mut cfg, &folder, drive.as_deref())?;
+        cfg.save().map_err(|e| e.to_string())?;
+    }
+    // the anchor turns down this machine's writes either way; this makes its own tools refuse them first
+    if args.iter().any(|a| a == "--read-only") || std::env::var("HILO_READONLY").as_deref() == Ok("1") {
+        let mut cfg = Config::load();
+        cfg.set("scope_ro", "1");
         cfg.save().map_err(|e| e.to_string())?;
     }
     if !daemon_up() {
@@ -475,15 +558,22 @@ fn up(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// `hilo add PATH`: link a folder (or one repo) on this machine.
+/// `hilo add [--drive] PATH [--as LABEL]`: link a folder of repos, one repo, or a drive (any other
+/// folder, or any folder with --drive) on this machine.
 fn add(args: &[String]) -> Result<(), String> {
-    let p = args.first().ok_or("usage: hilo add FOLDER")?;
+    let usage = "usage: hilo add [--drive] FOLDER [--as LABEL]";
+    let label = flag(args, "--as").unwrap_or_default();
+    let p = args.iter().enumerate().find(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--as")).ok_or(usage)?.1;
+    let mode = if args.iter().any(|a| a == "--drive") { "drive" } else { "auto" };
     let path = std::fs::canonicalize(p).map_err(|_| format!("{p}: no such folder"))?;
+    if !path.is_dir() {
+        return Err(format!("{p} is not a folder"));
+    }
     if daemon_up() {
-        return daemon_call(&["add", &path.to_string_lossy()]);
+        return daemon_call(&["add", &path.to_string_lossy(), mode, &label]);
     }
     let mut cfg = Config::load();
-    let line = register(&mut cfg, &path)?;
+    let line = register(&mut cfg, &path, daemon::drive_label(&path, mode, &label).as_deref())?;
     cfg.save().map_err(|e| e.to_string())?;
     println!("{line}");
     Ok(())
@@ -541,6 +631,9 @@ fn status(args: &[String]) -> Result<(), String> {
         return Ok(());
     };
     println!("machine   {} ({role}) — daemon not running", config::name());
+    for (l, p) in cfg.drives() {
+        println!("drive     {} ({l})", tui::tilde(&p));
+    }
     for r in cfg.all("repo") {
         println!("repo      {r} [{}] conflicts: {}", git::gitdir(Path::new(r)).ok().and_then(|g| git::branch(&g)).unwrap_or("detached".into()), git::conflict_branches(Path::new(r)));
     }

@@ -26,6 +26,8 @@ pub enum In {
     Unpair(String, Sender<Result<Vec<String>, String>>),
     /// Cut off every machine that joined with this cloud token.
     Kick(Vec<[u8; 32]>),
+    /// Every 30 s: cut off sandboxes whose token expired or was revoked.
+    Tick,
 }
 
 /// Cloud sandboxes that haven't connected for this long are forgotten.
@@ -44,7 +46,34 @@ struct Client {
     name: String,
     ready: bool, // Hello seen and caught up: receives broadcasts
     stream: Option<TcpStream>,
-    env: bool, // may receive the vault keys
+    env: bool,             // may receive the vault keys
+    token: Option<String>, // cloud token it joined with: checked again every 30 s
+    scope: Option<config::Scope>,
+    ro: bool,
+}
+
+impl Client {
+    fn sees(&self, wt: &str, path: &str) -> bool {
+        self.scope.as_ref().is_none_or(|s| config::in_scope(s, wt, path))
+    }
+
+    /// Every message to a machine goes through here: a scoped sandbox never hears of a key outside
+    /// its scope, and only machines allowed `.env` values get vault keys. False = the machine is gone.
+    fn send(&self, m: Msg) -> bool {
+        let key = match &m {
+            Msg::Op(o) => Some((&o.wt, &o.path)),
+            Msg::Reject(r) => Some((&r.wt, &r.path)),
+            Msg::Lease(l) => Some((&l.wt, &l.path)),
+            Msg::Claim { wt, path, .. } | Msg::Release { wt, path, .. } | Msg::NeedFull { wt, path } => Some((wt, path)),
+            Msg::Resync { .. } if self.scope.is_some() => return true, // never sent; no path to check
+            Msg::VaultKey { .. } if !self.env => return true,
+            Msg::Resync { .. } | Msg::VaultKey { .. } | Msg::Hello { .. } | Msg::CaughtUp | Msg::Ping | Msg::Time { .. } | Msg::Peers(_) => None,
+        };
+        if key.is_some_and(|(w, p)| !self.sees(w, p)) {
+            return true;
+        }
+        self.tx.send(m).is_ok()
+    }
 }
 
 struct Core {
@@ -130,7 +159,39 @@ pub fn now_ms() -> u64 {
 
 impl Core {
     fn send_ready(&mut self, m: Msg) {
-        self.clients.retain(|_, c| !c.ready || c.tx.send(m.clone()).is_ok());
+        self.clients.retain(|_, c| !c.ready || c.send(m.clone()));
+    }
+
+    fn to(&self, id: u64, m: Msg) {
+        if let Some(c) = self.clients.get(&id) {
+            c.send(m);
+        }
+    }
+
+    /// Drops these machines' connections and tells the rest who is online.
+    fn cut(&mut self, f: impl Fn(&Client) -> bool) {
+        let ids: Vec<u64> = self.clients.iter().filter(|(_, c)| f(c)).map(|(i, _)| *i).collect();
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            if let Some(s) = self.clients.remove(&id).and_then(|c| c.stream) {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        let m = self.peers_msg();
+        self.send_ready(m);
+    }
+
+    /// Tells `to` its change lost: `cur` is the version that stands.
+    fn reject(&self, to: u64, op: Op, cur: Hash) {
+        match read_blob(&cur) {
+            Ok(data) => {
+                let origin = self.origins.get(&(op.wt.clone(), op.path.clone())).cloned().unwrap_or_default();
+                self.to(to, Msg::Reject(Reject { wt: op.wt, path: op.path, rejected: op.new, current: cur, data: Data::from_opt(data), origin }));
+            }
+            Err(e) => log!("anchor: missing blob for {}: {e}", op.path),
+        }
     }
 
     fn peers_msg(&self) -> Msg {
@@ -194,26 +255,16 @@ impl Core {
                         }
                     }
                 }
-                self.clients.retain(|id, c| !c.ready || c.tx.send(Msg::Op(if *id == from { thin.clone() } else { wide.clone() })).is_ok());
+                self.clients.retain(|id, c| !c.ready || c.send(Msg::Op(if *id == from { thin.clone() } else { wide.clone() })));
             }
-            Err(cur) => {
-                let Some(c) = self.clients.get(&from) else { return };
-                match read_blob(&cur) {
-                    Ok(data) => {
-                        let origin = self.origins.get(&(op.wt.clone(), op.path.clone())).cloned().unwrap_or_default();
-                        let r = Reject { wt: op.wt, path: op.path, rejected: op.new, current: cur, data: Data::from_opt(data), origin };
-                        let _ = c.tx.send(Msg::Reject(r));
-                    }
-                    Err(e) => log!("anchor: missing blob for {}: {e}", op.path),
-                }
-            }
+            Err(cur) => self.reject(from, op, cur),
         }
     }
 
     fn handle(&mut self, ev: In) {
         match ev {
             In::Connect { id, tx, key, ip, stream } => {
-                let mut env = true;
+                let (mut env, mut token, mut scope, mut ro) = (true, None, None, false);
                 if id != 0 {
                     let now = unix_now();
                     let mut ps = config::peers();
@@ -222,33 +273,35 @@ impl Core {
                         let seen = p.tag.rsplit(':').next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(now);
                         p.cloud_token().is_none() || ct_eq(&p.key, &key) || now.saturating_sub(seen) < CLOUD_FORGET_SECS
                     });
-                    if let Some(p) = ps.iter_mut().find(|p| ct_eq(&p.key, &key)) {
-                        if p.cloud_token().is_none() && !p.ip.is_empty() && p.ip != "-" && p.ip != ip {
-                            let msg = format!("machine {} connected from a new address {ip} (was {})", p.name, p.ip);
-                            log!("anchor: {msg}");
-                            crate::notify(&msg);
+                    // unpaired or revoked between the handshake and here: nothing to say what it may see
+                    let Some(p) = ps.iter_mut().find(|p| ct_eq(&p.key, &key)) else { return refuse(stream, "is no longer paired") };
+                    if let Some(tid) = p.cloud_token() {
+                        // a known sandbox reconnects without its token: the token's limits come from here
+                        match config::cloud_tokens().into_iter().find(|t| t.id == tid) {
+                            Some(t) if t.live(now) => (token, scope, ro) = (Some(t.id), t.scope, t.ro),
+                            _ => return refuse(stream, &format!("joined with token {tid}, now expired or revoked ({})", p.name)),
                         }
-                        p.ip = ip;
-                        env = p.gets_env();
-                        if let Some(t) = p.tag.strip_prefix("cloud:") {
-                            let mut parts: Vec<&str> = t.split(':').collect();
-                            parts.truncate(2);
-                            p.tag = format!("cloud:{}:{now}", parts.join(":"));
-                        }
+                    }
+                    if p.cloud_token().is_none() && !p.ip.is_empty() && p.ip != "-" && p.ip != ip {
+                        let msg = format!("machine {} connected from a new address {ip} (was {})", p.name, p.ip);
+                        log!("anchor: {msg}");
+                        crate::notify(&msg);
+                    }
+                    p.ip = ip;
+                    env = p.gets_env();
+                    if let Some(t) = p.tag.strip_prefix("cloud:") {
+                        let mut parts: Vec<&str> = t.split(':').collect();
+                        parts.truncate(2);
+                        p.tag = format!("cloud:{}:{now}", parts.join(":"));
                     }
                     let _ = config::save_peers(&ps);
                 }
-                self.clients.insert(id, Client { tx, key, name: String::new(), ready: false, stream, env });
+                self.clients.insert(id, Client { tx, key, name: String::new(), ready: false, stream, env, token, scope, ro });
             }
-            In::Kick(keys) => {
-                let ids: Vec<u64> = self.clients.iter().filter(|(_, c)| keys.iter().any(|k| ct_eq(k, &c.key))).map(|(i, _)| *i).collect();
-                for id in ids {
-                    if let Some(s) = self.clients.remove(&id).and_then(|c| c.stream) {
-                        let _ = s.shutdown(std::net::Shutdown::Both);
-                    }
-                }
-                let m = self.peers_msg();
-                self.send_ready(m);
+            In::Kick(keys) => self.cut(|c| keys.iter().any(|k| ct_eq(k, &c.key))),
+            In::Tick => {
+                let (ts, now) = (config::cloud_tokens(), unix_now());
+                self.cut(|c| c.token.as_ref().is_some_and(|id| !ts.iter().any(|t| &t.id == id && t.live(now))));
             }
             In::Gone(id) => {
                 if self.clients.remove(&id).is_some_and(|c| c.ready) {
@@ -278,27 +331,41 @@ impl Core {
                         let _ = config::save_peers(&ps);
                     }
                 }
-                let tx = c.tx.clone();
-                if c.env {
-                    for (e, k) in vault::keys() {
-                        let _ = tx.send(Msg::VaultKey { epoch: e, key: k });
-                    }
+                for (e, k) in vault::keys() {
+                    self.to(id, Msg::VaultKey { epoch: e, key: k });
                 }
                 for l in self.leases.snapshot() {
-                    let _ = tx.send(Msg::Lease(l));
+                    self.to(id, Msg::Lease(l));
                 }
                 for (k, seq, h) in self.seq.since(last_seq) {
                     match self.latest(&k, seq, h, true) {
-                        Ok(op) => {
-                            let _ = tx.send(Msg::Op(op));
-                        }
+                        Ok(op) => self.to(id, Msg::Op(op)),
                         Err(e) => log!("anchor: missing blob for {}: {e}", k.1),
                     }
                 }
-                let _ = tx.send(Msg::CaughtUp);
+                self.to(id, Msg::CaughtUp);
                 self.clients.get_mut(&id).unwrap().ready = true;
                 let m = self.peers_msg();
                 self.send_ready(m);
+            }
+            // A scoped sandbox's writes outside its scope are dropped without a word: a Reject would
+            // carry the current content. A read-only one gets every write turned down, and its claims
+            // and releases are ignored (a lease it can't use would only block the writers).
+            Msg::Op(_) | Msg::Claim { .. } | Msg::Release { .. } if c.ro => {
+                if let Msg::Op(op) = m {
+                    if c.sees(&op.wt, &op.path) {
+                        let cur = self.seq.current(&op.wt, &op.path);
+                        self.reject(id, op, cur);
+                    } else {
+                        log!("anchor: dropped a change outside the scope of {}: {} {:?}", c.name, op.wt, op.path);
+                    }
+                }
+            }
+            Msg::Op(Op { ref wt, ref path, .. }) | Msg::Claim { ref wt, ref path, .. } if !c.sees(wt, path) => {
+                log!("anchor: dropped a change or claim outside the scope of {}: {wt} {path:?}", c.name);
+            }
+            Msg::Release { ref wt, ref path, .. } if !wt.is_empty() && !c.sees(wt, path) => {
+                log!("anchor: dropped a release outside the scope of {}: {wt} {path:?}", c.name);
             }
             Msg::Op(mut op) => {
                 op.origin = c.name.clone();
@@ -309,44 +376,45 @@ impl Core {
                 }
             }
             Msg::NeedFull { wt, path } => {
-                let tx = c.tx.clone();
                 let k = (wt, path);
                 if let Some((seq, h)) = self.seq.state.get(&k).copied() {
                     if let Ok(op) = self.latest(&k, seq, h, false) {
-                        let _ = tx.send(Msg::Op(op));
+                        self.to(id, Msg::Op(op));
                     }
                 }
             }
             Msg::Resync { wt } => {
-                let tx = c.tx.clone();
                 // "repo:*" = every repo announcement (a folder was just linked)
                 let hit = |w: &str| w == wt || wt.strip_suffix('*').is_some_and(|p| w.starts_with(p));
                 for (k, seq, h) in self.seq.since(0).into_iter().filter(|e| hit(&e.0 .0)) {
                     if let Ok(op) = self.latest(&k, seq, h, true) {
-                        let _ = tx.send(Msg::Op(op));
+                        self.to(id, Msg::Op(op));
                     }
                 }
             }
             Msg::Claim { wt, path, session } => {
                 let machine = c.name.clone();
-                let tx = c.tx.clone();
                 match self.leases.claim(&wt, &path, &session, &machine) {
                     Some(l) => self.send_ready(Msg::Lease(l)),
                     None => {
                         // tell the loser who holds it, so its local copy is right
                         if let Some(l) = self.leases.snapshot().into_iter().find(|l| l.wt == wt && l.path == path) {
-                            let _ = tx.send(Msg::Lease(l));
+                            self.to(id, Msg::Lease(l));
                         }
                     }
                 }
             }
             Msg::Release { wt, path, session } => {
-                for l in self.leases.release(&wt, &path, &session) {
-                    self.send_ready(Msg::Lease(l));
+                // "every lease of the session" from a scoped sandbox only reaches inside its scope
+                let keys: Vec<Key> = if wt.is_empty() { self.leases.0.keys().filter(|k| c.sees(&k.0, &k.1)).cloned().collect() } else { vec![(wt, path)] };
+                for (w, p) in keys {
+                    for l in self.leases.release(&w, &p, &session) {
+                        self.send_ready(Msg::Lease(l));
+                    }
                 }
             }
             Msg::Time { t0, .. } => {
-                let _ = c.tx.send(Msg::Time { t0, t1: now_ms() });
+                c.send(Msg::Time { t0, t1: now_ms() });
             }
             _ => {}
         }
@@ -360,20 +428,11 @@ impl Core {
         }
         config::save_peers(&keep).map_err(|e| e.to_string())?;
         // cut live connections at once
-        let ids: Vec<u64> = self.clients.iter().filter(|(_, c)| gone.iter().any(|p| ct_eq(&p.key, &c.key))).map(|(i, _)| *i).collect();
-        for id in ids {
-            if let Some(c) = self.clients.remove(&id) {
-                if let Some(s) = c.stream {
-                    let _ = s.shutdown(std::net::Shutdown::Both);
-                }
-            }
-        }
-        let m = self.peers_msg();
-        self.send_ready(m);
+        self.cut(|c| gone.iter().any(|p| ct_eq(&p.key, &c.key)));
         // new vault key; re-seal every shared value with it
         let old = vault::keys();
         let (e, k) = vault::new_epoch().map_err(|e| e.to_string())?;
-        self.clients.retain(|_, c| !c.ready || !c.env || c.tx.send(Msg::VaultKey { epoch: e, key: k }).is_ok());
+        self.send_ready(Msg::VaultKey { epoch: e, key: k });
         let keys = vault::keys();
         let mut seen = vec![];
         for ((wt, path), (_, h)) in self.seq.state.clone() {
@@ -396,6 +455,14 @@ impl Core {
     }
 }
 
+/// Turns a connection away after the handshake: dropping its channel ends its writer.
+fn refuse(stream: Option<TcpStream>, why: &str) {
+    log!("anchor: refused a machine that {why}");
+    if let Some(s) = stream {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 pub fn start(listen: &str, key: [u8; 32]) -> io::Result<Sender<In>> {
     let (seq, origins, log) = open_log()?;
     log!("anchor: {} changes on record, listening on {listen}", seq.seq);
@@ -405,6 +472,13 @@ pub fn start(listen: &str, key: [u8; 32]) -> io::Result<Sender<In>> {
         let mut core = Core { seq, origins, log, clients: HashMap::new(), leases: lease::Table::default() };
         for ev in rx {
             core.handle(ev);
+        }
+    });
+    let ttx = tx.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        if ttx.send(In::Tick).is_err() {
+            break;
         }
     });
     let atx = tx.clone();
@@ -429,7 +503,8 @@ fn serve(mut s: TcpStream, key: [u8; 32], atx: Sender<In>, unauth: Arc<AtomicUsi
     let _ = s.set_nodelay(true);
     let _ = s.set_write_timeout(Some(net::HANDSHAKE_TIMEOUT));
     let tokens = config::active_tokens();
-    let clouds: Vec<config::CloudToken> = config::cloud_tokens().into_iter().filter(|t| !t.revoked).collect();
+    let now = unix_now();
+    let clouds: Vec<config::CloudToken> = config::cloud_tokens().into_iter().filter(|t| t.live(now)).collect();
     let psks: Vec<[u8; 32]> = std::iter::once(net::ZERO_PSK)
         .chain(tokens.iter().map(|t| config::token_psk(t)))
         .chain(clouds.iter().map(|t| config::cloud_psk(&t.secret)))
@@ -476,4 +551,140 @@ fn serve(mut s: TcpStream, key: [u8; 32], atx: Sender<In>, unauth: Arc<AtomicUsi
     let _ = atx.send(In::Gone(id));
     let _ = s.shutdown(std::net::Shutdown::Both);
     log!("anchor: {} ({peer}) disconnected", &hex(&remote)[..8]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CloudToken, Scope};
+
+    fn op(wt: &str, path: &str, body: &str) -> Op {
+        let d = body.as_bytes().to_vec();
+        Op { seq: 0, wt: wt.into(), path: path.into(), base: NONE, new: hash_of(Some(&d)), data: Data::Full(d), origin: String::new(), t_event: 0, t_seq: 0 }
+    }
+
+    fn keys(rx: &Receiver<Msg>) -> Vec<(&'static str, String, String)> {
+        rx.try_iter()
+            .filter_map(|m| match m {
+                Msg::Op(o) => Some(("op", o.wt, o.path)),
+                Msg::Lease(l) => Some(("lease", l.wt, l.path)),
+                Msg::Reject(r) => Some(("reject", r.wt, r.path)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has(v: &[(&str, String, String)], kind: &str, wt: &str, path: &str) -> bool {
+        v.iter().any(|(k, w, p)| *k == kind && w == wt && p == path)
+    }
+
+    /// Phase 2's acceptance test: a sandbox works in one folder without seeing the others.
+    /// The only test that touches HILO_HOME in-process; it points it at a fresh temp dir first.
+    #[test]
+    fn scoped_sandbox_sees_only_its_folder() {
+        let home = std::env::temp_dir().join(format!("hilo-anchor-test-{}-{}", std::process::id(), hex(&crate::crypto::random::<4>())));
+        for d in ["anchor/blobs", "tmp", "secrets", "vault", "index"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        std::env::set_var("HILO_HOME", &home);
+        let now = unix_now();
+        let notes = |p: &str| Some(Scope { unit: "drive:notes".into(), prefix: p.into() });
+        let tok = |id: &str, scope: Option<Scope>, expires: u64, ro: bool| CloudToken { id: id.into(), secret: id.repeat(32)[..32].into(), name: id.into(), env: false, created: now, revoked: false, scope, expires, ro };
+        let tokens = vec![tok("W", None, 0, false), tok("S", notes("a"), now + 3600, false), tok("R", notes("a"), 0, true), tok("X", notes(""), now - 1, false)];
+        config::save_cloud_tokens(&tokens).unwrap();
+        let peers: Vec<Peer> = ["W", "S", "R", "X"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Peer { key: [i as u8 + 1; 32], name: format!("m{t}"), ip: "-".into(), tag: format!("cloud:{t}:0:{now}") })
+            .collect();
+        config::save_peers(&peers).unwrap();
+
+        let (seq, origins, log) = open_log().unwrap();
+        let mut core = Core { seq, origins, log, clients: HashMap::new(), leases: lease::Table::default() };
+        let connect = |core: &mut Core, id: u64| {
+            let (tx, rx) = channel();
+            core.handle(In::Connect { id, tx, key: [id as u8; 32], ip: "-".into(), stream: None });
+            rx
+        };
+        let (w, s, r, x) = (1, 2, 3, 4); // writer (no scope), scoped, scoped read-only, expired
+        let wrx = connect(&mut core, w);
+        core.handle(In::Msg(w, Msg::Hello { last_seq: 0, name: "w".into() }));
+        keys(&wrx);
+
+        // history the sandbox's catch-up must filter, and a lease outside its scope
+        for (wt, p) in [("drive:notes", "a/1"), ("drive:notes", "ab/2"), ("drive:notes", "a"), ("drive:other", "a/3"), ("R:main", "a/4"), ("vault:R", "a/.env\0K")] {
+            core.handle(In::Msg(w, Msg::Op(op(wt, p, p))));
+        }
+        core.handle(In::Msg(w, Msg::Claim { wt: "drive:notes".into(), path: "b/secret".into(), session: "s1".into() }));
+        core.handle(In::Msg(w, Msg::Claim { wt: "drive:notes".into(), path: "a/1".into(), session: "s1".into() }));
+
+        let srx = connect(&mut core, s);
+        core.handle(In::Msg(s, Msg::Hello { last_seq: 0, name: "s".into() }));
+        let mut got = keys(&srx);
+        assert!(has(&got, "op", "drive:notes", "a/1") && has(&got, "op", "drive:notes", "a") && has(&got, "lease", "drive:notes", "a/1"), "{got:?}");
+
+        // live traffic: broadcasts (thin and wide), leases, NeedFull, Resync, re-seal fan-out
+        let mut big = "x".repeat(DELTA_MIN * 2);
+        core.handle(In::Msg(w, Msg::Op(op("drive:notes", "a/b/5", &big))));
+        big.push('y');
+        let mut o = op("drive:notes", "a/b/5", &big);
+        o.base = hash_of(Some("x".repeat(DELTA_MIN * 2).as_bytes()));
+        core.handle(In::Msg(w, Msg::Op(o))); // goes out as a delta
+        core.handle(In::Msg(w, Msg::Op(op("drive:notes", "b/6", "b"))));
+        core.handle(In::Msg(w, Msg::Claim { wt: "drive:notes".into(), path: "b/6".into(), session: "s1".into() }));
+        core.handle(In::Msg(w, Msg::Release { wt: "drive:notes".into(), path: "b/6".into(), session: "s1".into() }));
+        core.handle(In::Msg(s, Msg::NeedFull { wt: "drive:notes".into(), path: "b/6".into() }));
+        core.handle(In::Msg(s, Msg::Resync { wt: "drive:*".into() }));
+        core.handle(In::Msg(s, Msg::Resync { wt: "repo:*".into() }));
+        core.accept(op("drive:notes", "z", "z"), u64::MAX);
+        core.accept(op("drive:notes", "a/10", "z"), u64::MAX);
+        // the sandbox's own writes: outside its scope dropped without a word, inside accepted
+        core.handle(In::Msg(s, Msg::Op(op("drive:notes", "b/7", "evil"))));
+        core.handle(In::Msg(s, Msg::Op(op("drive:other", "a/1", "evil"))));
+        core.handle(In::Msg(s, Msg::Claim { wt: "drive:notes".into(), path: "b/8".into(), session: "s2".into() }));
+        core.handle(In::Msg(s, Msg::Release { wt: String::new(), path: String::new(), session: "s1".into() }));
+        core.handle(In::Msg(s, Msg::Op(op("drive:notes", "a/8", "ok"))));
+
+        got.extend(keys(&srx));
+        for (_, wt, p) in &got {
+            assert!(config::in_scope(&notes("a").unwrap(), wt, p), "scoped sandbox saw {wt} {p:?}");
+        }
+        for (k, p) in [("op", "a/b/5"), ("op", "a/10"), ("op", "a/8"), ("lease", "a/1")] {
+            assert!(has(&got, k, "drive:notes", p), "missing {k} {p}: {got:?}");
+        }
+        assert!(!got.iter().any(|e| e.0 == "reject"));
+        let wgot = keys(&wrx);
+        assert!(has(&wgot, "op", "drive:notes", "a/8") && has(&wgot, "op", "drive:notes", "z"));
+        assert!(!has(&wgot, "op", "drive:notes", "b/7") && !has(&wgot, "lease", "drive:notes", "b/8"));
+        assert_eq!(core.seq.current("drive:notes", "b/7"), NONE);
+        assert_eq!(core.seq.current("drive:other", "a/1"), NONE);
+        assert!(core.leases.holder("drive:notes", "b/secret").is_some(), "a scoped release reached outside its scope");
+        assert!(core.leases.holder("drive:notes", "a/1").is_none());
+
+        // read-only: an in-scope write is turned down with the current version, never accepted
+        let rrx = connect(&mut core, r);
+        core.handle(In::Msg(r, Msg::Hello { last_seq: 0, name: "r".into() }));
+        keys(&rrx);
+        let mut edit = op("drive:notes", "a/1", "ro edit");
+        edit.base = core.seq.current("drive:notes", "a/1");
+        core.handle(In::Msg(r, Msg::Op(edit)));
+        core.handle(In::Msg(r, Msg::Op(op("drive:notes", "a/new", "ro new"))));
+        core.handle(In::Msg(r, Msg::Op(op("drive:notes", "b/6", "ro out"))));
+        core.handle(In::Msg(r, Msg::Claim { wt: "drive:notes".into(), path: "a/1".into(), session: "s3".into() }));
+        let got = keys(&rrx);
+        assert_eq!(got, vec![("reject", "drive:notes".to_string(), "a/1".to_string()), ("reject", "drive:notes".to_string(), "a/new".to_string())]);
+        assert_eq!(core.seq.current("drive:notes", "a/1"), hash_of(Some(b"a/1".as_slice())));
+        assert_eq!(core.seq.current("drive:notes", "a/new"), NONE);
+        assert!(core.leases.holder("drive:notes", "a/1").is_none());
+
+        // an expired token can't come back over its pinned key; a revoked one is cut on the next tick
+        let xrx = connect(&mut core, x);
+        assert!(!core.clients.contains_key(&x) && xrx.recv().is_err());
+        let mut ts = config::cloud_tokens();
+        ts[1].revoked = true;
+        config::save_cloud_tokens(&ts).unwrap();
+        core.handle(In::Tick);
+        assert!(!core.clients.contains_key(&s) && core.clients.contains_key(&w) && core.clients.contains_key(&r));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
