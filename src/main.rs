@@ -4,6 +4,7 @@ mod crypto;
 mod daemon;
 mod fsops;
 mod git;
+mod grep;
 mod hooks;
 mod install;
 mod ipc;
@@ -95,6 +96,8 @@ Cloud agents (Claude Code on the web, Codex, Cursor, Codespaces, dev containersâ
   hilo env local KEY | prod KEY             keep a key per machine | only on this one, only via `hilo run`
   hilo env ls | history [KEY] | revert KEY [N]
   hilo run -- CMD ...                       run with the vault's variables, without writing files
+  hilo grep PATTERN [DIR] [-i]              search the synced files (literal text, -i ignores case)
+  hilo mcp                                  MCP server for agents: leases and file tools (stdio)
   hilo approve [PATH | --all | --deny PATH] review changes to paths that run code
   hilo trust MACHINE read-only|full         stop (or allow) a machine writing here
   hilo invite                               a new join code (anchor)
@@ -665,6 +668,17 @@ fn main() -> ExitCode {
             [m] => daemon_call(&["unpair", m]),
             _ => Err("usage: hilo unpair MACHINE".into()),
         },
+        Some("grep") => {
+            let ic = rest.iter().any(|a| a == "-i");
+            let pos: Vec<&String> = rest.iter().filter(|a| *a != "-i").collect();
+            match pos[..] {
+                [pat] | [pat, _] => {
+                    let dir = std::path::absolute(pos.get(1).map_or(".", |d| d.as_str())).map_err(|e| e.to_string());
+                    dir.and_then(|d| daemon_call(&["grep", pat, &d.to_string_lossy(), if ic { "i" } else { "" }]))
+                }
+                _ => Err("usage: hilo grep PATTERN [DIR] [-i]".into()),
+            }
+        }
         Some("uninstall") => uninstall(),
         Some("hook") => return ExitCode::from(hooks::run(rest.first().map_or("", String::as_str)) as u8),
         Some("mcp") => return ExitCode::from(mcp::run() as u8),

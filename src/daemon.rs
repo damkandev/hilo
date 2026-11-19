@@ -52,11 +52,15 @@ pub struct Shared {
 impl Shared {
     /// (worktree id, relative path) for an absolute path inside a synced worktree.
     pub fn locate(&self, p: &Path) -> Option<(String, String)> {
+        self.unit_of(p).filter(|u| !u.2.is_empty()).map(|(id, _, rel)| (id, rel))
+    }
+    /// (unit id, root, relative path) for a path inside a synced unit; `""` is the root itself.
+    pub fn unit_of(&self, p: &Path) -> Option<(String, PathBuf, String)> {
         let abs = canonical_maybe_missing(p);
         let roots = self.roots.read().unwrap();
         let (root, id) = roots.iter().filter(|(r, _)| abs.starts_with(r)).max_by_key(|(r, _)| r.as_os_str().len())?;
         let rel = abs.strip_prefix(root).ok()?.to_str()?.to_string();
-        valid_path(&rel).then(|| (id.clone(), rel))
+        (rel.is_empty() || valid_path(&rel)).then(|| (id.clone(), root.clone(), rel))
     }
     pub fn send(&self, m: Msg) {
         if let Some(o) = self.out.lock().unwrap().as_ref() {
@@ -1158,8 +1162,36 @@ impl D {
                     Err(_) => (1, "anchor did not answer".into()),
                 }
             }
+            ["grep", pattern, dir, flags] => (0, self.grep(pattern, dir, flags.contains('i'))),
             _ => (1, "unknown request".into()),
         }
+    }
+
+    /// `hilo grep` / MCP `search`: the synced files of every unit under `dir` (or containing it),
+    /// shown relative to `dir`. Ignored and untracked files are never searched.
+    // ponytail: reads files on the main loop; move to a thread if big drives make it stall syncing.
+    fn grep(&self, pattern: &str, dir: &str, ignore_case: bool) -> String {
+        let dir = canonical_maybe_missing(Path::new(dir));
+        let mut files = vec![];
+        for w in self.wts.iter().filter(|w| w.id().is_some()) {
+            let prefix = match dir.strip_prefix(&w.root) {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(_) if w.root.starts_with(&dir) => String::new(),
+                Err(_) => continue,
+            };
+            let mut rels: Vec<&String> = w.scanner.files.keys().filter(|r| prefix.is_empty() || **r == prefix || r.starts_with(&format!("{prefix}/"))).collect();
+            rels.sort();
+            for r in rels {
+                let p = w.root.join(r);
+                let shown = p.strip_prefix(&dir).ok().map(|s| s.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| r.clone());
+                files.push((p, shown));
+            }
+        }
+        let mut hits = crate::grep::search(&files, pattern, ignore_case, crate::grep::MAX_RESULTS);
+        if hits.len() == crate::grep::MAX_RESULTS {
+            hits.push(format!("[stopped at {} results; narrow the folder or the pattern]", crate::grep::MAX_RESULTS));
+        }
+        if hits.is_empty() { "no matches".into() } else { hits.join("\n") }
     }
 
     fn status(&self, latency: bool) -> String {
