@@ -26,7 +26,7 @@ You only need `hilo`. Everything else is there when you want to look or change s
 
 | Command | |
 | --- | --- |
-| `hilo status [--latency]` | machines online, linked folders, leases, conflicts, history, waiting approvals, p50/p95 latency |
+| `hilo status [--latency]` | machines online, linked folders, leases, conflicts, history, waiting approvals, p50/p95 latency; in a sandbox with a scoped token, its scope and the files kept there because they are outside it |
 | `hilo approve [PATH \| --all \| --deny PATH]` | review a remote change to a path that runs code |
 | `hilo log PATH` | every version of a file this machine kept, newest first: when, how (`local`, `remote`, `conflict`, `replaced`, `restored`), who, size |
 | `hilo restore PATH [--at N \| --conflict]` | bring a version back: the newest one that differs from the file, line `N` of `hilo log`, or the one that lost the last conflict. It syncs as a new write |

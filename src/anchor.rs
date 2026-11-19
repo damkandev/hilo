@@ -67,7 +67,7 @@ impl Client {
             Msg::Claim { wt, path, .. } | Msg::Release { wt, path, .. } | Msg::NeedFull { wt, path } => Some((wt, path)),
             Msg::Resync { .. } if self.scope.is_some() => return true, // never sent; no path to check
             Msg::VaultKey { .. } if !self.env => return true,
-            Msg::Resync { .. } | Msg::VaultKey { .. } | Msg::Hello { .. } | Msg::CaughtUp | Msg::Ping | Msg::Time { .. } | Msg::Peers(_) => None,
+            Msg::Resync { .. } | Msg::VaultKey { .. } | Msg::Hello { .. } | Msg::CaughtUp | Msg::Ping | Msg::Time { .. } | Msg::Peers(_) | Msg::Scope { .. } => None,
         };
         if key.is_some_and(|(w, p)| !self.sees(w, p)) {
             return true;
@@ -348,6 +348,11 @@ impl Core {
                         let _ = config::save_peers(&ps);
                     }
                 }
+                // first, so the sandbox knows what not to send before it resends anything
+                if let Some(s) = c.scope.clone() {
+                    let ro = c.ro;
+                    self.to(id, Msg::Scope { unit: s.unit, prefix: s.prefix, ro });
+                }
                 for (e, k) in vault::keys() {
                     self.to(id, Msg::VaultKey { epoch: e, key: k });
                 }
@@ -379,7 +384,7 @@ impl Core {
                 }
             }
             // A scoped sandbox may not announce a repo either: META says where the others clone it from.
-            Msg::Op(Op { ref wt, ref path, .. }) | Msg::Claim { ref wt, ref path, .. } if !c.sees(wt, path) || (c.scope.is_some() && wt.starts_with("repo:")) => {
+            Msg::Op(Op { ref wt, ref path, .. }) | Msg::Claim { ref wt, ref path, .. } if c.scope.as_ref().is_some_and(|s| !config::may_write(s, wt, path)) => {
                 log!("anchor: dropped a change or claim outside the scope of {}: {wt} {path:?}", c.name);
             }
             Msg::Release { ref wt, ref path, .. } if !wt.is_empty() && !c.sees(wt, path) => {
@@ -640,7 +645,7 @@ mod tests {
         let (w, s, r, x, p) = (1, 2, 3, 4, 5); // writer (no scope), scoped, scoped read-only, expired, one repo
         let wrx = connect(&mut core, w);
         core.handle(In::Msg(w, Msg::Hello { last_seq: 0, name: "w".into() }));
-        keys(&wrx);
+        assert!(!wrx.try_iter().any(|m| matches!(m, Msg::Scope { .. })), "an unscoped machine got a Scope");
 
         // history the sandbox's catch-up must filter, and a lease outside its scope
         for (wt, p) in [("drive:notes", "a/1"), ("drive:notes", "ab/2"), ("drive:notes", "a"), ("drive:other", "a/3"), ("R:main", "a/4"), ("vault:R", "a/.env\0K")] {
@@ -651,6 +656,7 @@ mod tests {
 
         let srx = connect(&mut core, s);
         core.handle(In::Msg(s, Msg::Hello { last_seq: 0, name: "s".into() }));
+        assert_eq!(srx.try_recv().ok(), Some(Msg::Scope { unit: "drive:notes".into(), prefix: "a".into(), ro: false }), "Scope comes first");
         let mut got = keys(&srx);
         assert!(has(&got, "op", "drive:notes", "a/1") && has(&got, "op", "drive:notes", "a") && has(&got, "lease", "drive:notes", "a/1"), "{got:?}");
 
@@ -736,6 +742,7 @@ mod tests {
         // read-only: an in-scope write is turned down with the current version, never accepted
         let rrx = connect(&mut core, r);
         core.handle(In::Msg(r, Msg::Hello { last_seq: 0, name: "r".into() }));
+        assert_eq!(rrx.try_recv().ok(), Some(Msg::Scope { unit: "drive:notes".into(), prefix: "a".into(), ro: true }));
         keys(&rrx);
         let mut edit = op("drive:notes", "a/1", "ro edit");
         edit.base = core.seq.current("drive:notes", "a/1");

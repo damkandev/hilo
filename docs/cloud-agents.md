@@ -40,7 +40,7 @@ hilo token create --addr hilo.example.com:7710 --path ~/notes/plans --expires 24
 
 - `--path P` limits the sandbox to one place, resolved on the anchor: inside a drive, that folder (or
   the whole drive); inside a repo, the whole repo (a repo is shared whole). Nothing outside reaches
-  it: not the files, not the leases, not the history it catches up on. Its writes outside are dropped.
+  it: not the files, not the leases, not the history it catches up on. Whatever it writes outside stays in the sandbox: its log says why, the agent that wrote it is told, and `hilo status` there counts it ("N files outside the scope, kept here only") instead of leaving it "waiting to send".
 - `--expires 30m|24h|7d` ends the token: no new sandbox joins with it, and the connected ones are cut
   off within 30 seconds.
 - `--read-only`: the anchor turns down every write from the sandbox (its version stays in its own
