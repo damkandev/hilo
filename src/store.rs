@@ -51,34 +51,40 @@ pub struct Store {
     _lock: File,
 }
 
-/// Longest string a record holds. A longer length is damage, not a torn write.
-const MAX_STR: usize = 64 << 10;
+fn sum4(b: &[u8]) -> [u8; 4] {
+    let h = sha256(b);
+    [h[0], h[1], h[2], h[3]]
+}
 
+/// A record: payload length (u32) and its checksum, then the payload and its checksum. Checksums
+/// are the first 4 bytes of the SHA-256, so a flipped bit anywhere is damage, never a short read.
 fn encode(e: &Entry) -> Vec<u8> {
     let mut w = W::default();
     w.u64(e.t_ms).str(&e.unit).str(&e.path).hash(&e.hash).u8(e.kind as u8).str(&e.origin);
-    w.0
+    let len = (w.0.len() as u32).to_be_bytes();
+    [&len[..], &sum4(&len), &w.0, &sum4(&w.0)].concat()
 }
 
 /// One record. `Err(true)`: the bytes end mid-record (a torn write); `Err(false)`: damage.
 fn decode(r: &mut Rd) -> Result<Entry, bool> {
-    fn s(r: &mut Rd) -> Result<String, bool> {
-        let n = r.u32().ok_or(true)? as usize;
-        if n > MAX_STR {
-            return Err(false);
-        }
-        if r.0.len() < n {
-            return Err(true);
-        }
-        let (a, b) = r.0.split_at(n);
-        r.0 = b;
-        String::from_utf8(a.to_vec()).map_err(|_| false)
+    let b = r.0;
+    if b.len() < 8 {
+        return Err(true);
     }
-    let t_ms = r.u64().ok_or(true)?;
-    let (unit, path) = (s(r)?, s(r)?);
-    let hash = r.hash().ok_or(true)?;
-    let kind = *Kind::ALL.get(r.u8().ok_or(true)? as usize).ok_or(false)?;
-    Ok(Entry { t_ms, unit, path, hash, kind, origin: s(r)? })
+    if b[4..8] != sum4(&b[..4]) {
+        return Err(false);
+    }
+    let n = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    let Some(rest) = b[8..].get(..n + 4) else { return Err(true) };
+    let (p, sum) = rest.split_at(n);
+    if sum != sum4(p) {
+        return Err(false);
+    }
+    r.0 = &b[8 + n + 4..];
+    let mut q = Rd(p);
+    let e = (|| Some(Entry { t_ms: q.u64()?, unit: q.str()?, path: q.str()?, hash: q.hash()?, kind: *Kind::ALL.get(q.u8()? as usize)?, origin: q.str()? }))();
+    // a valid checksum over a payload that doesn't parse: a newer format, not a torn write
+    e.filter(|_| q.0.is_empty()).ok_or(false)
 }
 
 fn open_journal(p: &Path) -> io::Result<File> {
@@ -166,9 +172,6 @@ impl Store {
 
     pub fn put(&mut self, unit: &str, path: &str, data: Option<&[u8]>, kind: Kind, origin: &str) -> io::Result<Hash> {
         self.journal()?;
-        if [unit, path, origin].iter().any(|s| s.len() > MAX_STR) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "name too long for the version store"));
-        }
         let hash = hash_of(data);
         // ponytail: an object already there is re-read to check it; costly only for big files stored twice
         if let Some(d) = data.filter(|_| !self.sizes.contains_key(&hash) || self.get(&hash).is_err()) {
@@ -481,29 +484,67 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_record_in_the_middle_is_kept_and_disables_the_store() {
-        let d = tmp();
-        let mut s = Store::open_at(d.clone()).unwrap();
-        let h = s.put("u", "f", Some(b"one"), Kind::Local, "").unwrap();
-        s.put("u", "f", Some(b"two"), Kind::Local, "").unwrap();
-        drop(s);
-        let j = d.join("journal");
-        let mut bytes = std::fs::read(&j).unwrap();
-        let len = bytes.len();
-        bytes[8 + 5 + 5 + 32] = 9; // first record's kind: from a newer binary, or a bit flip
-        std::fs::write(&j, &bytes).unwrap();
-        let mut s = Store::open_at(d.clone()).unwrap();
-        assert_eq!(std::fs::metadata(&j).unwrap().len(), len as u64);
-        assert!(std::fs::read_dir(&d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("journal.bad.")));
-        assert!(s.put("u", "f", Some(b"three"), Kind::Remote, "acer").is_err());
-        let root = d.join("wt");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("f"), b"mine").unwrap();
-        assert!(s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "acer").is_err());
-        assert_eq!(std::fs::read(root.join("f")).unwrap(), b"mine");
-        assert_eq!(s.prune(0, 0).unwrap(), (0, 0));
-        assert!(d.join("objects").join(hex(&h)).exists());
-        std::fs::remove_dir_all(d).unwrap();
+    fn a_damaged_record_is_kept_and_disables_the_store() {
+        // payload: t_ms 8 · unit len 4 + "u" · path len 4 + "f" · hash 32 · kind 1 · origin len 4; header 8
+        let rec = 8 + 8 + 5 + 5 + 32 + 1 + 4 + 4;
+        // (what, byte, xor mask)
+        let cases = [
+            ("first record's unit length", 8 + 8 + 3, 2u8), // 1 -> 3: plausible, eats into the path
+            ("first record's path", 8 + 8 + 5 + 4, 1),     // "f" -> "g"
+            ("first record's kind", 8 + 8 + 5 + 5 + 32, 9), // re-signed below, like a newer binary's kind
+            ("last record's unit length", rec + 8 + 8 + 3, 0xc8), // 1 -> 201: would read past the end, not a torn tail
+            ("last record's header", rec + 3, 0xff),
+        ];
+        for (what, at, mask) in cases {
+            let d = tmp();
+            let mut s = Store::open_at(d.clone()).unwrap();
+            let h = s.put("u", "f", Some(b"one"), Kind::Local, "").unwrap();
+            s.put("u", "f", Some(b"two"), Kind::Local, "").unwrap();
+            drop(s);
+            let j = d.join("journal");
+            let mut bytes = std::fs::read(&j).unwrap();
+            assert_eq!(bytes.len(), 2 * rec);
+            bytes[at] ^= mask;
+            if what.contains("kind") {
+                let p = bytes[8..rec - 4].to_vec();
+                bytes[rec - 4..rec].copy_from_slice(&sum4(&p));
+            }
+            std::fs::write(&j, &bytes).unwrap();
+            let mut s = Store::open_at(d.clone()).unwrap();
+            assert!(s.broken(), "{what}");
+            assert_eq!(std::fs::metadata(&j).unwrap().len(), bytes.len() as u64, "{what}");
+            assert!(std::fs::read_dir(&d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("journal.bad.")), "{what}");
+            assert!(s.put("u", "f", Some(b"three"), Kind::Remote, "acer").is_err(), "{what}");
+            let root = d.join("wt");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("f"), b"mine").unwrap();
+            assert!(s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "acer").is_err(), "{what}");
+            assert_eq!(std::fs::read(root.join("f")).unwrap(), b"mine", "{what}");
+            assert_eq!(s.prune(0, 0).unwrap(), (0, 0), "{what}");
+            assert!(d.join("objects").join(hex(&h)).exists(), "{what}");
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_torn_tail_is_cut_wherever_it_stops() {
+        let e = Entry { t_ms: 1, unit: "u".into(), path: "f".into(), hash: NONE, kind: Kind::Local, origin: "x".into() };
+        let rec = encode(&e);
+        for cut in [1, 5, 8, 9, 30, rec.len() - 1] {
+            let d = tmp();
+            let mut s = Store::open_at(d.clone()).unwrap();
+            s.put("u", "f", Some(b"one"), Kind::Local, "").unwrap();
+            drop(s);
+            let mut f = OpenOptions::new().append(true).open(d.join("journal")).unwrap();
+            f.write_all(&rec[..cut]).unwrap();
+            drop(f);
+            let mut s = Store::open_at(d.clone()).unwrap();
+            assert!(!s.broken(), "cut at {cut}");
+            s.put("u", "f", None, Kind::Local, "").unwrap();
+            drop(s);
+            assert_eq!(Store::open_at(d.clone()).unwrap().history("u", "f").len(), 2, "cut at {cut}");
+            std::fs::remove_dir_all(d).unwrap();
+        }
     }
 
     #[test]
