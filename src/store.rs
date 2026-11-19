@@ -332,6 +332,17 @@ mod tests {
     use super::*;
     use crate::crypto::random;
 
+    /// A `git` child spawned by another test holds the lock between fork and exec: retry briefly.
+    fn open(d: &Path) -> Store {
+        for _ in 0..200 {
+            match Store::open_at(d.to_path_buf()) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(5)),
+                r => return r.unwrap(),
+            }
+        }
+        panic!("store stayed locked")
+    }
+
     fn tmp() -> PathBuf {
         let d = std::env::temp_dir().join(format!("hilo-store-{}", hex(&random::<6>())));
         std::fs::create_dir_all(&d).unwrap();
@@ -341,7 +352,7 @@ mod tests {
     #[test]
     fn roundtrip_and_torn_tail() {
         let d = tmp();
-        let mut s = Store::open_at(d.clone()).unwrap();
+        let mut s = open(&d);
         let h1 = s.put("r:main", "a.txt", Some(b"one"), Kind::Local, "mac").unwrap();
         let h2 = s.put("r:main", "a.txt", Some(b"two"), Kind::Remote, "acer").unwrap();
         s.put("r:main", "b.txt", Some(b"one"), Kind::Local, "mac").unwrap();
@@ -356,11 +367,11 @@ mod tests {
         let mut f = OpenOptions::new().append(true).open(&j).unwrap();
         f.write_all(&encode(&Entry { t_ms: 1, unit: "r:main".into(), path: "a.txt".into(), hash: NONE, kind: Kind::Local, origin: "x".into() })[..20]).unwrap();
         drop(f);
-        let mut s = Store::open_at(d.clone()).unwrap();
+        let mut s = open(&d);
         assert_eq!(s.history("r:main", "a.txt").len(), 2);
         s.put("r:main", "a.txt", None, Kind::Local, "mac").unwrap();
         drop(s);
-        let s = Store::open_at(d.clone()).unwrap();
+        let s = open(&d);
         assert_eq!(s.history("r:main", "a.txt").len(), 3);
         assert_eq!(s.history("r:main", "a.txt")[0].hash, NONE);
         std::fs::remove_dir_all(d).unwrap();
@@ -369,7 +380,7 @@ mod tests {
     #[test]
     fn deleted_under_a_prefix() {
         let d = tmp();
-        let mut s = Store::open_at(d.clone()).unwrap();
+        let mut s = open(&d);
         for p in ["src/a.rs", "src/b.rs", "srcx/c.rs", "d.rs"] {
             s.put("u", p, Some(p.as_bytes()), Kind::Local, "mac").unwrap();
             s.put("u", p, None, Kind::Remote, "acer").unwrap();
@@ -389,7 +400,7 @@ mod tests {
     #[test]
     fn prune_keeps_the_newest_of_each_path() {
         let d = tmp();
-        let mut s = Store::open_at(d.clone()).unwrap();
+        let mut s = open(&d);
         let old = s.put("u", "a", Some(b"old a"), Kind::Local, "").unwrap();
         s.put("u", "a", Some(b"new a"), Kind::Local, "").unwrap();
         s.put("u", "b", Some(b"only b"), Kind::Local, "").unwrap();
@@ -401,7 +412,7 @@ mod tests {
         assert_eq!(s.prune(30, 1 << 30).unwrap(), (1, 5));
         assert!(s.get(&old).is_err());
         drop(s);
-        let s = Store::open_at(d.clone()).unwrap();
+        let s = open(&d);
         assert_eq!(s.history("u", "a").len(), 1);
         assert_eq!(s.history("u", "b").len(), 1);
         assert_eq!(s.totals(), (2, 11));
@@ -423,7 +434,7 @@ mod tests {
         let root = d.join("wt");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("f"), b"mine, never synced").unwrap();
-        let mut s = Store::open_at(d.join("store")).unwrap();
+        let mut s = open(&d.join("store"));
         std::fs::set_permissions(d.join("store/objects"), std::fs::Permissions::from_mode(0o500)).unwrap();
         if std::fs::write(d.join("store/objects/probe"), b"").is_ok() {
             return std::fs::remove_dir_all(d).unwrap(); // root ignores permissions: nothing to test
@@ -450,7 +461,7 @@ mod tests {
     #[test]
     fn age_counts_from_when_a_version_stopped_being_current() {
         let d = tmp();
-        let mut s = Store::open_at(d.clone()).unwrap();
+        let mut s = open(&d);
         let day = 86_400_000;
         let kept = s.put("u", "old", Some(b"written 60 days ago, deleted today"), Kind::Local, "").unwrap();
         s.put("u", "old", None, Kind::Remote, "acer").unwrap();
@@ -473,7 +484,7 @@ mod tests {
         let d = tmp();
         let root = d.join("wt");
         std::fs::create_dir_all(&root).unwrap();
-        let mut s = Store::open_at(d.join("store")).unwrap();
+        let mut s = open(&d.join("store"));
         s.put("u", "f", Some(b"A"), Kind::Local, "").unwrap();
         s.put("u", "f", Some(b"B"), Kind::Remote, "acer").unwrap();
         std::fs::write(root.join("f"), b"A").unwrap(); // went back to A here, not scanned yet
@@ -497,7 +508,7 @@ mod tests {
         ];
         for (what, at, mask) in cases {
             let d = tmp();
-            let mut s = Store::open_at(d.clone()).unwrap();
+            let mut s = open(&d);
             let h = s.put("u", "f", Some(b"one"), Kind::Local, "").unwrap();
             s.put("u", "f", Some(b"two"), Kind::Local, "").unwrap();
             drop(s);
@@ -510,7 +521,7 @@ mod tests {
                 bytes[rec - 4..rec].copy_from_slice(&sum4(&p));
             }
             std::fs::write(&j, &bytes).unwrap();
-            let mut s = Store::open_at(d.clone()).unwrap();
+            let mut s = open(&d);
             assert!(s.broken(), "{what}");
             assert_eq!(std::fs::metadata(&j).unwrap().len(), bytes.len() as u64, "{what}");
             assert!(std::fs::read_dir(&d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("journal.bad.")), "{what}");
@@ -532,17 +543,17 @@ mod tests {
         let rec = encode(&e);
         for cut in [1, 5, 8, 9, 30, rec.len() - 1] {
             let d = tmp();
-            let mut s = Store::open_at(d.clone()).unwrap();
+            let mut s = open(&d);
             s.put("u", "f", Some(b"one"), Kind::Local, "").unwrap();
             drop(s);
             let mut f = OpenOptions::new().append(true).open(d.join("journal")).unwrap();
             f.write_all(&rec[..cut]).unwrap();
             drop(f);
-            let mut s = Store::open_at(d.clone()).unwrap();
+            let mut s = open(&d);
             assert!(!s.broken(), "cut at {cut}");
             s.put("u", "f", None, Kind::Local, "").unwrap();
             drop(s);
-            assert_eq!(Store::open_at(d.clone()).unwrap().history("u", "f").len(), 2, "cut at {cut}");
+            assert_eq!(open(&d).history("u", "f").len(), 2, "cut at {cut}");
             std::fs::remove_dir_all(d).unwrap();
         }
     }
@@ -551,7 +562,7 @@ mod tests {
     fn an_unreadable_journal_is_an_error_not_an_empty_store() {
         use std::os::unix::fs::PermissionsExt;
         let d = tmp();
-        let mut s = Store::open_at(d.clone()).unwrap();
+        let mut s = open(&d);
         s.put("u", "f", Some(b"one"), Kind::Local, "").unwrap();
         drop(s);
         let j = d.join("journal");
@@ -563,7 +574,7 @@ mod tests {
         assert!(Store::open_at(d.clone()).is_err());
         std::fs::set_permissions(&j, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(std::fs::metadata(&j).unwrap().len(), len);
-        assert_eq!(Store::open_at(d.clone()).unwrap().history("u", "f").len(), 1);
+        assert_eq!(open(&d).history("u", "f").len(), 1);
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -571,7 +582,7 @@ mod tests {
     fn a_failed_prune_leaves_the_store_as_it_was() {
         use std::os::unix::fs::PermissionsExt;
         let d = tmp();
-        let mut s = Store::open_at(d.clone()).unwrap();
+        let mut s = open(&d);
         s.put("u", "f", Some(b"one"), Kind::Local, "").unwrap();
         s.put("u", "f", Some(b"two"), Kind::Local, "").unwrap();
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o500)).unwrap(); // no journal.tmp
@@ -585,7 +596,7 @@ mod tests {
         assert_eq!(s.prune(0, 0).unwrap().0, 2);
         s.put("u", "f", Some(b"four"), Kind::Local, "").unwrap(); // goes to the new journal
         drop(s);
-        let s = Store::open_at(d.clone()).unwrap();
+        let s = open(&d);
         let h: Vec<Hash> = s.history("u", "f").iter().map(|e| e.hash).collect();
         assert_eq!(h, [hash_of(Some(b"four")), hash_of(Some(b"three"))]);
         std::fs::remove_dir_all(d).unwrap();
@@ -594,22 +605,22 @@ mod tests {
     #[test]
     fn one_daemon_per_store() {
         let d = tmp();
-        let s = Store::open_at(d.clone()).unwrap();
+        let s = open(&d);
         assert_eq!(Store::open_at(d.clone()).err().map(|e| e.kind()), Some(io::ErrorKind::WouldBlock));
         drop(s);
-        Store::open_at(d.clone()).unwrap();
+        open(&d);
         std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn a_damaged_object_is_rewritten() {
         let d = tmp();
-        let mut s = Store::open_at(d.clone()).unwrap();
+        let mut s = open(&d);
         let h = s.put("u", "a", Some(b"abc"), Kind::Local, "").unwrap();
         let obj = d.join("objects").join(hex(&h));
         std::fs::write(&obj, b"").unwrap(); // crash before the data reached the disk
         drop(s);
-        let mut s = Store::open_at(d.clone()).unwrap();
+        let mut s = open(&d);
         assert!(s.get(&h).is_err());
         s.put("u", "b", Some(b"abc"), Kind::Local, "").unwrap();
         assert_eq!(s.get(&h).unwrap().as_deref(), Some(&b"abc"[..]));
