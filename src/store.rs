@@ -1,10 +1,11 @@
 //! Version store: every version of a file that passes through hilo on this machine, so any file
 //! can be recovered after hilo or anyone else overwrites or deletes it. `~/.hilo/store/objects/<hex>`
-//! holds contents (written once), `journal` the append-only records. The daemon is the only writer.
+//! holds contents (written once), `journal` the append-only records. The daemon is the only writer
+//! (an exclusive lock on `lock` keeps a second daemon out).
 #![forbid(unsafe_code)]
 use crate::anchor::now_ms;
 use crate::config;
-use crate::crypto::hex;
+use crate::crypto::{hex, sha256};
 use crate::fsops::{self, Stamp};
 use crate::sync::{hash_of, Hash, Key, NONE};
 use crate::wire::{Rd, W};
@@ -45,14 +46,39 @@ pub struct Store {
     entries: Vec<Entry>, // journal order
     by_key: HashMap<Key, Vec<usize>>, // indices into entries, oldest first
     sizes: HashMap<Hash, u64>, // objects on disk
-    journal: File,
+    journal: Option<File>, // None: the journal is damaged, so nothing is recorded (and nothing overwritten)
     len: u64, // journal bytes known good
+    _lock: File,
 }
+
+/// Longest string a record holds. A longer length is damage, not a torn write.
+const MAX_STR: usize = 64 << 10;
 
 fn encode(e: &Entry) -> Vec<u8> {
     let mut w = W::default();
     w.u64(e.t_ms).str(&e.unit).str(&e.path).hash(&e.hash).u8(e.kind as u8).str(&e.origin);
     w.0
+}
+
+/// One record. `Err(true)`: the bytes end mid-record (a torn write); `Err(false)`: damage.
+fn decode(r: &mut Rd) -> Result<Entry, bool> {
+    fn s(r: &mut Rd) -> Result<String, bool> {
+        let n = r.u32().ok_or(true)? as usize;
+        if n > MAX_STR {
+            return Err(false);
+        }
+        if r.0.len() < n {
+            return Err(true);
+        }
+        let (a, b) = r.0.split_at(n);
+        r.0 = b;
+        String::from_utf8(a.to_vec()).map_err(|_| false)
+    }
+    let t_ms = r.u64().ok_or(true)?;
+    let (unit, path) = (s(r)?, s(r)?);
+    let hash = r.hash().ok_or(true)?;
+    let kind = *Kind::ALL.get(r.u8().ok_or(true)? as usize).ok_or(false)?;
+    Ok(Entry { t_ms, unit, path, hash, kind, origin: s(r)? })
 }
 
 fn open_journal(p: &Path) -> io::Result<File> {
@@ -64,22 +90,48 @@ impl Store {
         Store::open_at(config::path("store"))
     }
 
-    /// Replays the journal; a torn tail from a crash is cut off.
+    /// Replays the journal. A torn tail from a crash is cut off; anything else that doesn't parse
+    /// is kept as it is (with a copy in `journal.bad.<ms>`) and the store records nothing.
     pub fn open_at(root: PathBuf) -> io::Result<Store> {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(root.join("objects"))?;
+        let lock = OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(root.join("lock"))?;
+        lock.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => io::Error::new(io::ErrorKind::WouldBlock, "another hilo daemon is running (the version store is locked)"),
+            std::fs::TryLockError::Error(e) => e,
+        })?;
         let p = root.join("journal");
-        let bytes = std::fs::read(&p).unwrap_or_default();
-        let mut entries = vec![];
-        let mut good = 0;
+        let bytes = match std::fs::read(&p) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
+            r => r?,
+        };
+        let (mut entries, mut good, mut damaged) = (vec![], 0, false);
         let mut r = Rd(&bytes);
-        while let Some(e) = (|| {
-            Some(Entry { t_ms: r.u64()?, unit: r.str()?, path: r.str()?, hash: r.hash()?, kind: *Kind::ALL.get(r.u8()? as usize)?, origin: r.str()? })
-        })() {
-            entries.push(e);
-            good = bytes.len() - r.0.len();
+        while !r.0.is_empty() {
+            match decode(&mut r) {
+                Ok(e) => {
+                    entries.push(e);
+                    good = bytes.len() - r.0.len();
+                }
+                Err(torn) => {
+                    damaged = !torn;
+                    break;
+                }
+            }
         }
-        let journal = open_journal(&p)?;
-        journal.set_len(good as u64)?;
+        let journal = if damaged {
+            let bad = root.join(format!("journal.bad.{}", now_ms()));
+            std::fs::copy(&p, &bad)?;
+            crate::log!(
+                "history: {} is damaged after byte {good} (a copy is in {}); until it is fixed, nothing is recorded and changes from other machines are not written here",
+                p.display(),
+                bad.display()
+            );
+            None
+        } else {
+            let j = open_journal(&p)?;
+            j.set_len(good as u64)?;
+            Some(j)
+        };
         let mut sizes = HashMap::new();
         for e in std::fs::read_dir(root.join("objects"))?.flatten() {
             let h = e.file_name().to_str().and_then(crate::crypto::unhex).and_then(|v| Hash::try_from(v).ok());
@@ -87,9 +139,18 @@ impl Store {
                 sizes.insert(h, m.len());
             }
         }
-        let mut s = Store { root, entries, by_key: HashMap::new(), sizes, journal, len: good as u64 };
+        let mut s = Store { root, entries, by_key: HashMap::new(), sizes, journal, len: good as u64, _lock: lock };
         s.reindex();
         Ok(s)
+    }
+
+    /// The journal is damaged: nothing can be recorded.
+    pub fn broken(&self) -> bool {
+        self.journal.is_none()
+    }
+
+    fn journal(&mut self) -> io::Result<&mut File> {
+        self.journal.as_mut().ok_or_else(|| io::Error::other("the version store's journal is damaged"))
     }
 
     fn reindex(&mut self) {
@@ -104,19 +165,27 @@ impl Store {
     }
 
     pub fn put(&mut self, unit: &str, path: &str, data: Option<&[u8]>, kind: Kind, origin: &str) -> io::Result<Hash> {
+        self.journal()?;
+        if [unit, path, origin].iter().any(|s| s.len() > MAX_STR) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "name too long for the version store"));
+        }
         let hash = hash_of(data);
-        if let Some(d) = data.filter(|_| !self.sizes.contains_key(&hash)) {
+        // ponytail: an object already there is re-read to check it; costly only for big files stored twice
+        if let Some(d) = data.filter(|_| !self.sizes.contains_key(&hash) || self.get(&hash).is_err()) {
             let p = self.object(&hash);
             let tmp = p.with_extension("tmp");
             let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
             f.write_all(d)?;
+            f.sync_all()?;
             std::fs::rename(tmp, p)?;
             self.sizes.insert(hash, d.len() as u64);
         }
         let e = Entry { t_ms: now_ms(), unit: unit.into(), path: path.into(), hash, kind, origin: origin.into() };
         let b = encode(&e);
-        if let Err(err) = self.journal.write_all(&b) {
-            let _ = self.journal.set_len(self.len); // don't leave a torn record for the next append to follow
+        let len = self.len;
+        let j = self.journal()?;
+        if let Err(err) = j.write_all(&b) {
+            let _ = j.set_len(len); // don't leave a torn record for the next append to follow
             return Err(err);
         }
         self.len += b.len() as u64;
@@ -125,8 +194,16 @@ impl Store {
         Ok(hash)
     }
 
+    /// The content of a version. A damaged object is an error.
     pub fn get(&self, h: &Hash) -> io::Result<Option<Vec<u8>>> {
-        if *h == NONE { Ok(None) } else { std::fs::read(self.object(h)).map(Some) }
+        if *h == NONE {
+            return Ok(None);
+        }
+        let d = std::fs::read(self.object(h))?;
+        if sha256(&d) != *h {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "damaged object in the version store"));
+        }
+        Ok(Some(d))
     }
 
     pub fn size(&self, h: &Hash) -> Option<u64> {
@@ -156,11 +233,21 @@ impl Store {
         v
     }
 
-    /// Drops the oldest entries until none is older than `max_age_days` and the objects fit in
-    /// `max_bytes`, never the newest entry of a path; then deletes objects nothing references.
+    /// Drops the oldest entries until no version stopped being current more than `max_age_days`
+    /// ago and the objects fit in `max_bytes`, never the newest entry of a path; then deletes
+    /// objects nothing references. On error nothing changes.
     pub fn prune(&mut self, max_age_days: u64, max_bytes: u64) -> io::Result<(usize, u64)> {
+        if self.broken() {
+            return Ok((0, 0)); // the damaged part may reference any object
+        }
         let cutoff = now_ms().saturating_sub(max_age_days * 86_400_000);
-        let newest: std::collections::HashSet<usize> = self.by_key.values().filter_map(|v| v.last().copied()).collect();
+        // when each version was replaced by the next one of its path; the newest never was
+        let mut until = vec![u64::MAX; self.entries.len()];
+        for v in self.by_key.values() {
+            for w in v.windows(2) {
+                until[w[0]] = self.entries[w[1]].t_ms;
+            }
+        }
         let mut refs: HashMap<Hash, usize> = HashMap::new();
         for e in &self.entries {
             *refs.entry(e.hash).or_default() += 1;
@@ -168,7 +255,7 @@ impl Store {
         let mut total: u64 = refs.keys().filter_map(|h| self.sizes.get(h)).sum();
         let mut keep = vec![true; self.entries.len()];
         for (i, e) in self.entries.iter().enumerate() {
-            if newest.contains(&i) || (e.t_ms >= cutoff && total <= max_bytes) {
+            if until[i] == u64::MAX || (until[i] >= cutoff && total <= max_bytes) {
                 continue;
             }
             keep[i] = false;
@@ -181,29 +268,24 @@ impl Store {
         }
         let dropped = keep.iter().filter(|k| !**k).count();
         if dropped > 0 {
-            let mut it = keep.iter();
-            let kept: Vec<Entry> = std::mem::take(&mut self.entries).into_iter().filter(|_| *it.next().unwrap()).collect();
+            let kept: Vec<Entry> = self.entries.iter().zip(&keep).filter(|(_, k)| **k).map(|(e, _)| e.clone()).collect();
             let bytes: Vec<u8> = kept.iter().flat_map(encode).collect();
             let p = self.root.join("journal");
             let tmp = p.with_extension("tmp");
-            let res = (|| {
-                let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+            let res = (|| -> io::Result<File> {
+                let _ = std::fs::remove_file(&tmp);
+                let mut f = OpenOptions::new().create_new(true).append(true).mode(0o600).open(&tmp)?;
                 f.write_all(&bytes)?;
+                f.sync_all()?;
                 std::fs::rename(&tmp, &p)?;
-                open_journal(&p)
+                Ok(f) // after the rename this handle is the journal
             })();
-            match res {
-                Ok(f) => {
-                    self.journal = f;
-                    self.len = bytes.len() as u64;
-                    self.entries = kept;
-                }
-                Err(e) => {
-                    // the old journal is still there and still matches what we had: reload it
-                    *self = Store::open_at(self.root.clone())?;
-                    return Err(e);
-                }
-            }
+            let f = res.inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })?;
+            self.journal = Some(f);
+            self.len = bytes.len() as u64;
+            self.entries = kept;
             self.reindex();
         }
         let mut freed = 0;
@@ -224,19 +306,20 @@ impl Store {
         Ok((dropped, freed))
     }
 
-    /// Writes `data` at `root/path` only after keeping what is on disk now (if this path has no
-    /// record of it yet, as `Replaced`) and the new version (as `kind`). Nothing is written unless
-    /// both are kept.
+    /// Writes `data` at `root/path` only after keeping what is on disk now (as `Replaced`, unless
+    /// it is this path's newest version) and the new version (as `kind`), both synced to disk.
+    /// Nothing is written unless both are kept.
     pub fn keep_and_write(&mut self, root: &Path, unit: &str, path: &str, data: Option<&[u8]>, kind: Kind, origin: &str) -> io::Result<Option<Stamp>> {
         let p = root.join(path);
         let disk = std::fs::symlink_metadata(&p).ok().filter(|m| m.is_file()).and_then(|_| std::fs::read(&p).ok());
         if let Some(d) = &disk {
             let dh = hash_of(Some(d));
-            if !self.history(unit, path).iter().any(|e| e.hash == dh) {
+            if self.history(unit, path).first().map(|e| e.hash) != Some(dh) {
                 self.put(unit, path, Some(d), Kind::Replaced, "")?;
             }
         }
         self.put(unit, path, data, kind, origin)?;
+        self.journal()?.sync_data()?;
         fsops::write(root, path, data)
     }
 }
@@ -273,6 +356,7 @@ mod tests {
         let mut s = Store::open_at(d.clone()).unwrap();
         assert_eq!(s.history("r:main", "a.txt").len(), 2);
         s.put("r:main", "a.txt", None, Kind::Local, "mac").unwrap();
+        drop(s);
         let s = Store::open_at(d.clone()).unwrap();
         assert_eq!(s.history("r:main", "a.txt").len(), 3);
         assert_eq!(s.history("r:main", "a.txt")[0].hash, NONE);
@@ -313,6 +397,7 @@ mod tests {
         }
         assert_eq!(s.prune(30, 1 << 30).unwrap(), (1, 5));
         assert!(s.get(&old).is_err());
+        drop(s);
         let s = Store::open_at(d.clone()).unwrap();
         assert_eq!(s.history("u", "a").len(), 1);
         assert_eq!(s.history("u", "b").len(), 1);
@@ -352,6 +437,145 @@ mod tests {
         s.keep_and_write(&root, "u", "f", None, Kind::Remote, "acer").unwrap();
         assert_eq!(s.history("u", "f").len(), 3);
         assert!(!root.join("f").exists());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    fn root_ignores_perms(dir: &Path) -> bool {
+        std::fs::write(dir.join("probe"), b"").is_ok_and(|_| std::fs::remove_file(dir.join("probe")).is_ok())
+    }
+
+    #[test]
+    fn age_counts_from_when_a_version_stopped_being_current() {
+        let d = tmp();
+        let mut s = Store::open_at(d.clone()).unwrap();
+        let day = 86_400_000;
+        let kept = s.put("u", "old", Some(b"written 60 days ago, deleted today"), Kind::Local, "").unwrap();
+        s.put("u", "old", None, Kind::Remote, "acer").unwrap();
+        let a = s.put("u", "f", Some(b"a"), Kind::Local, "").unwrap();
+        let b = s.put("u", "f", Some(b"b"), Kind::Local, "").unwrap();
+        s.put("u", "f", Some(b"c"), Kind::Local, "").unwrap();
+        for (e, age) in s.entries.iter_mut().zip([60, 0, 60, 40, 0]) {
+            e.t_ms = now_ms() - age * day;
+        }
+        // a stopped being current 40 days ago (when b came); b stopped today
+        assert_eq!(s.prune(30, 1 << 30).unwrap(), (1, 1));
+        assert!(s.get(&a).is_err());
+        assert_eq!(s.get(&b).unwrap().as_deref(), Some(&b"b"[..]));
+        assert_eq!(s.get(&kept).unwrap().as_deref(), Some(&b"written 60 days ago, deleted today"[..]));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn replaced_unless_the_newest_version_is_on_disk() {
+        let d = tmp();
+        let root = d.join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut s = Store::open_at(d.join("store")).unwrap();
+        s.put("u", "f", Some(b"A"), Kind::Local, "").unwrap();
+        s.put("u", "f", Some(b"B"), Kind::Remote, "acer").unwrap();
+        std::fs::write(root.join("f"), b"A").unwrap(); // went back to A here, not scanned yet
+        s.keep_and_write(&root, "u", "f", Some(b"C"), Kind::Remote, "acer").unwrap();
+        let h: Vec<Kind> = s.history("u", "f").iter().map(|e| e.kind).collect();
+        assert_eq!(h, [Kind::Remote, Kind::Replaced, Kind::Remote, Kind::Local]);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_bad_record_in_the_middle_is_kept_and_disables_the_store() {
+        let d = tmp();
+        let mut s = Store::open_at(d.clone()).unwrap();
+        let h = s.put("u", "f", Some(b"one"), Kind::Local, "").unwrap();
+        s.put("u", "f", Some(b"two"), Kind::Local, "").unwrap();
+        drop(s);
+        let j = d.join("journal");
+        let mut bytes = std::fs::read(&j).unwrap();
+        let len = bytes.len();
+        bytes[8 + 5 + 5 + 32] = 9; // first record's kind: from a newer binary, or a bit flip
+        std::fs::write(&j, &bytes).unwrap();
+        let mut s = Store::open_at(d.clone()).unwrap();
+        assert_eq!(std::fs::metadata(&j).unwrap().len(), len as u64);
+        assert!(std::fs::read_dir(&d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("journal.bad.")));
+        assert!(s.put("u", "f", Some(b"three"), Kind::Remote, "acer").is_err());
+        let root = d.join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f"), b"mine").unwrap();
+        assert!(s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "acer").is_err());
+        assert_eq!(std::fs::read(root.join("f")).unwrap(), b"mine");
+        assert_eq!(s.prune(0, 0).unwrap(), (0, 0));
+        assert!(d.join("objects").join(hex(&h)).exists());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_journal_is_an_error_not_an_empty_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp();
+        let mut s = Store::open_at(d.clone()).unwrap();
+        s.put("u", "f", Some(b"one"), Kind::Local, "").unwrap();
+        drop(s);
+        let j = d.join("journal");
+        let len = std::fs::metadata(&j).unwrap().len();
+        std::fs::set_permissions(&j, std::fs::Permissions::from_mode(0o200)).unwrap(); // writable, not readable
+        if std::fs::read(&j).is_ok() {
+            return std::fs::remove_dir_all(d).unwrap(); // root
+        }
+        assert!(Store::open_at(d.clone()).is_err());
+        std::fs::set_permissions(&j, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::metadata(&j).unwrap().len(), len);
+        assert_eq!(Store::open_at(d.clone()).unwrap().history("u", "f").len(), 1);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_failed_prune_leaves_the_store_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp();
+        let mut s = Store::open_at(d.clone()).unwrap();
+        s.put("u", "f", Some(b"one"), Kind::Local, "").unwrap();
+        s.put("u", "f", Some(b"two"), Kind::Local, "").unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o500)).unwrap(); // no journal.tmp
+        if root_ignores_perms(&d) {
+            return std::fs::remove_dir_all(d).unwrap();
+        }
+        assert!(s.prune(0, 0).is_err());
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(s.history("u", "f").len(), 2);
+        s.put("u", "f", Some(b"three"), Kind::Local, "").unwrap();
+        assert_eq!(s.prune(0, 0).unwrap().0, 2);
+        s.put("u", "f", Some(b"four"), Kind::Local, "").unwrap(); // goes to the new journal
+        drop(s);
+        let s = Store::open_at(d.clone()).unwrap();
+        let h: Vec<Hash> = s.history("u", "f").iter().map(|e| e.hash).collect();
+        assert_eq!(h, [hash_of(Some(b"four")), hash_of(Some(b"three"))]);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn one_daemon_per_store() {
+        let d = tmp();
+        let s = Store::open_at(d.clone()).unwrap();
+        assert_eq!(Store::open_at(d.clone()).err().map(|e| e.kind()), Some(io::ErrorKind::WouldBlock));
+        drop(s);
+        Store::open_at(d.clone()).unwrap();
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_object_is_rewritten() {
+        let d = tmp();
+        let mut s = Store::open_at(d.clone()).unwrap();
+        let h = s.put("u", "a", Some(b"abc"), Kind::Local, "").unwrap();
+        let obj = d.join("objects").join(hex(&h));
+        std::fs::write(&obj, b"").unwrap(); // crash before the data reached the disk
+        drop(s);
+        let mut s = Store::open_at(d.clone()).unwrap();
+        assert!(s.get(&h).is_err());
+        s.put("u", "b", Some(b"abc"), Kind::Local, "").unwrap();
+        assert_eq!(s.get(&h).unwrap().as_deref(), Some(&b"abc"[..]));
+        std::fs::write(&obj, b"abd").unwrap(); // bit rot
+        assert!(s.get(&h).is_err());
+        s.put("u", "c", Some(b"abc"), Kind::Local, "").unwrap();
+        assert_eq!(s.get(&h).unwrap().as_deref(), Some(&b"abc"[..]));
         std::fs::remove_dir_all(d).unwrap();
     }
 }
