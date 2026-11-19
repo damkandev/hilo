@@ -107,6 +107,11 @@ fn handle(mut s: UnixStream, sh: &Shared, tx: &Sender<Ev>) -> io::Result<()> {
             sh.send(Msg::Release { wt, path: rel, session: session.to_string() });
             with_notices(sh, session, 0, String::new())
         }
+        // MCP file tools: is this path in a synced unit? "unit\0root\0rel" (rel "" = the root)
+        ["locate", path] => match sh.unit_of(Path::new(path)) {
+            Some((id, root, rel)) => (0, format!("{id}\0{}\0{rel}", root.display())),
+            None => (1, format!("{path} is not in a synced folder")),
+        },
         ["who", path] => match sh.locate(Path::new(path)) {
             None => (0, format!("{path} is not in a synced worktree")),
             Some((wt, rel)) => match sh.leases.lock().unwrap().holder(&wt, &rel) {

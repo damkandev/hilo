@@ -31,6 +31,22 @@ You only need `hilo`. Everything else is there when you want to look or change s
 | `hilo restore PATH [--at N \| --conflict]` | bring a version back: the newest one that differs from the file, line `N` of `hilo log`, or the one that lost the last conflict. It syncs as a new write |
 | `hilo trash [DIR]` | files deleted under `DIR` (default: the whole repo) that hilo can bring back |
 | `hilo run -- npm run dev` | run with the variables, without writing any file |
+| `hilo grep PATTERN [DIR] [-i]` | literal search over the synced files under `DIR` (default: here); ignored files are skipped |
+
+## Agents over MCP
+
+`hilo mcp` is an MCP server on stdio for agents without hooks, and for sandboxes that should only
+touch synced files. Paths are absolute or relative to the agent's working directory, and must be
+inside a synced folder; anything else is refused. Without a daemon, the file tools answer "hilo
+daemon is not running".
+
+| Tool | |
+| --- | --- |
+| `claim` · `release` · `who` | take a file before editing it, let it go, see who holds it |
+| `read` `path` `offset?` `limit?` | text of a file, cut at 256 KB (`offset`/`limit` in lines); binary files answer with their size |
+| `write` `path` `content` | claims the file, writes it whole and atomically, syncs it at once; refused if another agent holds it, or on a read-only token |
+| `list` `path?` `depth?` | files and folders with sizes, `depth` 1 to 4 |
+| `search` `pattern` `path?` `ignore_case?` | same as `hilo grep`: `path:line: text`, at most 200 results |
 
 ## Environment variables
 
