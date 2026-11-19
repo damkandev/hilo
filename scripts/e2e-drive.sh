@@ -162,6 +162,82 @@ on_c status | grep -q "^scope     drive:notes/clientes$" || fail "status shows t
 grep -q "fuera.md is outside what this sandbox's token may sync (drive:notes/clientes)" "$T/c/daemon.log" || fail "the sandbox logs why"
 ok "the sandbox's status and log say why fuera.md stays there"
 
+echo "== acer's drive folder goes away (unmounted) and comes back"
+paused() { run_on "$1" status | grep -q "^drive .*(paused: "; }
+syncing() { run_on "$1" status | grep -q "^drive .*notes, "; }
+mv "$B" "$B.away"
+wait_for "acer pauses the drive" paused b
+echo "mac while acer was away" >"$A/a.txt"
+echo "created while acer was away" >"$A/new1.txt"
+rm "$A/marker.txt"
+wait_for "mac settled" synced a
+mv "$B.away" "$B"
+wait_for "acer syncs the drive again" syncing b
+wait_for "acer gets the edit it missed" has "$B/a.txt" "mac while acer was away"
+wait_for "acer gets the file created meanwhile" has "$B/new1.txt" "created while acer was away"
+wait_for "acer gets the deletion it missed" gone "$B/marker.txt"
+has "$A/a.txt" "mac while acer was away" || fail "mac's edit was reverted"
+ok "mac's edit is not reverted"
+
+echo "== the same, with acer restarting while the folder is back"
+PB=${PIDS[2]}
+mv "$B" "$B.away"
+wait_for "acer pauses the drive" paused b
+echo "mac again while away" >"$A/a.txt"
+echo "second new file" >"$A/new2.txt"
+wait_for "mac settled" synced a
+mv "$B.away" "$B"
+kill "$PB"; wait "$PB" 2>/dev/null || true; PIDS[2]=
+start b
+wait_for "acer back up" up b
+wait_for "acer gets the edit it missed" has "$B/a.txt" "mac again while away"
+wait_for "acer gets the file created meanwhile" has "$B/new2.txt" "second new file"
+sleep 2
+has "$A/a.txt" "mac again while away" || fail "acer's stale copy reverted mac's edit"
+ok "acer's stale copy does not revert mac's edit"
+
+echo "== mac's drive folder is swapped for an empty one (an unmounted mount point)"
+mv "$A" "$A.real"
+mkdir "$A"
+wait_for "mac pauses the drive instead of deleting everything" paused a
+on_a status | grep "^drive" | sed 's/^/     /'
+sleep 5
+for f in a.txt c.txt new1.txt new2.txt clientes/plan.md; do [ -f "$B/$f" ] || fail "$f was deleted on acer"; done
+ok "acer keeps every file"
+rmdir "$A"
+mv "$A.real" "$A"
+wait_for "the same folder back: mac syncs it again" syncing a
+echo "after the swap" >"$A/new1.txt"
+wait_for "and its edits reach acer" has "$B/new1.txt" "after the swap"
+
+echo "== hilo's own folder never syncs"
+out=$(on_a add --drive "$T/a" --as all 2>&1) && fail "a drive holding HILO_HOME was accepted"
+echo "     $out"
+echo "$out" | grep -q "hilo's own folder" || fail "the refusal says why"
+on_a add --drive "$T/a/hilo/tmp" --as t >/dev/null 2>&1 && fail "a drive inside HILO_HOME was accepted"
+ok "a drive around or inside HILO_HOME is refused"
+mkdir -p "$T/d/home"
+out=$(cd "$T/d/home" && HOME=$T/d/home HILO_HOME=$T/d/home/.hilo HILO_KEYCHAIN=0 HILO_NOTIFY=0 HILO_NO_SERVICE=1 HILO_TOKEN=$TOKEN "$HILO" up --drive notes --no-wait 2>&1) && fail "hilo up --drive in \$HOME was accepted"
+echo "     $out"
+echo "$out" | grep -q "hilo's own folder" || fail "hilo up --drive in \$HOME says why"
+ok "hilo up --drive from \$HOME is refused with a clear message"
+
+echo "== a repo inside a drive syncs as a repo; an empty folder stays a folder of repos"
+mkdir -p "$A/proj"
+git -C "$A/proj" init -q -b main
+echo p >"$A/proj/p.txt"
+git -C "$A/proj" add p.txt
+git -C "$A/proj" -c user.email=t@t -c user.name=t commit -qm p
+on_a add "$A/proj" | sed 's/^/     /'
+on_a status | grep -q "^  $A/proj \[main\]" || fail "the repo inside the drive is synced as a repo"
+ok "a repo inside a drive can be added"
+mkdir -p "$T/a/empty"
+out=$(on_a add "$T/a/empty")
+echo "     $out"
+echo "$out" | grep -q "hilo add --drive" || fail "the empty folder's message mentions --drive"
+on_a status | grep -q "^folder .*/a/empty " || fail "an empty folder is linked as a folder of repos"
+ok "an empty folder is linked as a folder of repos, with a hint about --drive"
+
 echo "== status"
 on_a status | sed 's/^/     /'
 on_b status | grep -E "^(drive|conflicts| )" | sed 's/^/     /'

@@ -14,8 +14,8 @@ You only need `hilo`. Everything else is there when you want to look or change s
 | `hilo setup HOST [--folder DIR]` | the wizard without questions: set up `HOST` over SSH and pair this machine with it |
 | `hilo init [--listen IP:PORT] [--public] [--bind IP:PORT]` | make this machine the anchor and print a join code ([Deployment](deployment.md)) |
 | `hilo join CODE@IP:PORT` | join an anchor |
-| `hilo add DIR [--as LABEL]` | link another folder of repos, or a single repo. A folder with no repos in it becomes a [drive](architecture.md#drive-folders): its files sync as they are, matched across machines by `LABEL` (default: the folder's name, lowercased) |
-| `hilo add --drive DIR [--as LABEL]` | link `DIR` as a drive even if it has repos in it (they are skipped: add each with `hilo add`) |
+| `hilo add DIR` | link another folder of repos, or a single repo. A folder with files and no repos in it becomes a [drive](architecture.md#drive-folders): its files sync as they are. An empty folder stays a folder that receives repos |
+| `hilo add --drive DIR [--as LABEL]` | link `DIR` as a drive, empty or with repos in it (they are skipped; `hilo add` one to sync it as a repo). Machines match drives by `LABEL`, by default the folder's name lowercased; `--as` alone also means a drive. On a drive whose folder was unmounted or replaced, it makes the folder there now the drive |
 | `hilo up [--read-only] [--drive LABEL]` | in a sandbox's setup script: join, link, start, wait until in sync ([Cloud agents](cloud-agents.md)). `--drive LABEL` links the folder (created if missing) as that drive |
 | `hilo uninstall` | remove the service, hooks and config; your repos stay plain git repos |
 

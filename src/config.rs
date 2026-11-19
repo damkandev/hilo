@@ -15,6 +15,10 @@ pub fn path(name: &str) -> PathBuf {
     home().join(name)
 }
 
+/// Tests that point HILO_HOME elsewhere, or need it to stay put, take this.
+#[cfg(test)]
+pub static TEST_HOME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn ensure_home() -> io::Result<()> {
     for d in ["", "tmp", "anchor/blobs", "secrets", "vault", "index", "store/objects"] {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(home().join(d))?;

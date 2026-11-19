@@ -416,6 +416,7 @@ mod tests {
 
     #[test]
     fn drive_scan() {
+        let _home = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner()); // its ignore repo lives there
         let d = std::env::temp_dir().join(format!("hilo-drive-{}", hex(&crate::crypto::random::<4>())));
         let w = |p: &str, c: &str| {
             std::fs::create_dir_all(d.join(p).parent().unwrap()).unwrap();
@@ -456,5 +457,49 @@ mod tests {
         assert_eq!(s.check(&["a.txt".into()]).unwrap().files, vec![("a.txt".to_string(), None)]);
         std::fs::remove_dir_all(&d).unwrap();
         assert!(s.scan().is_err()); // the folder is gone: an error, not every file deleted
+    }
+
+    #[test]
+    fn drive_root_swapped_or_emptied() {
+        let _home = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        crate::config::ensure_home().unwrap(); // the index lives there
+        let d = std::env::temp_dir().join(format!("hilo-swap-{}", hex(&crate::crypto::random::<4>())));
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("a.txt"), "a").unwrap();
+        std::fs::write(d.join("sub/b.txt"), "b").unwrap();
+        let d = std::fs::canonicalize(&d).unwrap();
+        let label = format!("t{}", hex(&crate::crypto::random::<4>()));
+        let mut s = Scanner::drive(&d, &label);
+        assert_eq!(s.scan().unwrap().files.len(), 2);
+        s.save_index().unwrap();
+        // everything deleted at once (or the volume's contents vanished): not a mass delete
+        std::fs::remove_file(d.join("a.txt")).unwrap();
+        std::fs::remove_file(d.join("sub/b.txt")).unwrap();
+        assert!(s.scan().is_err());
+        // deletions the watcher reports one by one still sync
+        assert_eq!(s.check(&["a.txt".into()]).unwrap().files, vec![("a.txt".to_string(), None)]);
+        std::fs::write(d.join("a.txt"), "a").unwrap();
+        std::fs::write(d.join("sub/b.txt"), "b").unwrap();
+        s.scan().unwrap();
+        s.save_index().unwrap();
+        // the folder moved away and an empty one took its place (or an unmounted mount point)
+        let away = d.with_extension("away");
+        std::fs::rename(&d, &away).unwrap();
+        std::fs::create_dir(&d).unwrap();
+        assert!(s.scan().is_err() && s.root_ok().is_err());
+        let mut again = Scanner::drive(&d, &label); // a restart remembers which folder it was
+        assert!(again.root_ok().is_err() && again.scan().is_err());
+        // the same folder back: fine
+        std::fs::remove_dir(&d).unwrap();
+        std::fs::rename(&away, &d).unwrap();
+        assert!(Scanner::drive(&d, &label).root_ok().is_ok());
+        // re-added on purpose: the new folder is the drive, and what it lacks is not "deleted"
+        std::fs::rename(&d, &away).unwrap();
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("c.txt"), "c").unwrap();
+        again.reset_root();
+        assert_eq!(again.scan().unwrap().files, vec![("c.txt".to_string(), Some(b"c".to_vec()))]);
+        std::fs::remove_dir_all(&d).unwrap();
+        std::fs::remove_dir_all(&away).unwrap();
     }
 }

@@ -77,14 +77,20 @@ sin commitear.
 
 ## Carpetas drive
 
-Cualquier carpeta puede sincronizarse sin ser un repo: `hilo add` sobre una carpeta sin repos
-adentro (o `hilo add --drive`) la deja como drive, unidad `drive:<etiqueta>`. Las máquinas reconocen
+Cualquier carpeta puede sincronizarse sin ser un repo: `hilo add` sobre una carpeta con archivos y
+sin repos (o `hilo add --drive`) la deja como drive, unidad `drive:<etiqueta>`. Las máquinas reconocen
 un drive por su etiqueta, el nombre de la carpeta en minúsculas o `--as ETIQUETA`, y un drive solo
 se sincroniza entre las máquinas que lo agregaron. Sus archivos siguen [la regla](#la-regla) como
 cualquier otro; no hay ramas ni commits. Valen sus `.gitignore`, más `.DS_Store`, `node_modules/` y
-los temporales de hilo. Los `.env` y los secretos nunca salen de ahí, y un repo adentro se salta
-(agrégalo con `hilo add`). Las raíces sincronizadas nunca se anidan: un drive no puede estar dentro
-ni alrededor de una carpeta vinculada, un repo u otro drive.
+los temporales de hilo. Los `.env`, los secretos y la carpeta de hilo nunca salen de ahí. Un repo adentro se
+salta; `hilo add` lo sincroniza como repo. Fuera de eso las carpetas sincronizadas no se anidan: un
+drive no puede estar dentro de una carpeta vinculada, un repo u otro drive, ni contener una carpeta
+vinculada u otro drive.
+
+Si la carpeta de un drive desaparece o otra carpeta toma su lugar (un disco desmontado, una carpeta
+movida y vuelta a crear), el drive se pausa en vez de leer eso como todos los archivos borrados, y se
+pone al día cuando vuelve la misma carpeta. `hilo add --drive` sobre la carpeta nueva la deja como
+drive.
 
 Como no hay rama donde guardarla, la versión que pierde un conflicto queda en el historial de hilo
 en esa máquina: `hilo log RUTA` la muestra y `hilo restore RUTA --conflict` la trae de vuelta.
