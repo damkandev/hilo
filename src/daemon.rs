@@ -1172,6 +1172,9 @@ impl D {
             }
             ["restore", p, mode @ ..] => {
                 let (wi, id, rel) = file(self, p)?;
+                if self.held.iter().any(|h| h.wt == id && h.path == rel) {
+                    return Err(format!("a change to {rel} is waiting for approval: run `hilo approve` (or `hilo approve --deny {rel}`) first"));
+                }
                 let root = self.wts[wi].root.clone();
                 let disk = hash_of(read_disk(&root, &rel).as_deref());
                 let h = self.store.history(&id, &rel);
@@ -1336,6 +1339,9 @@ impl D {
         s += &format!("conflicts {conflicts} saved branch(es) (git branch --list 'hilo/conflict/*')\n");
         let (n, bytes) = self.store.totals();
         s += &format!("history   {n} versions, {:.1} MB (hilo log PATH)\n", bytes as f64 / 1048576.0);
+        if self.store.broken() {
+            s += "          the journal is damaged: changes from other machines are not written here (see the daemon log)\n";
+        }
         s += &format!("approve   {} change(s) waiting{}\n", self.held.len(), if self.held.is_empty() { "" } else { " — run `hilo approve`" });
         if latency {
             let pct = |mut v: Vec<u64>, p: usize| {
@@ -1585,6 +1591,7 @@ pub fn run() -> io::Result<()> {
     let key = crate::secret::waiting_note(config::key)?;
     let name = config::name();
     config::ensure_home()?;
+    let store = crate::store::Store::open()?; // before the socket: a second daemon stops here
     let sh = Arc::new(Shared {
         name: name.clone(),
         leases: Mutex::new(lease::Table::default()),
@@ -1662,7 +1669,7 @@ pub fn run() -> io::Result<()> {
         last_folders: Instant::now() - Duration::from_secs(60),
         wts: vec![],
         vaults: HashMap::new(),
-        store: crate::store::Store::open()?,
+        store,
         vkeys: crate::secret::waiting_note(vault::keys),
         held: load_held(),
         cache: Cache::default(),

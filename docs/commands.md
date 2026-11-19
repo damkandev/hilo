@@ -30,6 +30,10 @@ You only need `hilo`. Everything else is there when you want to look or change s
 | `hilo log PATH` | every version of a file this machine kept, newest first: when, how (`local`, `remote`, `conflict`, `replaced`, `restored`), who, size |
 | `hilo restore PATH [--at N \| --conflict]` | bring a version back: the newest one that differs from the file, line `N` of `hilo log`, or the one that lost the last conflict. It syncs as a new write |
 | `hilo trash [DIR]` | files deleted under `DIR` (default: the whole repo) that hilo can bring back |
+
+History starts with the first version hilo sees after you upgrade: a file nobody has touched since
+has no history on this machine yet. If you delete one of those here, the other machines still keep
+it, because the delete reaches them as a `replaced` version.
 | `hilo run -- npm run dev` | run with the variables, without writing any file |
 | `hilo grep PATTERN [DIR] [-i]` | literal search over the synced files under `DIR` (default: here); ignored files are skipped |
 
