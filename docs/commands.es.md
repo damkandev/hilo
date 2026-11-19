@@ -15,8 +15,9 @@ línea de comandos está en inglés.
 | `hilo setup HOST [--folder DIR]` | el asistente sin preguntas: configura `HOST` por SSH y empareja esta máquina con él |
 | `hilo init [--listen IP:PUERTO] [--public] [--bind IP:PUERTO]` | deja esta máquina como ancla e imprime un código de unión ([Despliegue](deployment.es.md)) |
 | `hilo join CÓDIGO@IP:PUERTO` | se une a un ancla |
-| `hilo add DIR` | vincula otra carpeta (o un solo repo) |
-| `hilo up [--read-only]` | en el script de setup de un sandbox: une, vincula, arranca y espera a quedar al día ([Agentes en la nube](cloud-agents.es.md)) |
+| `hilo add DIR [--as ETIQUETA]` | vincula otra carpeta de repos, o un solo repo. Una carpeta sin repos adentro queda como [drive](architecture.es.md#carpetas-drive): sus archivos se sincronizan tal cual, y las máquinas la reconocen por `ETIQUETA` (por defecto, el nombre de la carpeta en minúsculas) |
+| `hilo add --drive DIR [--as ETIQUETA]` | vincula `DIR` como drive aunque tenga repos adentro (se saltan: agrega cada uno con `hilo add`) |
+| `hilo up [--read-only] [--drive ETIQUETA]` | en el script de setup de un sandbox: une, vincula, arranca y espera a quedar al día ([Agentes en la nube](cloud-agents.es.md)). `--drive ETIQUETA` vincula la carpeta (la crea si no existe) como ese drive |
 | `hilo uninstall` | quita el servicio, los hooks y la configuración; tus repos quedan como repos git normales |
 
 `init`, `join` y `setup` vinculan la carpeta donde los corres, o `--folder DIR`. También aceptan
@@ -74,6 +75,7 @@ herramientas de archivos responden "hilo daemon is not running".
 | Clave | |
 | --- | --- |
 | `folder` | una carpeta vinculada (una línea por carpeta) |
+| `drive` | un drive: `drive = <etiqueta> <ruta absoluta>`, la ruta puede tener espacios |
 | `mirrors` | dónde van las ramas espejadas: por defecto `<repo>.worktrees/<rama>` junto al repo; también una carpeta o `off` |
 | `env = strict` | nunca escribe archivos `.env`; las variables solo llegan a `hilo run` |
 | `readonly` | máquinas que no pueden escribir aquí (`hilo trust`) |

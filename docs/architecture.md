@@ -74,6 +74,19 @@ to the repo (see [`mirrors`](commands.md#configuration)). A repo created with `g
 folder shows up on the other machines after its first commit, with its history and uncommitted
 files.
 
+## Drive folders
+
+Any folder can sync without being a repo: `hilo add` on a folder with no repos in it (or
+`hilo add --drive`) makes it a drive, unit `drive:<label>`. Machines match drives by label, the
+folder's name lowercased or `--as LABEL`, and a drive only syncs between machines that added it.
+Its files follow [the rule](#the-rule) like any other; there are no branches or commits. Its
+`.gitignore` files apply, plus `.DS_Store`, `node_modules/` and hilo's own temp files. `.env` files
+and secrets never leave it, and a repo inside it is skipped (add it with `hilo add`). Synced roots
+never nest: a drive can't sit inside or around a linked folder, a repo or another drive.
+
+With no branch to save to, the version that loses a conflict goes to hilo's history on that
+machine: `hilo log PATH` lists it and `hilo restore PATH --conflict` brings it back.
+
 ## Leases
 
 Claude Code's `PreToolUse` hook takes a 120-second lease on the file. The anchor broadcasts the lease

@@ -14,8 +14,9 @@ You only need `hilo`. Everything else is there when you want to look or change s
 | `hilo setup HOST [--folder DIR]` | the wizard without questions: set up `HOST` over SSH and pair this machine with it |
 | `hilo init [--listen IP:PORT] [--public] [--bind IP:PORT]` | make this machine the anchor and print a join code ([Deployment](deployment.md)) |
 | `hilo join CODE@IP:PORT` | join an anchor |
-| `hilo add DIR` | link another folder (or a single repo) |
-| `hilo up [--read-only]` | in a sandbox's setup script: join, link, start, wait until in sync ([Cloud agents](cloud-agents.md)) |
+| `hilo add DIR [--as LABEL]` | link another folder of repos, or a single repo. A folder with no repos in it becomes a [drive](architecture.md#drive-folders): its files sync as they are, matched across machines by `LABEL` (default: the folder's name, lowercased) |
+| `hilo add --drive DIR [--as LABEL]` | link `DIR` as a drive even if it has repos in it (they are skipped: add each with `hilo add`) |
+| `hilo up [--read-only] [--drive LABEL]` | in a sandbox's setup script: join, link, start, wait until in sync ([Cloud agents](cloud-agents.md)). `--drive LABEL` links the folder (created if missing) as that drive |
 | `hilo uninstall` | remove the service, hooks and config; your repos stay plain git repos |
 
 `init`, `join` and `setup` link the folder you run them in, or `--folder DIR`. They also take
@@ -73,6 +74,7 @@ daemon is not running".
 | Key | |
 | --- | --- |
 | `folder` | a linked folder (one line each) |
+| `drive` | a drive: `drive = <label> <absolute path>`, the path may have spaces |
 | `mirrors` | where mirrored branches go: `<repo>.worktrees/<branch>` next to the repo by default, a directory, or `off` |
 | `env = strict` | never write `.env` files; variables only reach `hilo run` |
 | `readonly` | machines that may not write here (`hilo trust`) |

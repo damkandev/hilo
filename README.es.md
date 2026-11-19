@@ -65,6 +65,7 @@ Mira [Despliegue](docs/deployment.es.md) para direcciones, servicios y plataform
 | **Los agentes se enteran antes** | Antes de que un agente edite un archivo que otro está editando, Claude Code bloquea la edición y le dice quién lo tiene, dónde y por cuánto tiempo. |
 | **Ramas y commits** | Los commits viajan con los archivos, las ramas avanzan en todas las máquinas y un worktree nuevo en una aparece en las demás. |
 | **Repos nuevos, solos** | Haz `git init` en una carpeta vinculada, el primer commit, y el repo aparece en la otra máquina con su historial y sus archivos sin commitear. |
+| **También carpetas normales** | `hilo add ~/notas` sobre una carpeta sin repos la deja como [drive](docs/architecture.es.md#carpetas-drive): se sincroniza tal cual, y cada versión queda en `hilo log`. |
 | **`.env` sin copiar** | Las variables viajan cifradas, clave por clave, y se escriben en cada worktree que las necesita. Una clave puede quedar por máquina o solo en producción. |
 | **También agentes en la nube** | Los sandboxes de Claude Code en la web, Codex, Cursor y Codespaces se unen con un token, y su rama aparece en tu Mac mientras trabajan. [Cómo →](docs/cloud-agents.es.md) |
 
