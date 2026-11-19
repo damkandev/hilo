@@ -16,7 +16,7 @@ línea de comandos está en inglés.
 | `hilo init [--listen IP:PUERTO] [--public] [--bind IP:PUERTO]` | deja esta máquina como ancla e imprime un código de unión ([Despliegue](deployment.es.md)) |
 | `hilo join CÓDIGO@IP:PUERTO` | se une a un ancla |
 | `hilo add DIR` | vincula otra carpeta (o un solo repo) |
-| `hilo up` | en el script de setup de un sandbox: une, vincula, arranca y espera a quedar al día ([Agentes en la nube](cloud-agents.es.md)) |
+| `hilo up [--read-only]` | en el script de setup de un sandbox: une, vincula, arranca y espera a quedar al día ([Agentes en la nube](cloud-agents.es.md)) |
 | `hilo uninstall` | quita el servicio, los hooks y la configuración; tus repos quedan como repos git normales |
 
 `init`, `join` y `setup` vinculan la carpeta donde los corres, o `--folder DIR`. También aceptan
@@ -65,7 +65,7 @@ herramientas de archivos responden "hilo daemon is not running".
 | `hilo invite` | un código de unión nuevo, de un solo uso (ancla) |
 | `hilo unpair MÁQUINA` | desconecta una máquina y rota la llave de la bóveda (ancla) |
 | `hilo trust MÁQUINA read-only\|full` | impide (o vuelve a permitir) que una máquina escriba aquí |
-| `hilo token create [--env] [--addr HOST:PUERTO]` · `ls` · `revoke ID` | tokens reutilizables para sandboxes en la nube (ancla) |
+| `hilo token create [--env] [--addr HOST:PUERTO] [--path P] [--expires 24h] [--read-only]` · `ls` · `revoke ID` | tokens reutilizables para sandboxes en la nube, si quieres limitados a una carpeta o un repo, por un rato, sin escribir (ancla) |
 
 ## Configuración
 
@@ -80,13 +80,14 @@ herramientas de archivos responden "hilo daemon is not running".
 | `bind` | escucha en una dirección distinta de la que anuncia (NAT, contenedores) |
 | `history_days` | cuánto tiempo quedan las versiones viejas en `~/.hilo/store` (por defecto `30`); la versión más nueva de cada archivo queda siempre |
 | `history_max_mb` | lo máximo que puede ocupar el historial, en MB (por defecto `5120`); primero se van las versiones más viejas |
+| `scope_ro = 1` | este sandbox entró con un token de solo lectura: sus propias herramientas rechazan escrituras (`hilo up --read-only`) |
 
 ## Entorno
 
 | Variable | |
 | --- | --- |
 | `HILO_HOME` | usa otra carpeta en vez de `~/.hilo` |
-| `HILO_TOKEN` · `HILO_NAME` | token y nombre de máquina para `hilo up` |
+| `HILO_TOKEN` · `HILO_NAME` · `HILO_READONLY=1` | token, nombre de máquina y solo lectura para `hilo up` |
 | `HILO_PROXY` | proxy a usar, antes que `ALL_PROXY` y `HTTPS_PROXY` |
 | `HILO_KEYCHAIN=0` | guarda las llaves en `~/.hilo/secrets` en vez del Keychain de macOS |
 | `HILO_NOTIFY=0` | sin notificaciones de escritorio |

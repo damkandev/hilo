@@ -20,6 +20,11 @@ descripción del diseño y de sus tests, no como una garantía.
 - **Emparejamiento:** un código de un solo uso y 10 minutos, mezclado en un handshake `Noise_XXpsk3_25519_ChaChaPoly_SHA256` (lo ejecuta `snow`) probado contra los vectores oficiales de cacophony. Después solo se conectan llaves conocidas, y cada lado fija la llave del otro.
 - **El ancla** escucha solo en la dirección privada que elijas. Una pública exige `--public`. Antes de que un par se autentique: tope de 1 MiB por frame, 5 segundos para el handshake y como mucho 16 conexiones pendientes.
 
+## Tokens con alcance
+
+- **Un token creado con `--path`** ve una carpeta de un drive (o el drive entero), o un repo entero: sus ramas, su anuncio y sus valores de `.env` sellados (las llaves de la bóveda siguen exigiendo `--env`). El ancla filtra cada mensaje que le manda a ese sandbox (puesta al día, cambios en vivo, reenvíos, leases) por un solo chequeo, y descarta sin responder sus cambios, claims y releases fuera del alcance, porque una respuesta llevaría el contenido. Lo que sí puede ver: los nombres de las máquinas conectadas y el contador de cambios del ancla.
+- **`--read-only`:** el ancla rechaza cada escritura con la versión vigente e ignora sus claims. **`--expires`** y **`hilo token revoke`:** el token sale de la lista del handshake, un sandbox que entró con él no puede reconectarse, y uno conectado queda fuera en menos de 30 segundos.
+
 ## Archivos
 
 - **Cada máquina valida cada ruta que recibe.** Rechaza `.git` con cualquier mayúscula o disfraz Unicode, abre cada carpeta con `openat(O_NOFOLLOW)`, crea los temporales con `O_EXCL`, nunca aplica setuid y rechaza nombres que chocan en un disco que no distingue mayúsculas.

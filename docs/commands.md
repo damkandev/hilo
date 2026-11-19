@@ -15,7 +15,7 @@ You only need `hilo`. Everything else is there when you want to look or change s
 | `hilo init [--listen IP:PORT] [--public] [--bind IP:PORT]` | make this machine the anchor and print a join code ([Deployment](deployment.md)) |
 | `hilo join CODE@IP:PORT` | join an anchor |
 | `hilo add DIR` | link another folder (or a single repo) |
-| `hilo up` | in a sandbox's setup script: join, link, start, wait until in sync ([Cloud agents](cloud-agents.md)) |
+| `hilo up [--read-only]` | in a sandbox's setup script: join, link, start, wait until in sync ([Cloud agents](cloud-agents.md)) |
 | `hilo uninstall` | remove the service, hooks and config; your repos stay plain git repos |
 
 `init`, `join` and `setup` link the folder you run them in, or `--folder DIR`. They also take
@@ -64,7 +64,7 @@ daemon is not running".
 | `hilo invite` | a new single-use join code (anchor) |
 | `hilo unpair MACHINE` | cut a machine off and rotate the vault key (anchor) |
 | `hilo trust MACHINE read-only\|full` | stop (or allow again) a machine writing here |
-| `hilo token create [--env] [--addr HOST:PORT]` · `ls` · `revoke ID` | reusable tokens for cloud sandboxes (anchor) |
+| `hilo token create [--env] [--addr HOST:PORT] [--path P] [--expires 24h] [--read-only]` · `ls` · `revoke ID` | reusable tokens for cloud sandboxes, optionally limited to one folder or repo, for a while, without writing (anchor) |
 
 ## Configuration
 
@@ -79,13 +79,14 @@ daemon is not running".
 | `bind` | listen on a different address than the one you advertise (NAT, containers) |
 | `history_days` | how long old versions stay in `~/.hilo/store` (default `30`); the newest version of each file always stays |
 | `history_max_mb` | the most that history may take, in MB (default `5120`); the oldest versions go first |
+| `scope_ro = 1` | this sandbox joined with a read-only token: its own tools refuse writes (`hilo up --read-only`) |
 
 ## Environment
 
 | Variable | |
 | --- | --- |
 | `HILO_HOME` | use another directory instead of `~/.hilo` |
-| `HILO_TOKEN` · `HILO_NAME` | token and machine name for `hilo up` |
+| `HILO_TOKEN` · `HILO_NAME` · `HILO_READONLY=1` | token, machine name and read-only for `hilo up` |
 | `HILO_PROXY` | proxy to use, before `ALL_PROXY` and `HTTPS_PROXY` |
 | `HILO_KEYCHAIN=0` | keep keys in `~/.hilo/secrets` instead of the macOS Keychain |
 | `HILO_NOTIFY=0` | no desktop notifications |
