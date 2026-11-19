@@ -16,7 +16,7 @@ pub fn path(name: &str) -> PathBuf {
 }
 
 pub fn ensure_home() -> io::Result<()> {
-    for d in ["", "tmp", "anchor/blobs", "secrets", "vault", "index"] {
+    for d in ["", "tmp", "anchor/blobs", "secrets", "vault", "index", "store/objects"] {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(home().join(d))?;
     }
     Ok(())
