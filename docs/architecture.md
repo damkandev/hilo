@@ -78,7 +78,8 @@ files.
 
 Claude Code's `PreToolUse` hook takes a 120-second lease on the file. The anchor broadcasts the lease
 table, so the hook answers from the local daemon in a few milliseconds. Agents without hooks
-(Codex, Cursor, OpenCode) use `claim`, `release` and `who` over MCP.
+(Codex, Cursor, OpenCode) use `claim`, `release` and `who` over MCP, and its file tools (`read`,
+`write`, `list`, `search`) only reach synced files ([Commands](commands.md#agents-over-mcp)).
 
 ```mermaid
 sequenceDiagram
@@ -150,5 +151,5 @@ cryptography: `snow`, `x25519-dalek`, `chacha20poly1305`, `sha2` and `hkdf`. See
 | `watch.rs` · `scan.rs` · `fsops.rs` | FSEvents and inotify, scanning, safe path handling |
 | `net.rs` · `noise.rs` · `wire.rs` · `crypto.rs` | connections and proxies, the Noise channel, framing |
 | `vault.rs` · `secret.rs` | the `.env` vault, the Keychain and `~/.hilo/secrets` |
-| `lease.rs` · `hooks.rs` · `mcp.rs` | leases, Claude Code hooks, the MCP server |
+| `lease.rs` · `hooks.rs` · `mcp.rs` · `grep.rs` | leases, Claude Code hooks, the MCP server and its file tools, `hilo grep` |
 | `setup.rs` · `install.rs` · `tui.rs` | the wizard, background services, the terminal UI |

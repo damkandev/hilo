@@ -29,6 +29,22 @@ línea de comandos está en inglés.
 | `hilo status [--latency]` | máquinas conectadas, carpetas vinculadas, leases, conflictos, aprobaciones pendientes, latencia p50/p95 |
 | `hilo approve [RUTA \| --all \| --deny RUTA]` | revisa un cambio remoto a una ruta que ejecuta código |
 | `hilo run -- npm run dev` | corre con las variables, sin escribir ningún archivo |
+| `hilo grep PATRÓN [DIR] [-i]` | búsqueda literal en los archivos sincronizados bajo `DIR` (por defecto, aquí); los ignorados no se buscan |
+
+## Agentes por MCP
+
+`hilo mcp` es un servidor MCP por stdio para agentes sin hooks, y para sandboxes que solo deben tocar
+archivos sincronizados. Las rutas son absolutas o relativas al directorio de trabajo del agente, y
+tienen que estar dentro de una carpeta sincronizada; cualquier otra se rechaza. Sin daemon, las
+herramientas de archivos responden "hilo daemon is not running".
+
+| Herramienta | |
+| --- | --- |
+| `claim` · `release` · `who` | toma un archivo antes de editarlo, lo suelta, muestra quién lo tiene |
+| `read` `path` `offset?` `limit?` | el texto de un archivo, cortado en 256 KB (`offset`/`limit` en líneas); los binarios responden con su tamaño |
+| `write` `path` `content` | toma el archivo, lo escribe entero y de forma atómica, y lo sincroniza al tiro; se rechaza si otro agente lo tiene, o con un token de solo lectura |
+| `list` `path?` `depth?` | archivos y carpetas con su tamaño, `depth` de 1 a 4 |
+| `search` `pattern` `path?` `ignore_case?` | igual que `hilo grep`: `ruta:línea: texto`, máximo 200 resultados |
 
 ## Variables de entorno
 
