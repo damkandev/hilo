@@ -82,6 +82,7 @@ struct Core {
     log: File,
     clients: HashMap<u64, Client>,
     leases: lease::Table,
+    sessions: HashMap<String, [u8; 32]>, // lease session -> the machine that holds it
 }
 
 fn blob_path(h: &Hash) -> std::path::PathBuf {
@@ -181,6 +182,22 @@ impl Core {
         }
         let m = self.peers_msg();
         self.send_ready(m);
+    }
+
+    /// A session's leases belong to the machine (by key, not by its self-chosen name) that holds
+    /// them: session ids travel in every Lease, so others could otherwise use up its quota or free them.
+    fn owns(&mut self, session: &str, key: &[u8; 32]) -> bool {
+        let now = std::time::Instant::now();
+        let live = self.leases.0.values().any(|e| e.session == session && e.expires > now);
+        match self.sessions.get(session) {
+            Some(k) if live => ct_eq(k, key),
+            _ => {
+                let t = &self.leases.0;
+                self.sessions.retain(|s, _| t.values().any(|e| &e.session == s && e.expires > now));
+                self.sessions.insert(session.to_string(), *key);
+                true
+            }
+        }
     }
 
     /// Tells `to` its change lost: `cur` is the version that stands.
@@ -361,7 +378,8 @@ impl Core {
                     }
                 }
             }
-            Msg::Op(Op { ref wt, ref path, .. }) | Msg::Claim { ref wt, ref path, .. } if !c.sees(wt, path) => {
+            // A scoped sandbox may not announce a repo either: META says where the others clone it from.
+            Msg::Op(Op { ref wt, ref path, .. }) | Msg::Claim { ref wt, ref path, .. } if !c.sees(wt, path) || (c.scope.is_some() && wt.starts_with("repo:")) => {
                 log!("anchor: dropped a change or claim outside the scope of {}: {wt} {path:?}", c.name);
             }
             Msg::Release { ref wt, ref path, .. } if !wt.is_empty() && !c.sees(wt, path) => {
@@ -369,6 +387,12 @@ impl Core {
             }
             Msg::Op(mut op) => {
                 op.origin = c.name.clone();
+                // A delta on anything but the current version is turned down before its base is read:
+                // otherwise the answer would tell whether the anchor holds a blob, from any folder.
+                let cur = self.seq.current(&op.wt, &op.path);
+                if matches!(op.data, Data::Delta { .. }) && op.base != cur {
+                    return self.reject(id, op, cur);
+                }
                 let path = op.path.clone();
                 match validate(op) {
                     Some(op) => self.accept(op, id),
@@ -393,7 +417,10 @@ impl Core {
                 }
             }
             Msg::Claim { wt, path, session } => {
-                let machine = c.name.clone();
+                let (machine, key) = (c.name.clone(), c.key);
+                if !self.owns(&session, &key) {
+                    return log!("anchor: {machine} claimed for a session another machine holds");
+                }
                 match self.leases.claim(&wt, &path, &session, &machine) {
                     Some(l) => self.send_ready(Msg::Lease(l)),
                     None => {
@@ -407,6 +434,10 @@ impl Core {
             Msg::Release { wt, path, session } => {
                 // "every lease of the session" from a scoped sandbox only reaches inside its scope
                 let keys: Vec<Key> = if wt.is_empty() { self.leases.0.keys().filter(|k| c.sees(&k.0, &k.1)).cloned().collect() } else { vec![(wt, path)] };
+                let (machine, key) = (c.name.clone(), c.key);
+                if !self.owns(&session, &key) {
+                    return log!("anchor: {machine} released for a session another machine holds");
+                }
                 for (w, p) in keys {
                     for l in self.leases.release(&w, &p, &session) {
                         self.send_ready(Msg::Lease(l));
@@ -469,7 +500,7 @@ pub fn start(listen: &str, key: [u8; 32]) -> io::Result<Sender<In>> {
     let listener = TcpListener::bind(listen)?;
     let (tx, rx): (Sender<In>, Receiver<In>) = channel();
     std::thread::spawn(move || {
-        let mut core = Core { seq, origins, log, clients: HashMap::new(), leases: lease::Table::default() };
+        let mut core = Core { seq, origins, log, clients: HashMap::new(), leases: lease::Table::default(), sessions: HashMap::new() };
         for ev in rx {
             core.handle(ev);
         }
@@ -590,9 +621,9 @@ mod tests {
         let now = unix_now();
         let notes = |p: &str| Some(Scope { unit: "drive:notes".into(), prefix: p.into() });
         let tok = |id: &str, scope: Option<Scope>, expires: u64, ro: bool| CloudToken { id: id.into(), secret: id.repeat(32)[..32].into(), name: id.into(), env: false, created: now, revoked: false, scope, expires, ro };
-        let tokens = vec![tok("W", None, 0, false), tok("S", notes("a"), now + 3600, false), tok("R", notes("a"), 0, true), tok("X", notes(""), now - 1, false)];
+        let tokens = vec![tok("W", None, 0, false), tok("S", notes("a"), now + 3600, false), tok("R", notes("a"), 0, true), tok("X", notes(""), now - 1, false), tok("P", Some(Scope { unit: "repo:R".into(), prefix: String::new() }), 0, false)];
         config::save_cloud_tokens(&tokens).unwrap();
-        let peers: Vec<Peer> = ["W", "S", "R", "X"]
+        let peers: Vec<Peer> = ["W", "S", "R", "X", "P"]
             .iter()
             .enumerate()
             .map(|(i, t)| Peer { key: [i as u8 + 1; 32], name: format!("m{t}"), ip: "-".into(), tag: format!("cloud:{t}:0:{now}") })
@@ -600,13 +631,13 @@ mod tests {
         config::save_peers(&peers).unwrap();
 
         let (seq, origins, log) = open_log().unwrap();
-        let mut core = Core { seq, origins, log, clients: HashMap::new(), leases: lease::Table::default() };
+        let mut core = Core { seq, origins, log, clients: HashMap::new(), leases: lease::Table::default(), sessions: HashMap::new() };
         let connect = |core: &mut Core, id: u64| {
             let (tx, rx) = channel();
             core.handle(In::Connect { id, tx, key: [id as u8; 32], ip: "-".into(), stream: None });
             rx
         };
-        let (w, s, r, x) = (1, 2, 3, 4); // writer (no scope), scoped, scoped read-only, expired
+        let (w, s, r, x, p) = (1, 2, 3, 4, 5); // writer (no scope), scoped, scoped read-only, expired, one repo
         let wrx = connect(&mut core, w);
         core.handle(In::Msg(w, Msg::Hello { last_seq: 0, name: "w".into() }));
         keys(&wrx);
@@ -659,7 +690,48 @@ mod tests {
         assert_eq!(core.seq.current("drive:notes", "b/7"), NONE);
         assert_eq!(core.seq.current("drive:other", "a/1"), NONE);
         assert!(core.leases.holder("drive:notes", "b/secret").is_some(), "a scoped release reached outside its scope");
-        assert!(core.leases.holder("drive:notes", "a/1").is_none());
+        assert!(core.leases.holder("drive:notes", "a/1").is_some_and(|e| e.session == "s1"), "released another machine's session");
+
+        // review: a delta on a guessed base must answer the same whether the anchor holds that blob
+        // ("b" is b/6, outside the scope) or not, or a sandbox can read any file a guess at a time
+        for guess in ["b", "not on the anchor"] {
+            let mut o = op("drive:notes", "a/1", "x");
+            o.base = hash_of(Some(guess.as_bytes()));
+            o.data = Data::Delta { prefix: 0, suffix: 0, middle: b"x".to_vec() };
+            core.handle(In::Msg(s, Msg::Op(o)));
+            assert_eq!(keys(&srx), vec![("reject", "drive:notes".to_string(), "a/1".to_string())], "{guess}");
+        }
+
+        // review: a sandbox can't use up or free the leases of another machine's session
+        let claim = |core: &mut Core, id: u64, path: &str, session: &str| core.handle(In::Msg(id, Msg::Claim { wt: "drive:notes".into(), path: path.into(), session: session.into() }));
+        claim(&mut core, w, "b/v", "victim");
+        claim(&mut core, w, "a/v", "victim");
+        for i in 0..lease::MAX_PER_SESSION {
+            claim(&mut core, s, &format!("a/h{i}"), "victim");
+        }
+        core.handle(In::Msg(s, Msg::Release { wt: String::new(), path: String::new(), session: "victim".into() }));
+        core.handle(In::Msg(s, Msg::Release { wt: "drive:notes".into(), path: "a/v".into(), session: "victim".into() }));
+        claim(&mut core, w, "c/next", "victim");
+        claim(&mut core, s, "a/mine", "own");
+        let held = |core: &Core, p: &str| core.leases.holder("drive:notes", p).map(|e| e.session.clone());
+        assert_eq!((held(&core, "a/h0"), held(&core, "a/v"), held(&core, "c/next")), (None, Some("victim".into()), Some("victim".into())));
+        assert_eq!(held(&core, "a/mine"), Some("own".into()));
+        keys(&srx);
+        keys(&wrx);
+
+        // a scoped sandbox can't announce its repo (META says where the others clone it from); its files go through
+        let prx = connect(&mut core, p);
+        core.handle(In::Msg(p, Msg::Hello { last_seq: 0, name: "p".into() }));
+        let mut meta = op("repo:R", META, "");
+        meta.new = crate::sync::meta_hash("r", "r", "github.com/evil/r");
+        meta.data = Data::Full(crate::sync::meta_payload("r", "r", "github.com/evil/r", "main", None));
+        core.handle(In::Msg(p, Msg::Op(meta.clone())));
+        core.handle(In::Msg(p, Msg::Op(op("R:main", "p/file", "p"))));
+        assert_eq!(core.seq.current("repo:R", META), NONE);
+        assert_eq!(core.seq.current("R:main", "p/file"), hash_of(Some(b"p".as_slice())));
+        core.handle(In::Msg(w, Msg::Op(meta))); // the same op is valid from an unscoped machine
+        assert_ne!(core.seq.current("repo:R", META), NONE);
+        assert!(keys(&prx).iter().all(|(k, wt, _)| *k == "op" && (wt == "R:main" || wt == "repo:R" || wt == "vault:R")));
 
         // read-only: an in-scope write is turned down with the current version, never accepted
         let rrx = connect(&mut core, r);
@@ -675,7 +747,7 @@ mod tests {
         assert_eq!(got, vec![("reject", "drive:notes".to_string(), "a/1".to_string()), ("reject", "drive:notes".to_string(), "a/new".to_string())]);
         assert_eq!(core.seq.current("drive:notes", "a/1"), hash_of(Some(b"a/1".as_slice())));
         assert_eq!(core.seq.current("drive:notes", "a/new"), NONE);
-        assert!(core.leases.holder("drive:notes", "a/1").is_none());
+        assert!(core.leases.holder("drive:notes", "a/1").is_some_and(|e| e.session == "s1"));
 
         // an expired token can't come back over its pinned key; a revoked one is cut on the next tick
         let xrx = connect(&mut core, x);

@@ -24,6 +24,8 @@ descripción del diseño y de sus tests, no como una garantía.
 
 - **Un token creado con `--path`** ve una carpeta de un drive (o el drive entero), o un repo entero: sus ramas, su anuncio y sus valores de `.env` sellados (las llaves de la bóveda siguen exigiendo `--env`). El ancla filtra cada mensaje que le manda a ese sandbox (puesta al día, cambios en vivo, reenvíos, leases) por un solo chequeo, y descarta sin responder sus cambios, claims y releases fuera del alcance, porque una respuesta llevaría el contenido. Lo que sí puede ver: los nombres de las máquinas conectadas y el contador de cambios del ancla.
 - **`--read-only`:** el ancla rechaza cada escritura con la versión vigente e ignora sus claims. **`--expires`** y **`hilo token revoke`:** el token sale de la lista del handshake, un sandbox que entró con él no puede reconectarse, y uno conectado queda fuera en menos de 30 segundos.
+- **También se rechaza de un sandbox con alcance:** el anuncio de un repo (dice desde dónde lo clonan las otras máquinas), un delta sobre algo que no sea la versión vigente (se rechaza antes de leer su base, así la respuesta no delata qué blobs tiene el ancla) y claims o releases para una sesión de leases que tiene otra máquina.
+- **Límites conocidos.** Un token con alcance y `--env` recibe las llaves de la bóveda, que son globales: solo le llegan los cifrados de su alcance, pero las llaves abrirían también los demás (llaves por repo serían el endurecimiento). Revocar un token no rota la llave de la bóveda; `hilo unpair` sí.
 
 ## Archivos
 
