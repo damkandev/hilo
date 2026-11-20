@@ -643,7 +643,7 @@ impl D {
             if op.path != REF && !op.wt.starts_with("vault:") && d.len() > 4096 {
                 if let Some(base) = self.cache.map.get(&op.base) {
                     let delta = Data::delta(base, &d);
-                    if matches!(&delta, Data::Delta { middle, .. } if middle.len() < d.len() / 2) {
+                    if matches!(&delta, Data::Delta(p) if p.len() < d.len() / 2) {
                         op.data = delta;
                     }
                 }

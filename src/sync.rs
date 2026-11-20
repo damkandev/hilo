@@ -3,6 +3,8 @@
 //! Keys are (worktree, path) for files, (worktree, "\0ref") for the branch, ("vault:<repo>", "<file>\n<KEY>") for envs.
 #![forbid(unsafe_code)]
 use crate::crypto::sha256;
+use crate::fsops::MAX_FILE;
+use crate::wire::{Rd, W};
 use std::collections::{HashMap, VecDeque};
 
 pub type Hash = [u8; 32];
@@ -21,8 +23,8 @@ pub enum Data {
     Full(Vec<u8>),
     /// Hash only: the receiver may already have it (catch-up, or the op's own author).
     Omitted,
-    /// `new = base[..prefix] + middle + base[len-suffix..]`
-    Delta { prefix: u32, suffix: u32, middle: Vec<u8> },
+    /// `new` rebuilt from `base`: a run of `0 off len` (copy base[off..off+len]) and `1 len bytes` (insert).
+    Delta(Vec<u8>),
 }
 
 impl Data {
@@ -37,20 +39,97 @@ impl Data {
             _ => None,
         }
     }
+    /// rsync-style delta, but the sender holds both sides, so no checksum round trip and no strong
+    /// hash: base blocks are indexed by a rolling checksum, `new` is scanned byte by byte, and each
+    /// hit is checked against the real bytes and stretched both ways. Moved, inserted and repeated
+    /// chunks become copies, so big binaries with scattered edits travel small too.
     pub fn delta(base: &[u8], new: &[u8]) -> Data {
-        let prefix = base.iter().zip(new).take_while(|(a, b)| a == b).count();
-        let max_suffix = base.len().min(new.len()) - prefix;
-        let suffix = base.iter().rev().zip(new.iter().rev()).take(max_suffix).take_while(|(a, b)| a == b).count();
-        Data::Delta { prefix: prefix as u32, suffix: suffix as u32, middle: new[prefix..new.len() - suffix].to_vec() }
-    }
-    /// Rebuilds a delta on top of `base`. None if it doesn't fit.
-    pub fn apply_delta(&self, base: &[u8]) -> Option<Vec<u8>> {
-        let Data::Delta { prefix, suffix, middle } = self else { return None };
-        let (p, s) = (*prefix as usize, *suffix as usize);
-        if p.checked_add(s)? > base.len() {
-            return None;
+        // ~sqrt(len) like rsync: fine blocks for code, few index entries for a 50 MB file
+        let b = ((base.len() as f64).sqrt() as usize).clamp(64, 1 << 14);
+        let mut w = W::default();
+        let mut lit = 0; // start of the bytes not yet covered
+        if base.len() >= b && new.len() >= b {
+            let mut idx: HashMap<u32, usize> = HashMap::with_capacity(base.len() / b);
+            for off in (0..=base.len() - b).step_by(b) {
+                idx.entry(Roll::new(&base[off..off + b]).sum()).or_insert(off);
+            }
+            let (mut i, mut r) = (0, Roll::new(&new[..b]));
+            // ponytail: one HashMap probe per byte of `new`; a bloom filter in front if huge binaries get slow
+            while i + b <= new.len() {
+                if let Some(&off) = idx.get(&r.sum()).filter(|&&o| base[o..o + b] == new[i..i + b]) {
+                    let (mut s, mut o) = (i, off);
+                    while s > lit && o > 0 && new[s - 1] == base[o - 1] {
+                        (s, o) = (s - 1, o - 1);
+                    }
+                    let mut e = i + b;
+                    while e < new.len() && e - s + o < base.len() && new[e] == base[e - s + o] {
+                        e += 1;
+                    }
+                    if s > lit {
+                        w.u8(1).bytes(&new[lit..s]);
+                    }
+                    w.u8(0).u32(o as u32).u32((e - s) as u32);
+                    (i, lit) = (e, e);
+                    if i + b <= new.len() {
+                        r = Roll::new(&new[i..i + b]);
+                    }
+                    continue;
+                }
+                if i + b < new.len() {
+                    r.roll(new[i], new[i + b]);
+                }
+                i += 1;
+            }
         }
-        Some([&base[..p], &middle[..], &base[base.len() - s..]].concat())
+        if lit < new.len() {
+            w.u8(1).bytes(&new[lit..]);
+        }
+        Data::Delta(w.0)
+    }
+    /// Rebuilds a delta on top of `base`. None if it doesn't fit or would outgrow MAX_FILE
+    /// (a few bytes of copies could otherwise ask for gigabytes).
+    pub fn apply_delta(&self, base: &[u8]) -> Option<Vec<u8>> {
+        let Data::Delta(p) = self else { return None };
+        let (mut r, mut out) = (Rd(p), Vec::new());
+        while !r.0.is_empty() {
+            let piece = match r.u8()? {
+                0 => {
+                    let (off, n) = (r.u32()? as usize, r.u32()? as usize);
+                    base.get(off..off.checked_add(n)?)?
+                }
+                1 => r.bytes()?,
+                _ => return None,
+            };
+            if (out.len() + piece.len()) as u64 > MAX_FILE {
+                return None;
+            }
+            out.extend_from_slice(piece);
+        }
+        Some(out)
+    }
+}
+
+/// rsync's weak checksum: two 16-bit sums that slide one byte in O(1).
+struct Roll {
+    a: u32,
+    b: u32,
+    n: u32,
+}
+impl Roll {
+    fn new(d: &[u8]) -> Roll {
+        let (mut a, mut b) = (0u32, 0u32);
+        for &x in d {
+            a = a.wrapping_add(x as u32);
+            b = b.wrapping_add(a);
+        }
+        Roll { a, b, n: d.len() as u32 }
+    }
+    fn roll(&mut self, out: u8, inn: u8) {
+        self.a = self.a.wrapping_sub(out as u32).wrapping_add(inn as u32);
+        self.b = self.b.wrapping_sub(self.n.wrapping_mul(out as u32)).wrapping_add(self.a);
+    }
+    fn sum(&self) -> u32 {
+        (self.a & 0xffff) | (self.b << 16)
     }
 }
 
@@ -525,10 +604,34 @@ mod delta_tests {
 
     #[test]
     fn delta_roundtrip() {
-        for (a, b) in [("hello world", "hello brave world"), ("aaaa", "aa"), ("", "x"), ("abc", "abc"), ("abcabc", "abc")] {
+        let long = "fn main() {}\n".repeat(400);
+        let longer = long.replace("main() {}\nfn main", "main() { x }\nfn main");
+        for (a, b) in [("hello world", "hello brave world"), ("aaaa", "aa"), ("", "x"), ("abc", "abc"), ("abcabc", "abc"), ("x", ""), (&long, &longer), (&longer, &long), (&long, "")] {
             let d = Data::delta(a.as_bytes(), b.as_bytes());
             assert_eq!(d.apply_delta(a.as_bytes()).unwrap(), b.as_bytes(), "{a} -> {b}");
         }
-        assert_eq!(Data::Delta { prefix: 5, suffix: 5, middle: vec![] }.apply_delta(b"short"), None);
+        let copy = |off: u32, n: u32| Data::Delta(W(vec![0]).u32(off).u32(n).0.clone());
+        assert_eq!(copy(2, 4).apply_delta(b"short"), None, "copy past the end");
+        assert_eq!(copy(u32::MAX, 2).apply_delta(b"short"), None, "offset overflow");
+        let bomb = Data::Delta((0..20_000).flat_map(|_| W(vec![0]).u32(0).u32(4096).0.clone()).collect());
+        assert_eq!(bomb.apply_delta(&[0; 4096]), None, "copies may not outgrow MAX_FILE");
+        assert_eq!(Data::Delta(vec![7]).apply_delta(b"x"), None);
+    }
+
+    #[test]
+    fn delta_small_for_scattered_edits() {
+        // pseudo-random "binary": a prefix/suffix delta would resend nearly all of it
+        let mut x = 1u64;
+        let base: Vec<u8> = (0..1 << 20).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect();
+        let mut new = base.clone();
+        new[1000] ^= 1;
+        new.splice(300_000..300_000, b"inserted".iter().copied()); // shifts everything after
+        new.drain(700_000..700_100);
+        new[1_000_000] ^= 1;
+        new.extend_from_slice(&base[..5000]); // a moved chunk
+        let d = Data::delta(&base, &new);
+        let Data::Delta(p) = &d else { unreachable!() };
+        assert!(p.len() < 8 * 1024, "delta is {} bytes", p.len());
+        assert_eq!(d.apply_delta(&base).unwrap(), new);
     }
 }

@@ -74,7 +74,7 @@ impl W {
             Data::Absent => self.u8(0),
             Data::Full(b) => self.u8(1).bytes(b),
             Data::Omitted => self.u8(2),
-            Data::Delta { prefix, suffix, middle } => self.u8(3).u32(*prefix).u32(*suffix).bytes(middle),
+            Data::Delta(p) => self.u8(4).bytes(p),
         }
     }
 }
@@ -121,7 +121,8 @@ impl<'a> Rd<'a> {
             0 => Data::Absent,
             1 => Data::Full(self.bytes()?.to_vec()),
             2 => Data::Omitted,
-            3 => Data::Delta { prefix: self.u32()?, suffix: self.u32()?, middle: self.bytes()?.to_vec() },
+            // 3 was the old prefix/suffix delta: a bad message now, so mixed hilo versions don't misread it
+            4 => Data::Delta(self.bytes()?.to_vec()),
             _ => return None,
         })
     }
@@ -248,7 +249,7 @@ mod tests {
             path: "src/a.ts".into(),
             base: [1; 32],
             new: [2; 32],
-            data: Data::Delta { prefix: 1, suffix: 2, middle: b"hi".to_vec() },
+            data: Data::delta(b"hello world", b"hello brave world"),
             origin: "mac".into(),
             t_event: 5,
             t_seq: 6,

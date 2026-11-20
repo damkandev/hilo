@@ -146,7 +146,7 @@ fn validate(mut op: Op) -> Option<Op> {
     if !valid_path(&op.path) || excluded(&op.path) {
         return None;
     }
-    if let Data::Delta { .. } = op.data {
+    if let Data::Delta(_) = op.data {
         let base = read_blob(&op.base).ok()??;
         op.data = Data::Full(op.data.apply_delta(&base)?);
     }
@@ -264,10 +264,8 @@ impl Core {
                     if new.len() > DELTA_MIN {
                         if let Ok(Some(base)) = read_blob(&op.base) {
                             let d = Data::delta(&base, new);
-                            if let Data::Delta { middle, .. } = &d {
-                                if middle.len() < new.len() / 2 {
-                                    wide.data = d;
-                                }
+                            if matches!(&d, Data::Delta(p) if p.len() < new.len() / 2) {
+                                wide.data = d;
                             }
                         }
                     }
@@ -395,7 +393,7 @@ impl Core {
                 // A delta on anything but the current version is turned down before its base is read:
                 // otherwise the answer would tell whether the anchor holds a blob, from any folder.
                 let cur = self.seq.current(&op.wt, &op.path);
-                if matches!(op.data, Data::Delta { .. }) && op.base != cur {
+                if matches!(op.data, Data::Delta(_)) && op.base != cur {
                     return self.reject(id, op, cur);
                 }
                 let path = op.path.clone();
@@ -705,7 +703,7 @@ mod tests {
         for guess in ["b", "not on the anchor"] {
             let mut o = op("drive:notes", "a/1", "x");
             o.base = hash_of(Some(guess.as_bytes()));
-            o.data = Data::Delta { prefix: 0, suffix: 0, middle: b"x".to_vec() };
+            o.data = Data::delta(b"", b"x");
             core.handle(In::Msg(s, Msg::Op(o)));
             assert_eq!(keys(&srx), vec![("reject", "drive:notes".to_string(), "a/1".to_string())], "{guess}");
         }
