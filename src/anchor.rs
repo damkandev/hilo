@@ -99,8 +99,11 @@ fn write_blob(h: &Hash, d: &[u8]) -> io::Result<()> {
     if p.exists() {
         return Ok(());
     }
+    // durable before it gets its name: a blob that exists is never written again
     let tmp = p.with_extension("tmp");
-    std::fs::write(&tmp, d)?;
+    let mut f = File::create(&tmp)?;
+    f.write_all(d)?;
+    f.sync_all()?;
     std::fs::rename(tmp, p)
 }
 
@@ -186,14 +189,12 @@ impl Core {
 
     /// A session's leases belong to the machine (by key, not by its self-chosen name) that holds
     /// them: session ids travel in every Lease, so others could otherwise use up its quota or free them.
+    /// Dead sessions are dropped on every tick.
     fn owns(&mut self, session: &str, key: &[u8; 32]) -> bool {
         let now = std::time::Instant::now();
-        let live = self.leases.0.values().any(|e| e.session == session && e.expires > now);
         match self.sessions.get(session) {
-            Some(k) if live => ct_eq(k, key),
+            Some(k) if self.leases.0.values().any(|e| e.session == session && e.expires > now) => ct_eq(k, key),
             _ => {
-                let t = &self.leases.0;
-                self.sessions.retain(|s, _| t.values().any(|e| &e.session == s && e.expires > now));
                 self.sessions.insert(session.to_string(), *key);
                 true
             }
@@ -232,14 +233,13 @@ impl Core {
 
     /// Orders an op and fans it out. `from` gets a thin copy (it already has the content).
     fn accept(&mut self, mut op: Op, from: u64) {
-        let full = match op.data.content() {
-            Some(c) => c.map(<[u8]>::to_vec),
-            None => return,
-        };
+        if op.data.content().is_none() {
+            return;
+        }
         match self.seq.submit(&mut op) {
             Ok(_) => {
                 op.t_seq = now_ms();
-                let stored = full.as_ref().map_or(Ok(()), |d| write_blob(&op.new, d)).and_then(|_| {
+                let stored = op.data.content().flatten().map_or(Ok(()), |d| write_blob(&op.new, d)).and_then(|_| {
                     let mut w = W::default();
                     w.u64(op.seq).str(&op.wt).str(&op.path).hash(&op.new).str(&op.origin);
                     self.log.write_all(&w.0)
@@ -253,23 +253,26 @@ impl Core {
                 let is_file = op.path != REF && !op.wt.starts_with("vault:") && !op.wt.starts_with("repo:");
                 // The author already has the content: files go back as a hash, branch moves without
                 // their bundle. Vault values are tiny and go back whole.
-                let mut thin = op.clone();
-                thin.data = match &op.data {
-                    Data::Full(p) if op.path == REF => parse_ref(p).map_or(Data::Omitted, |(sha, f, _)| Data::Full(crate::sync::ref_payload(&sha, f, None))),
-                    Data::Full(_) if is_file || op.path == META => Data::Omitted,
-                    d => d.clone(),
+                let data = std::mem::replace(&mut op.data, Data::Omitted);
+                let thin = Op {
+                    data: match &data {
+                        Data::Full(p) if op.path == REF => parse_ref(p).map_or(Data::Omitted, |(sha, f, _)| Data::Full(crate::sync::ref_payload(&sha, f, None))),
+                        Data::Full(_) if is_file || op.path == META => Data::Omitted,
+                        d => d.clone(),
+                    },
+                    ..op.clone()
                 };
-                let mut wide = op.clone();
-                if let (true, Some(new), true) = (is_file, &full, op.base != NONE) {
-                    if new.len() > DELTA_MIN {
-                        if let Ok(Some(base)) = read_blob(&op.base) {
-                            let d = Data::delta(&base, new);
-                            if matches!(&d, Data::Delta(p) if p.len() < new.len() / 2) {
-                                wide.data = d;
-                            }
-                        }
-                    }
-                }
+                // the delta costs a pass over both versions: only when someone else will get it
+                let others = self.clients.iter().any(|(id, c)| *id != from && c.ready && c.sees(&op.wt, &op.path));
+                let delta = match &data {
+                    Data::Full(new) if is_file && others && op.base != NONE && new.len() > DELTA_MIN => read_blob(&op.base)
+                        .ok()
+                        .flatten()
+                        .map(|base| Data::delta(&base, new))
+                        .filter(|d| matches!(d, Data::Delta(p) if p.len() < new.len() / 2)),
+                    _ => None,
+                };
+                let wide = Op { data: delta.unwrap_or(data), ..op };
                 self.clients.retain(|id, c| !c.ready || c.send(Msg::Op(if *id == from { thin.clone() } else { wide.clone() })));
             }
             Err(cur) => self.reject(from, op, cur),
@@ -282,34 +285,41 @@ impl Core {
                 let (mut env, mut token, mut scope, mut ro) = (true, None, None, false);
                 if id != 0 {
                     let now = unix_now();
-                    let mut ps = config::peers();
-                    // forget cloud sandboxes that are long gone
-                    ps.retain(|p| {
-                        let seen = p.tag.rsplit(':').next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(now);
-                        p.cloud_token().is_none() || ct_eq(&p.key, &key) || now.saturating_sub(seen) < CLOUD_FORGET_SECS
-                    });
-                    // unpaired or revoked between the handshake and here: nothing to say what it may see
-                    let Some(p) = ps.iter_mut().find(|p| ct_eq(&p.key, &key)) else { return refuse(stream, "is no longer paired") };
-                    if let Some(tid) = p.cloud_token() {
-                        // a known sandbox reconnects without its token: the token's limits come from here
-                        match config::cloud_tokens().into_iter().find(|t| t.id == tid) {
-                            Some(t) if t.live(now) => (token, scope, ro) = (Some(t.id), t.scope, t.ro),
-                            _ => return refuse(stream, &format!("joined with token {tid}, now expired or revoked ({})", p.name)),
+                    let clients = &self.clients;
+                    let checked = config::update_peers(|ps| {
+                        // forget cloud sandboxes that are long gone (one online now only stamps its last seen on connect)
+                        ps.retain(|p| {
+                            let seen = p.tag.rsplit(':').next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(now);
+                            p.cloud_token().is_none() || ct_eq(&p.key, &key) || now.saturating_sub(seen) < CLOUD_FORGET_SECS || clients.values().any(|c| ct_eq(&c.key, &p.key))
+                        });
+                        // unpaired or revoked between the handshake and here: nothing to say what it may see
+                        let Some(p) = ps.iter_mut().find(|p| ct_eq(&p.key, &key)) else { return Err("is no longer paired".to_string()) };
+                        if let Some(tid) = p.cloud_token() {
+                            // a known sandbox reconnects without its token: the token's limits come from here
+                            match config::cloud_tokens().into_iter().find(|t| t.id == tid) {
+                                Some(t) if t.live(now) => (token, scope, ro) = (Some(t.id), t.scope, t.ro),
+                                _ => return Err(format!("joined with token {tid}, now expired or revoked ({})", p.name)),
+                            }
                         }
+                        if p.cloud_token().is_none() && !p.ip.is_empty() && p.ip != "-" && p.ip != ip {
+                            let msg = format!("machine {} connected from a new address {ip} (was {})", p.name, p.ip);
+                            log!("anchor: {msg}");
+                            crate::notify(&msg);
+                        }
+                        p.ip = ip;
+                        env = p.gets_env();
+                        if let Some(t) = p.tag.strip_prefix("cloud:") {
+                            let mut parts: Vec<&str> = t.split(':').collect();
+                            parts.truncate(2);
+                            p.tag = format!("cloud:{}:{now}", parts.join(":"));
+                        }
+                        Ok(())
+                    });
+                    match checked {
+                        Ok(Ok(())) => {}
+                        Ok(Err(why)) => return refuse(stream, &why),
+                        Err(e) => return refuse(stream, &format!("could not be checked: {e}")),
                     }
-                    if p.cloud_token().is_none() && !p.ip.is_empty() && p.ip != "-" && p.ip != ip {
-                        let msg = format!("machine {} connected from a new address {ip} (was {})", p.name, p.ip);
-                        log!("anchor: {msg}");
-                        crate::notify(&msg);
-                    }
-                    p.ip = ip;
-                    env = p.gets_env();
-                    if let Some(t) = p.tag.strip_prefix("cloud:") {
-                        let mut parts: Vec<&str> = t.split(':').collect();
-                        parts.truncate(2);
-                        p.tag = format!("cloud:{}:{now}", parts.join(":"));
-                    }
-                    let _ = config::save_peers(&ps);
                 }
                 self.clients.insert(id, Client { tx, key, name: String::new(), ready: false, stream, env, token, scope, ro });
             }
@@ -317,6 +327,9 @@ impl Core {
             In::Tick => {
                 let (ts, now) = (config::cloud_tokens(), unix_now());
                 self.cut(|c| c.token.as_ref().is_some_and(|id| !ts.iter().any(|t| &t.id == id && t.live(now))));
+                self.leases.purge();
+                let live: std::collections::HashSet<&str> = self.leases.0.values().map(|e| e.session.as_str()).collect();
+                self.sessions.retain(|s, _| live.contains(s.as_str()));
             }
             In::Gone(id) => {
                 if self.clients.remove(&id).is_some_and(|c| c.ready) {
@@ -339,12 +352,8 @@ impl Core {
                     return;
                 }
                 c.name = name.chars().filter(|c| c.is_ascii_graphic()).take(64).collect();
-                if id != 0 {
-                    let mut ps = config::peers();
-                    if let Some(p) = ps.iter_mut().find(|p| ct_eq(&p.key, &c.key)).filter(|p| p.name != c.name) {
-                        p.name = c.name.clone();
-                        let _ = config::save_peers(&ps);
-                    }
+                if id != 0 && config::peers().iter().any(|p| ct_eq(&p.key, &c.key) && p.name != c.name) {
+                    let _ = config::update_peers(|ps| ps.iter_mut().filter(|p| ct_eq(&p.key, &c.key)).for_each(|p| p.name = c.name.clone()));
                 }
                 // first, so the sandbox knows what not to send before it resends anything
                 if let Some(s) = c.scope.clone() {
@@ -357,7 +366,9 @@ impl Core {
                 for l in self.leases.snapshot() {
                     self.to(id, Msg::Lease(l));
                 }
-                for (k, seq, h) in self.seq.since(last_seq) {
+                // what a scoped sandbox won't get is never read
+                let c = &self.clients[&id];
+                for (k, seq, h) in self.seq.since(last_seq).into_iter().filter(|e| c.sees(&e.0 .0, &e.0 .1)) {
                     match self.latest(&k, seq, h, true) {
                         Ok(op) => self.to(id, Msg::Op(op)),
                         Err(e) => log!("anchor: missing blob for {}: {e}", k.1),
@@ -402,7 +413,7 @@ impl Core {
                     None => log!("anchor: dropped invalid change to {path:?} from {}", self.clients[&id].name),
                 }
             }
-            Msg::NeedFull { wt, path } => {
+            Msg::NeedFull { wt, path } if c.sees(&wt, &path) => {
                 let k = (wt, path);
                 if let Some((seq, h)) = self.seq.state.get(&k).copied() {
                     if let Ok(op) = self.latest(&k, seq, h, false) {
@@ -413,7 +424,8 @@ impl Core {
             Msg::Resync { wt } => {
                 // "repo:*" = every repo announcement (a folder was just linked)
                 let hit = |w: &str| w == wt || wt.strip_suffix('*').is_some_and(|p| w.starts_with(p));
-                for (k, seq, h) in self.seq.since(0).into_iter().filter(|e| hit(&e.0 .0)) {
+                let c = &self.clients[&id];
+                for (k, seq, h) in self.seq.since(0).into_iter().filter(|e| hit(&e.0 .0) && c.sees(&e.0 .0, &e.0 .1)) {
                     if let Ok(op) = self.latest(&k, seq, h, true) {
                         self.to(id, Msg::Op(op));
                     }
@@ -428,7 +440,7 @@ impl Core {
                     Some(l) => self.send_ready(Msg::Lease(l)),
                     None => {
                         // tell the loser who holds it, so its local copy is right
-                        if let Some(l) = self.leases.snapshot().into_iter().find(|l| l.wt == wt && l.path == path) {
+                        if let Some(l) = self.leases.get(&wt, &path) {
                             self.to(id, Msg::Lease(l));
                         }
                     }
@@ -436,7 +448,7 @@ impl Core {
             }
             Msg::Release { wt, path, session } => {
                 // "every lease of the session" from a scoped sandbox only reaches inside its scope
-                let keys: Vec<Key> = if wt.is_empty() { self.leases.0.keys().filter(|k| c.sees(&k.0, &k.1)).cloned().collect() } else { vec![(wt, path)] };
+                let keys: Vec<Key> = if wt.is_empty() { self.leases.0.iter().filter(|(k, e)| e.session == session && c.sees(&k.0, &k.1)).map(|(k, _)| k.clone()).collect() } else { vec![(wt, path)] };
                 let (machine, key) = (c.name.clone(), c.key);
                 if !self.owns(&session, &key) {
                     return log!("anchor: {machine} released for a session another machine holds");
@@ -455,12 +467,15 @@ impl Core {
     }
 
     fn unpair(&mut self, name: &str) -> Result<Vec<String>, String> {
-        let ps = config::peers();
-        let (gone, keep): (Vec<Peer>, Vec<Peer>) = ps.into_iter().partition(|p| p.name == name);
+        let gone: Vec<Peer> = config::update_peers(|ps| {
+            let (gone, keep) = std::mem::take(ps).into_iter().partition(|p| p.name == name);
+            *ps = keep;
+            gone
+        })
+        .map_err(|e| e.to_string())?;
         if gone.is_empty() {
             return Err(format!("no paired machine called {name}"));
         }
-        config::save_peers(&keep).map_err(|e| e.to_string())?;
         // cut live connections at once
         self.cut(|c| gone.iter().any(|p| ct_eq(&p.key, &c.key)));
         // new vault key; re-seal every shared value with it
@@ -468,8 +483,10 @@ impl Core {
         let (e, k) = vault::new_epoch().map_err(|e| e.to_string())?;
         self.send_ready(Msg::VaultKey { epoch: e, key: k });
         let keys = vault::keys();
+        let me = self.clients.get(&0).map(|c| c.name.clone()).unwrap_or_default();
         let mut seen = vec![];
-        for ((wt, path), (_, h)) in self.seq.state.clone() {
+        let shared: Vec<(Key, Hash)> = self.seq.state.iter().filter(|(k, _)| k.0.starts_with("vault:")).map(|(k, v)| (k.clone(), v.1)).collect();
+        for ((wt, path), h) in shared {
             let (Some(repo), Some((file, key))) = (wt.strip_prefix("vault:"), vault::split_path(&path)) else { continue };
             let Ok(Some(ct)) = read_blob(&h) else { continue };
             let Some(pt) = vault::open(&old, repo, file, key, &ct) else { continue };
@@ -478,8 +495,7 @@ impl Core {
             }
             let Some(sealed) = vault::seal(&keys, repo, file, key, &pt) else { continue };
             let new = crate::crypto::sha256(&sealed);
-            let me = self.clients.get(&0).map(|c| c.name.clone()).unwrap_or_default();
-            let op = Op { seq: 0, wt: wt.clone(), path: path.clone(), base: h, new, data: Data::Full(sealed), origin: me, t_event: 0, t_seq: 0 };
+            let op = Op { seq: 0, wt: wt.clone(), path: path.clone(), base: h, new, data: Data::Full(sealed), origin: me.clone(), t_event: 0, t_seq: 0 };
             self.accept(op, u64::MAX);
         }
         seen.sort();
@@ -555,27 +571,30 @@ fn serve(mut s: TcpStream, key: [u8; 32], atx: Sender<In>, unauth: Arc<AtomicUsi
             return;
         }
     } else if i <= tokens.len() {
-        // the token is burned before anything else happens
-        let mut ps = config::peers();
-        ps.push(Peer { key: remote, name: "new".into(), ip: peer.clone(), tag: String::new() });
-        if config::use_token(&tokens[i - 1]).and_then(|_| config::save_peers(&ps)).is_err() {
-            return;
+        // the token is burned before anything else happens; two handshakes with it, one pairs
+        let new = Peer { key: remote, name: "new".into(), ip: peer.clone(), tag: String::new() };
+        match config::use_token(&tokens[i - 1]) {
+            Ok(true) if config::update_peers(|ps| ps.push(new)).is_ok() => {}
+            Ok(false) => return log!("anchor: pairing code already used, from {peer}"),
+            _ => return,
         }
         log!("anchor: paired new machine {} from {peer}", &hex(&remote)[..8]);
     } else {
         // a cloud sandbox: the token stays valid for the next one
         let t = &clouds[i - 1 - tokens.len()];
-        let mut ps = config::peers();
-        if !ps.iter().any(|p| ct_eq(&p.key, &remote)) {
-            let tag = format!("cloud:{}:{}:{}", t.id, t.env as u8, unix_now());
-            ps.push(Peer { key: remote, name: format!("cloud-{}", &hex(&remote)[..6]), ip: peer.clone(), tag });
-            if config::save_peers(&ps).is_err() {
-                return;
+        let added = config::update_peers(|ps| {
+            if !ps.iter().any(|p| ct_eq(&p.key, &remote)) {
+                let tag = format!("cloud:{}:{}:{}", t.id, t.env as u8, unix_now());
+                ps.push(Peer { key: remote, name: format!("cloud-{}", &hex(&remote)[..6]), ip: peer.clone(), tag });
             }
+        });
+        if added.is_err() {
+            return;
         }
         log!("anchor: cloud machine {} joined with token {} ({})", &hex(&remote)[..8], t.id, t.name);
     }
-    let _ = s.set_write_timeout(None);
+    // a machine that stops reading is cut off instead of queueing every broadcast forever
+    let _ = s.set_write_timeout(Some(net::DEAD));
     let id = ids.fetch_add(1, Ordering::SeqCst);
     let (ctx, crx) = channel();
     let (Ok(w), Ok(k)) = (s.try_clone(), s.try_clone()) else { return };

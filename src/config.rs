@@ -4,6 +4,8 @@ use crate::crypto::{hex, hkdf, random, unhex};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 pub fn home() -> PathBuf {
     std::env::var_os("HILO_HOME")
@@ -26,12 +28,30 @@ pub fn ensure_home() -> io::Result<()> {
     Ok(())
 }
 
-/// Atomic, 0600.
+/// Atomic, durable, 0600. Each writer gets its own temp file, so two writers never interleave.
 pub fn write_private(name: &str, data: &[u8]) -> io::Result<()> {
-    let tmp = path(&format!("{name}.tmp"));
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-    f.write_all(data)?;
-    std::fs::rename(tmp, path(name))
+    static N: AtomicU64 = AtomicU64::new(0);
+    let tmp = path(&format!("{name}.{}.{}.tmp", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let r = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).and_then(|mut f| {
+        f.write_all(data)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path(name))
+    });
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// Read-modify-write of `peers`, `tokens` and `cloud_tokens` happens under this: the anchor's
+/// threads, the daemon and the CLI all change them.
+// ponytail: one lock for all three files; split it if pairing ever contends.
+fn locked<T>(f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let l = std::fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(path("lock"))?;
+    l.lock()?; // and other processes (the CLI); released when `l` drops
+    f()
 }
 
 fn read(name: &str) -> String {
@@ -136,6 +156,16 @@ pub fn peers() -> Vec<Peer> {
         .collect()
 }
 
+/// Changes `peers` with nobody else changing it in between.
+pub fn update_peers<T>(f: impl FnOnce(&mut Vec<Peer>) -> T) -> io::Result<T> {
+    locked(|| {
+        let mut ps = peers();
+        let t = f(&mut ps);
+        save_peers(&ps)?;
+        Ok(t)
+    })
+}
+
 pub fn save_peers(ps: &[Peer]) -> io::Result<()> {
     let s: String = ps.iter().map(|p| format!("{} {} {} {}\n", hex(&p.key), p.name.replace(' ', "_"), if p.ip.is_empty() { "-" } else { &p.ip }, p.tag)).collect();
     write_private("peers", s.as_bytes())
@@ -156,30 +186,43 @@ pub fn new_token() -> io::Result<String> {
         bits >>= 5;
         c
     }).collect();
-    let mut s = read("tokens");
-    s.push_str(&format!("{t} {} 0\n", now() + 600));
-    write_private("tokens", s.as_bytes())?;
+    locked(|| {
+        let mut ts = live_tokens();
+        ts.push((t.clone(), now() + 600));
+        save_tokens(&ts)
+    })?;
     Ok(t)
 }
 
-/// Unused, unexpired tokens.
-pub fn active_tokens() -> Vec<String> {
+/// Unused, unexpired tokens and when they expire. Used and expired lines go on the next write.
+fn live_tokens() -> Vec<(String, u64)> {
     read("tokens")
         .lines()
         .filter_map(|l| {
             let mut p = l.split(' ');
             let (t, exp, used) = (p.next()?, p.next()?.parse::<u64>().ok()?, p.next()?);
-            (used == "0" && exp > now()).then(|| t.to_string())
+            (used == "0" && exp > now()).then(|| (t.to_string(), exp))
         })
         .collect()
 }
 
-pub fn use_token(t: &str) -> io::Result<()> {
-    let s: String = read("tokens")
-        .lines()
-        .map(|l| if l.starts_with(&format!("{t} ")) { format!("{} 1\n", &l[..l.len() - 2]) } else { format!("{l}\n") })
-        .collect();
-    write_private("tokens", s.as_bytes())
+fn save_tokens(ts: &[(String, u64)]) -> io::Result<()> {
+    write_private("tokens", ts.iter().map(|(t, e)| format!("{t} {e} 0\n")).collect::<String>().as_bytes())
+}
+
+pub fn active_tokens() -> Vec<String> {
+    live_tokens().into_iter().map(|t| t.0).collect()
+}
+
+/// Burns a token. False: it was already used (or expired), so this handshake doesn't pair.
+pub fn use_token(t: &str) -> io::Result<bool> {
+    locked(|| {
+        let mut ts = live_tokens();
+        let n = ts.len();
+        ts.retain(|e| e.0 != t);
+        save_tokens(&ts)?;
+        Ok(ts.len() < n)
+    })
 }
 
 pub fn token_psk(t: &str) -> [u8; 32] {
@@ -291,10 +334,26 @@ fn b32(n: usize) -> String {
 
 pub fn new_cloud_token(name: &str, env: bool, scope: Option<Scope>, expires: u64, ro: bool) -> io::Result<CloudToken> {
     let t = CloudToken { id: b32(6), secret: b32(32), name: name.into(), env, created: now(), revoked: false, scope, expires, ro };
-    let mut all = cloud_tokens();
-    all.push(t.clone());
-    save_cloud_tokens(&all)?;
+    locked(|| {
+        let mut all = cloud_tokens();
+        all.push(t.clone());
+        save_cloud_tokens(&all)
+    })?;
     Ok(t)
+}
+
+/// Revokes a cloud token and forgets the sandboxes that joined with it (returned, to cut them off).
+/// None: no such token.
+pub fn revoke_cloud_token(id: &str) -> io::Result<Option<Vec<Peer>>> {
+    locked(|| {
+        let mut ts = cloud_tokens();
+        let Some(t) = ts.iter_mut().find(|t| t.id == id) else { return Ok(None) };
+        t.revoked = true;
+        save_cloud_tokens(&ts)?;
+        let (gone, keep): (Vec<Peer>, Vec<Peer>) = peers().into_iter().partition(|p| p.cloud_token() == Some(id));
+        save_peers(&keep)?;
+        Ok(Some(gone))
+    })
 }
 
 pub fn cloud_psk(secret: &str) -> [u8; 32] {
@@ -364,6 +423,26 @@ mod tests {
         for bad in ["repo:", "drive:", "", "other:R", "R"] {
             assert!(!in_scope(&Scope { unit: bad.into(), prefix: String::new() }, "R:main", "a"), "{bad}");
         }
+    }
+
+    #[test]
+    fn pairing_token_pairs_once() {
+        let _lock = TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("hilo-config-test-{}-{}", std::process::id(), hex(&random::<4>())));
+        std::fs::create_dir_all(&home).unwrap();
+        let old = std::env::var_os("HILO_HOME");
+        std::env::set_var("HILO_HOME", &home);
+        write_private("tokens", format!("OLD {} 0\nUSED {} 1\n", now() - 1, now() + 600).as_bytes()).unwrap();
+        let t = new_token().unwrap();
+        assert_eq!(read("tokens").lines().count(), 1, "expired and used lines are dropped");
+        let both: Vec<bool> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..2).map(|_| s.spawn(|| use_token(&t).unwrap())).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(both.iter().filter(|b| **b).count(), 1, "{both:?}");
+        assert!(active_tokens().is_empty());
+        old.map_or_else(|| std::env::remove_var("HILO_HOME"), |o| std::env::set_var("HILO_HOME", o));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

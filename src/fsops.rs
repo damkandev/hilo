@@ -3,7 +3,7 @@
 use crate::crypto::{hex, random};
 use std::ffi::{c_char, c_int, CString};
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -93,6 +93,7 @@ pub fn has_secret(data: &[u8]) -> bool {
 #[cfg(target_os = "macos")]
 mod c {
     pub const O_WRONLY: i32 = 1;
+    pub const O_NONBLOCK: i32 = 0x4;
     pub const O_NOFOLLOW: i32 = 0x100;
     pub const O_CREAT: i32 = 0x200;
     pub const O_EXCL: i32 = 0x800;
@@ -104,6 +105,7 @@ mod c {
 mod c {
     pub const O_WRONLY: i32 = 1;
     pub const O_CREAT: i32 = 0x40;
+    pub const O_NONBLOCK: i32 = 0x800;
     pub const O_EXCL: i32 = 0x80;
     pub const O_CLOEXEC: i32 = 0x80000;
     #[cfg(target_arch = "aarch64")]
@@ -190,6 +192,24 @@ pub fn stamp(m: &std::fs::Metadata) -> Stamp {
     (m.mtime(), m.mtime_nsec(), m.size(), m.ino())
 }
 
+/// The regular file at `rel`, without following a symlink anywhere on the way. None: no regular file there.
+pub fn read(root: &Path, rel: &str) -> io::Result<Option<Vec<u8>>> {
+    let (dir, at, name) = match open_parent(root, rel, false) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        r => r?,
+    };
+    if !std::fs::symlink_metadata(at.join(&name)).is_ok_and(|m| m.is_file()) {
+        return Ok(None);
+    }
+    let mut f = File::from(open_at(&dir, &name, c::O_NONBLOCK, 0)?);
+    if !f.metadata()?.is_file() {
+        return Ok(None);
+    }
+    let mut d = vec![];
+    f.read_to_end(&mut d)?;
+    Ok(Some(d))
+}
+
 pub fn write(root: &Path, rel: &str, data: Option<&[u8]>) -> io::Result<Option<Stamp>> {
     write_mode(root, rel, data, 0o644)
 }
@@ -198,10 +218,14 @@ pub fn write(root: &Path, rel: &str, data: Option<&[u8]>) -> io::Result<Option<S
 /// never setuid/setgid. Returns the written file's stamp, so the scanner doesn't re-read it.
 pub fn write_mode(root: &Path, rel: &str, data: Option<&[u8]>, new_mode: u32) -> io::Result<Option<Stamp>> {
     let Some(data) = data else {
-        let (dir, _, name) = match open_parent(root, rel, false) {
+        let (dir, at, name) = match open_parent(root, rel, false) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             r => r?,
         };
+        match case_twin(&at, &name) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(None), // only `foo` for `Foo`: not ours to delete
+            r => r?,
+        }
         let n = cstr(&name)?;
         return match check(unsafe { unlinkat(dir.as_raw_fd(), n.as_ptr(), 0) }) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -213,7 +237,8 @@ pub fn write_mode(root: &Path, rel: &str, data: Option<&[u8]>, new_mode: u32) ->
     }
     let (dir, at, name) = open_parent(root, rel, true)?;
     case_twin(&at, &name)?;
-    let mode = match open_at(&dir, &name, 0, 0) {
+    // O_NONBLOCK: a FIFO there must not hang the daemon
+    let mode = match open_at(&dir, &name, c::O_NONBLOCK, 0) {
         Ok(fd) => {
             let m = File::from(fd).metadata()?;
             if !m.is_file() {
@@ -282,8 +307,15 @@ mod tests {
         std::fs::set_permissions(root.join("a/b/c.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
         write(&root, "a/b/c.txt", Some(b"v2")).unwrap();
         assert_eq!(std::fs::metadata(root.join("a/b/c.txt")).unwrap().permissions().mode() & 0o777, 0o755);
+        write(&root, "a/b/C.txt", None).unwrap(); // a delete of a case twin leaves this one alone
+        assert_eq!(read(&root, "a/b/c.txt").unwrap().as_deref(), Some(&b"v2"[..]));
+        assert_eq!(read(&root, "evil/x.txt").ok().flatten(), None);
         write(&root, "a/b/c.txt", None).unwrap();
         assert!(!root.join("a/b/c.txt").exists());
+        assert_eq!(read(&root, "a/b/c.txt").unwrap(), None);
+        // a FIFO where a file goes: refused, not a hang
+        assert!(std::process::Command::new("mkfifo").arg(root.join("p")).status().unwrap().success());
+        assert!(write(&root, "p", Some(b"x")).is_err());
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

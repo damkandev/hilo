@@ -11,7 +11,7 @@ use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const NAME: &str = "Noise_XXpsk3_25519_ChaChaPoly_SHA256";
-const MAX: usize = 65535;
+pub const MAX: usize = 65535; // largest Noise message
 
 #[derive(Debug)]
 pub struct Error;
@@ -48,22 +48,35 @@ impl CryptoResolver for Resolver {
     }
 }
 
-/// One direction of a transport session.
-#[derive(Clone)]
-pub struct Cipher {
+/// The sending half of a transport session. Each half owns its nonce counter and can only go one way,
+/// so no nonce is ever used twice (cloning is for tests only).
+#[cfg_attr(test, derive(Clone))]
+pub struct SendCipher {
     t: Arc<StatelessTransportState>,
     n: u64,
 }
 
-impl Cipher {
+/// The receiving half.
+#[cfg_attr(test, derive(Clone))]
+pub struct RecvCipher {
+    t: Arc<StatelessTransportState>,
+    n: u64,
+}
+
+impl SendCipher {
+    /// Appends the ciphertext of `pt` to `out`.
     /// snow refuses nonce 2^64-1, so this fails (instead of ever reusing a nonce) once the space runs out.
-    pub fn encrypt(&mut self, pt: &[u8]) -> R<Vec<u8>> {
-        let mut out = vec![0u8; pt.len() + 16];
-        let n = self.t.write_message(self.n, pt, &mut out)?;
-        out.truncate(n);
+    pub fn encrypt(&mut self, pt: &[u8], out: &mut Vec<u8>) -> R<()> {
+        let at = out.len();
+        out.resize(at + pt.len() + 16, 0);
+        let n = self.t.write_message(self.n, pt, &mut out[at..])?;
+        out.truncate(at + n);
         self.n += 1;
-        Ok(out)
+        Ok(())
     }
+}
+
+impl RecvCipher {
     pub fn decrypt(&mut self, ct: &[u8]) -> R<Vec<u8>> {
         let mut out = vec![0u8; ct.len()];
         let n = self.t.read_message(self.n, ct, &mut out)?;
@@ -160,10 +173,10 @@ impl Handshake {
     }
 
     /// (send, recv, remote static key) once the handshake is done.
-    pub fn split(self) -> R<(Cipher, Cipher, [u8; 32])> {
+    pub fn split(self) -> R<(SendCipher, RecvCipher, [u8; 32])> {
         let rs = self.hs.get_remote_static().ok_or(Error)?.try_into().map_err(|_| Error)?;
         let t = Arc::new(self.hs.into_stateless_transport_mode()?);
-        Ok((Cipher { t: t.clone(), n: 0 }, Cipher { t, n: 0 }, rs))
+        Ok((SendCipher { t: t.clone(), n: 0 }, RecvCipher { t, n: 0 }, rs))
     }
     #[cfg(test)]
     pub fn hash(&self) -> [u8; 32] {
@@ -227,13 +240,13 @@ mod tests {
 
         let (mut i_tx, mut i_rx, _) = i.split().unwrap();
         let (mut r_tx, mut r_rx, _) = r.split().unwrap();
-        let c3 = r_tx.encrypt(&p(3)).unwrap();
+        let c3 = enc(&mut r_tx, &p(3)).unwrap();
         assert_eq!(hex(&c3), msgs[3].1);
         assert_eq!(i_rx.decrypt(&c3).unwrap(), p(3));
-        let c4 = i_tx.encrypt(&p(4)).unwrap();
+        let c4 = enc(&mut i_tx, &p(4)).unwrap();
         assert_eq!(hex(&c4), msgs[4].1);
         assert_eq!(r_rx.decrypt(&c4).unwrap(), p(4));
-        assert_eq!(hex(&r_tx.encrypt(&p(5)).unwrap()), msgs[5].1);
+        assert_eq!(hex(&enc(&mut r_tx, &p(5)).unwrap()), msgs[5].1);
     }
 
     struct Rng(u64);
@@ -306,7 +319,12 @@ mod tests {
         }
     }
 
-    fn pair() -> ((Cipher, Cipher), (Cipher, Cipher)) {
+    fn enc(c: &mut SendCipher, pt: &[u8]) -> R<Vec<u8>> {
+        let mut v = vec![];
+        c.encrypt(pt, &mut v).map(|_| v)
+    }
+
+    fn pair() -> ((SendCipher, RecvCipher), (RecvCipher, SendCipher)) {
         let psk = [5u8; 32];
         let mut i = Handshake::new([1; 32], b"", true, None).unwrap();
         let mut r = Handshake::new([2; 32], b"", false, None).unwrap();
@@ -320,8 +338,8 @@ mod tests {
     #[test]
     fn transport_refuses_replay_reorder_and_tampering() {
         let ((mut tx, _), (mut rx, _)) = pair();
-        let a = tx.encrypt(b"first").unwrap();
-        let b = tx.encrypt(b"second").unwrap();
+        let a = enc(&mut tx, b"first").unwrap();
+        let b = enc(&mut tx, b"second").unwrap();
         // reordered: the second message can't be read first
         let mut rx2 = rx.clone();
         assert!(rx2.decrypt(&b).is_err());
@@ -342,8 +360,8 @@ mod tests {
         let ((mut tx, _), (mut rx, _)) = pair();
         tx.n = u64::MAX - 1;
         rx.n = u64::MAX - 1;
-        let last = tx.encrypt(b"last").unwrap();
-        assert!(tx.encrypt(b"one more").is_err());
+        let last = enc(&mut tx, b"last").unwrap();
+        assert!(enc(&mut tx, b"one more").is_err());
         assert_eq!(rx.decrypt(&last).unwrap(), b"last");
         assert!(rx.decrypt(&last).is_err());
     }

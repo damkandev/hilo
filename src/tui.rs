@@ -439,9 +439,9 @@ pub fn card(lines: &[String]) {
 
 /// `~/x` for paths under HOME.
 pub fn tilde(p: &std::path::Path) -> String {
-    let s = p.to_string_lossy().into_owned();
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
-        _ => s,
+    match std::env::var_os("HOME").filter(|h| !h.is_empty()).and_then(|h| Some(p.strip_prefix(h).ok()?.to_string_lossy().into_owned())) {
+        Some(r) if r.is_empty() => "~".into(),
+        Some(r) => format!("~/{r}"),
+        None => p.to_string_lossy().into_owned(),
     }
 }

@@ -70,11 +70,6 @@ impl Json {
         (p.i == p.b.len()).then_some(v)
     }
 
-    pub fn to_string(&self) -> String {
-        let mut o = String::new();
-        self.write(&mut o, None, 0);
-        o
-    }
     pub fn pretty(&self) -> String {
         let mut o = String::new();
         self.write(&mut o, Some(2), 0);
@@ -126,6 +121,14 @@ impl Json {
                 o.push('}');
             }
         }
+    }
+}
+
+impl std::fmt::Display for Json {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut o = String::new();
+        self.write(&mut o, None, 0);
+        f.write_str(&o)
     }
 }
 
@@ -231,13 +234,34 @@ impl P<'_> {
                 Some(Json::Obj(v))
             }
             b'-' | b'0'..=b'9' => {
+                // -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?
                 let st = self.i;
-                while self.i < self.b.len() && matches!(self.b[self.i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
-                    self.i += 1;
+                let digits = |p: &mut Self| {
+                    let s = p.i;
+                    while p.peek().is_some_and(|c| c.is_ascii_digit()) {
+                        p.i += 1;
+                    }
+                    p.i - s
+                };
+                self.i += (self.peek() == Some(b'-')) as usize;
+                let int = self.i;
+                if digits(self) == 0 || (self.b[int] == b'0' && self.i - int > 1) {
+                    return None;
                 }
-                let t = std::str::from_utf8(&self.b[st..self.i]).ok()?;
-                t.parse::<f64>().ok()?;
-                Some(Json::Num(t.to_string()))
+                if self.peek() == Some(b'.') {
+                    self.i += 1;
+                    if digits(self) == 0 {
+                        return None;
+                    }
+                }
+                if matches!(self.peek(), Some(b'e' | b'E')) {
+                    self.i += 1;
+                    self.i += matches!(self.peek(), Some(b'+' | b'-')) as usize;
+                    if digits(self) == 0 {
+                        return None;
+                    }
+                }
+                Some(Json::Num(String::from_utf8_lossy(&self.b[st..self.i]).into_owned()))
             }
             _ => None,
         };
@@ -245,9 +269,9 @@ impl P<'_> {
         v
     }
     fn hex4(&mut self) -> Option<u32> {
-        let h = std::str::from_utf8(self.b.get(self.i..self.i + 4)?).ok()?;
+        let h = self.b.get(self.i..self.i + 4)?;
         self.i += 4;
-        u32::from_str_radix(h, 16).ok()
+        h.iter().try_fold(0, |n, c| Some(n << 4 | (*c as char).to_digit(16)?))
     }
     fn string(&mut self) -> Option<String> {
         if self.peek()? != b'"' {
@@ -280,7 +304,10 @@ impl P<'_> {
                                 }
                                 self.i += 2;
                                 let lo = self.hex4()?;
-                                u = 0x10000 + ((u - 0xd800) << 10) + (lo.checked_sub(0xdc00)? & 0x3ff);
+                                if !(0xdc00..0xe000).contains(&lo) {
+                                    return None;
+                                }
+                                u = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00);
                             }
                             char::from_u32(u)?
                         }
@@ -307,9 +334,12 @@ mod tests {
         assert_eq!(Json::parse(&j.pretty()).unwrap(), j);
         assert_eq!(Json::parse(&j.to_string()).unwrap(), j);
         assert!(j.to_string().contains("2.50"));
-        for bad in ["", "{", "[1,]", "{\"a\" 1}", "\"\u{1}\"", "01x", "nul"] {
+        for bad in ["", "{", "[1,]", "{\"a\" 1}", "\"\u{1}\"", "01x", "nul", "01", "1.", "-01", "-", "1e", ".5", "+1", r#""\u+041""#, r#""\ud83d\u0041""#] {
             assert!(Json::parse(bad).is_none(), "{bad}");
         }
         assert!(Json::parse(&"[".repeat(1000)).is_none());
+        for good in ["0", "-0.5", "1e+9", "10E-2", r#""\u0041\ud83d\ude00""#] {
+            assert!(Json::parse(good).is_some(), "{good}");
+        }
     }
 }

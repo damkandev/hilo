@@ -30,6 +30,8 @@ pub struct Scanner {
     env: HashMap<String, Stamp>,
     gitignores: HashMap<String, Stamp>,
     warned: HashSet<String>,
+    /// files skipped for looking like they hold a key, as they were then: not re-read until they change
+    keyed: HashMap<String, Stamp>,
     dirty_index: bool,
     /// drives: the empty bare repo `git check-ignore` runs against
     drive: Option<PathBuf>,
@@ -54,6 +56,7 @@ impl Scanner {
             env: HashMap::new(),
             gitignores: HashMap::new(),
             warned: HashSet::new(),
+            keyed: HashMap::new(),
             dirty_index: false,
             drive: None,
             root_id: None,
@@ -171,43 +174,39 @@ impl Scanner {
         yes
     }
 
-    pub fn scan(&mut self) -> io::Result<Changes> {
-        self.walk("")
+    /// What changed goes into `out`, also when it fails partway: those files are already marked
+    /// as seen, so they would never be reported again.
+    pub fn scan(&mut self, out: &mut Changes) -> io::Result<()> {
+        self.walk("", out)
     }
 
-    /// Look only at these paths (relative). Directories are walked.
-    pub fn check(&mut self, rels: &[String]) -> io::Result<Changes> {
-        let mut out = Changes::default();
+    /// Look only at these paths (relative). Directories are walked. Same `out` as `scan`.
+    pub fn check(&mut self, rels: &[String], out: &mut Changes) -> io::Result<()> {
+        if rels.iter().any(|r| r.is_empty()) {
+            return self.walk("", out);
+        }
+        let all: HashSet<&str> = rels.iter().map(String::as_str).collect();
         let mut done: HashSet<&str> = HashSet::new();
         for rel in rels {
-            if rel.is_empty() {
-                return self.walk("");
-            }
-            if !done.insert(rel) || rel.split('/').any(is_dotgit) {
+            if !done.insert(rel) || rel.split('/').any(|c| is_dotgit(c) || c.starts_with(TMP_PREFIX)) {
                 continue;
             }
             // already covered by a parent in this batch
-            if rels.iter().any(|o| o != rel && rel.starts_with(&format!("{o}/"))) {
+            if rel.match_indices('/').any(|(i, _)| all.contains(&rel[..i])) {
                 continue;
             }
-            if rel.split('/').any(|c| c.starts_with(TMP_PREFIX)) {
-                continue;
-            }
-            let c = self.walk(rel)?;
-            out.files.extend(c.files);
-            out.env.extend(c.env);
-            out.dirs.extend(c.dirs);
+            self.walk(rel, out)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Look at `prefix` ("" = everything): a file, a directory, or something now gone.
-    fn walk(&mut self, prefix: &str) -> io::Result<Changes> {
+    fn walk(&mut self, prefix: &str, out: &mut Changes) -> io::Result<()> {
         if self.root.starts_with(&self.home) {
             return Err(io::Error::other(format!("{} is inside hilo's own folder; not syncing it", self.root.display())));
         }
         if !prefix.is_empty() && self.root.join(prefix).starts_with(&self.home) {
-            return Ok(Changes::default());
+            return Ok(());
         }
         if self.drive.is_some() {
             let id = self.root_ok()?;
@@ -219,7 +218,6 @@ impl Scanner {
         if self.drive.is_none() && !self.root.join(".git").exists() {
             return Err(io::Error::other(format!("{} is not a git worktree anymore", self.root.display())));
         }
-        let mut out = Changes::default();
         let mut seen = HashSet::new();
         let mut complete = true;
         let mut rules_changed = false;
@@ -244,7 +242,7 @@ impl Scanner {
                         stack.push(prefix.to_string());
                     }
                 }
-                Ok(m) => self.look(prefix, &m, &mut out, &mut seen, &mut rules_changed)?,
+                Ok(m) => self.look(prefix, &m, out, &mut seen, &mut rules_changed)?,
                 Err(_) => {} // gone: handled below
             }
         }
@@ -275,7 +273,7 @@ impl Scanner {
                     }
                     continue;
                 }
-                self.look(&rel, &m, &mut out, &mut seen, &mut rules_changed)?;
+                self.look(&rel, &m, out, &mut seen, &mut rules_changed)?;
             }
         }
         if complete && prefix.is_empty() && self.drive.is_some() && seen.is_empty() && !self.files.is_empty() {
@@ -287,8 +285,14 @@ impl Scanner {
             )));
         }
         if complete {
-            let under = |k: &str| prefix.is_empty() || k == prefix || k.starts_with(&format!("{prefix}/"));
-            let gone: Vec<String> = self.files.keys().filter(|k| under(k) && !seen.contains(*k)).cloned().collect();
+            let dir = format!("{prefix}/");
+            let under = |k: &str| prefix.is_empty() || k == prefix || k.starts_with(&dir);
+            let gone: Vec<String> = if !prefix.is_empty() && self.files.contains_key(prefix) {
+                // a file: only it can be gone
+                Some(prefix.to_string()).filter(|k| !seen.contains(k)).into_iter().collect()
+            } else {
+                self.files.keys().filter(|k| under(k) && !seen.contains(*k)).cloned().collect()
+            };
             for rel in gone {
                 self.files.remove(&rel);
                 self.dirty_index = true;
@@ -310,12 +314,9 @@ impl Scanner {
             self.ignore = None;
             self.ignored.clear();
             self.env.clear();
-            let more = self.walk("")?;
-            out.files.extend(more.files);
-            out.env.extend(more.env);
-            out.dirs.extend(more.dirs);
+            self.walk("", out)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     fn look(&mut self, rel: &str, m: &std::fs::Metadata, out: &mut Changes, seen: &mut HashSet<String>, rules_changed: &mut bool) -> io::Result<()> {
@@ -350,7 +351,7 @@ impl Scanner {
         if name == ".gitignore" && self.gitignores.insert(rel.into(), st).is_some_and(|old| old != st) {
             *rules_changed = true;
         }
-        if self.files.get(rel).is_some_and(|f| f.0 == st) {
+        if self.files.get(rel).is_some_and(|f| f.0 == st) || self.keyed.get(rel) == Some(&st) {
             return Ok(());
         }
         if m.len() > MAX_FILE {
@@ -364,6 +365,7 @@ impl Scanner {
             return Ok(());
         }
         if has_secret(&data) {
+            self.keyed.insert(rel.into(), st);
             self.warn(rel, "looks like it contains a key");
             return Ok(());
         }
@@ -382,12 +384,22 @@ impl Scanner {
 mod tests {
     use super::*;
 
+    fn scan(s: &mut Scanner) -> io::Result<Changes> {
+        let mut c = Changes::default();
+        s.scan(&mut c).map(|_| c)
+    }
+
+    fn check(s: &mut Scanner, rels: &[String]) -> io::Result<Changes> {
+        let mut c = Changes::default();
+        s.check(rels, &mut c).map(|_| c)
+    }
+
     #[test]
     fn scan_sees_changes_and_respects_ignores() {
         let d = crate::git::tests::temp_repo();
         std::fs::write(d.join(".gitignore"), "node_modules/\n*.log\n.env*\n").unwrap();
-        let mut s = Scanner { root: d.clone(), ignore: None, ignored: HashMap::new(), files: HashMap::new(), env: HashMap::new(), gitignores: HashMap::new(), warned: HashSet::new(), dirty_index: false, drive: None, root_id: None, home: PathBuf::from("/nonexistent") };
-        let mut first: Vec<String> = s.scan().unwrap().files.into_iter().map(|c| c.0).collect();
+        let mut s = Scanner { root: d.clone(), ignore: None, ignored: HashMap::new(), files: HashMap::new(), env: HashMap::new(), gitignores: HashMap::new(), warned: HashSet::new(), keyed: HashMap::new(), dirty_index: false, drive: None, root_id: None, home: PathBuf::from("/nonexistent") };
+        let mut first: Vec<String> = scan(&mut s).unwrap().files.into_iter().map(|c| c.0).collect();
         first.sort();
         assert_eq!(first, [".gitignore", "a.txt"]);
         std::fs::create_dir_all(d.join("node_modules/x")).unwrap();
@@ -396,21 +408,27 @@ mod tests {
         std::fs::write(d.join(".env"), "SECRET=1").unwrap();
         std::fs::create_dir_all(d.join("src")).unwrap();
         std::fs::write(d.join("src/b.ts"), "b").unwrap();
-        let c = s.scan().unwrap();
+        let c = scan(&mut s).unwrap();
         assert_eq!(c.files, vec![("src/b.ts".to_string(), Some(b"b".to_vec()))]);
         assert_eq!(c.env, vec![(".env".to_string(), Some(b"SECRET=1".to_vec()), true)]);
-        assert!(s.scan().unwrap().files.is_empty());
+        assert!(scan(&mut s).unwrap().files.is_empty());
         // targeted checks
         std::fs::write(d.join("src/b.ts"), "b2").unwrap();
         std::fs::write(d.join("node_modules/x/i.js"), "y").unwrap();
-        let c = s.check(&["src/b.ts".into(), "node_modules/x/i.js".into()]).unwrap();
+        let c = check(&mut s, &["src/b.ts".into(), "node_modules/x/i.js".into()]).unwrap();
         assert_eq!(c.files, vec![("src/b.ts".to_string(), Some(b"b2".to_vec()))]);
         std::fs::remove_dir_all(d.join("src")).unwrap();
-        assert_eq!(s.check(&["src".into()]).unwrap().files, vec![("src/b.ts".to_string(), None)]);
+        assert_eq!(check(&mut s, &["src".into()]).unwrap().files, vec![("src/b.ts".to_string(), None)]);
         // hilo's own writes are not reported back
         let st = fsops::write(&d, "w.txt", Some(b"mine")).unwrap();
         s.note("w.txt", st, sha256(b"mine"));
-        assert!(s.check(&["w.txt".into()]).unwrap().files.is_empty());
+        assert!(check(&mut s, &["w.txt".into()]).unwrap().files.is_empty());
+        // "" (the root) later in a batch still reports what the earlier paths found
+        std::fs::write(d.join("a.txt"), "a2").unwrap();
+        assert_eq!(check(&mut s, &["a.txt".into(), "".into()]).unwrap().files, vec![("a.txt".to_string(), Some(b"a2".to_vec()))]);
+        // a file holding a key is not re-read while it stays the same
+        std::fs::write(d.join("k.txt"), "AKIAABCDEFGHIJKLMNOP").unwrap();
+        assert!(scan(&mut s).unwrap().files.is_empty() && s.keyed.contains_key("k.txt"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -445,18 +463,36 @@ mod tests {
             v.sort();
             v
         };
-        let c = s.scan().unwrap();
+        let c = scan(&mut s).unwrap();
         assert_eq!(names(&c), [".gitignore", "a.txt", "sub/.gitignore", "sub/b.txt", "sub/deep/c.txt", "sub/keep.log"]);
         assert!(c.env.is_empty());
-        assert!(s.check(&["nested/n.txt".into(), "nested".into(), ".env".into()]).unwrap().files.is_empty());
+        assert!(check(&mut s, &["nested/n.txt".into(), "nested".into(), ".env".into()]).unwrap().files.is_empty());
         // a .gitignore change re-reads everything: x.log now syncs, deep/ stops (still on disk: not a deletion)
         std::fs::write(d.join(".gitignore"), "deep/\n").unwrap();
-        assert_eq!(names(&s.scan().unwrap()), [".gitignore", "sub/x.log"]);
+        assert_eq!(names(&scan(&mut s).unwrap()), [".gitignore", "sub/x.log"]);
         assert!(!s.files.contains_key("sub/deep/c.txt"));
         std::fs::remove_file(d.join("a.txt")).unwrap();
-        assert_eq!(s.check(&["a.txt".into()]).unwrap().files, vec![("a.txt".to_string(), None)]);
+        assert_eq!(check(&mut s, &["a.txt".into()]).unwrap().files, vec![("a.txt".to_string(), None)]);
         std::fs::remove_dir_all(&d).unwrap();
-        assert!(s.scan().is_err()); // the folder is gone: an error, not every file deleted
+        assert!(scan(&mut s).is_err()); // the folder is gone: an error, not every file deleted
+    }
+
+    #[test]
+    fn changes_survive_a_failed_walk() {
+        let _home = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        let d = std::env::temp_dir().join(format!("hilo-partial-{}", hex(&crate::crypto::random::<4>())));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".gitignore"), "x\n").unwrap();
+        std::fs::write(d.join("a.txt"), "a").unwrap();
+        let d = std::fs::canonicalize(&d).unwrap();
+        let mut s = Scanner::drive(&d, &format!("t{}", hex(&crate::crypto::random::<4>())));
+        scan(&mut s).unwrap();
+        // new rules ignore everything, itself too: the rescan they trigger fails (an emptied drive)
+        std::fs::write(d.join(".gitignore"), "*\n.*\n").unwrap();
+        let mut c = Changes::default();
+        assert!(s.check(&[".gitignore".into()], &mut c).is_err());
+        assert_eq!(c.files, vec![(".gitignore".to_string(), Some(b"*\n.*\n".to_vec()))]);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
@@ -470,25 +506,25 @@ mod tests {
         let d = std::fs::canonicalize(&d).unwrap();
         let label = format!("t{}", hex(&crate::crypto::random::<4>()));
         let mut s = Scanner::drive(&d, &label);
-        assert_eq!(s.scan().unwrap().files.len(), 2);
+        assert_eq!(scan(&mut s).unwrap().files.len(), 2);
         s.save_index().unwrap();
         // everything deleted at once (or the volume's contents vanished): not a mass delete
         std::fs::remove_file(d.join("a.txt")).unwrap();
         std::fs::remove_file(d.join("sub/b.txt")).unwrap();
-        assert!(s.scan().is_err());
+        assert!(scan(&mut s).is_err());
         // deletions the watcher reports one by one still sync
-        assert_eq!(s.check(&["a.txt".into()]).unwrap().files, vec![("a.txt".to_string(), None)]);
+        assert_eq!(check(&mut s, &["a.txt".into()]).unwrap().files, vec![("a.txt".to_string(), None)]);
         std::fs::write(d.join("a.txt"), "a").unwrap();
         std::fs::write(d.join("sub/b.txt"), "b").unwrap();
-        s.scan().unwrap();
+        scan(&mut s).unwrap();
         s.save_index().unwrap();
         // the folder moved away and an empty one took its place (or an unmounted mount point)
         let away = d.with_extension("away");
         std::fs::rename(&d, &away).unwrap();
         std::fs::create_dir(&d).unwrap();
-        assert!(s.scan().is_err() && s.root_ok().is_err());
+        assert!(scan(&mut s).is_err() && s.root_ok().is_err());
         let mut again = Scanner::drive(&d, &label); // a restart remembers which folder it was
-        assert!(again.root_ok().is_err() && again.scan().is_err());
+        assert!(again.root_ok().is_err() && scan(&mut again).is_err());
         // the same folder back: fine
         std::fs::remove_dir(&d).unwrap();
         std::fs::rename(&away, &d).unwrap();
@@ -498,7 +534,7 @@ mod tests {
         std::fs::create_dir(&d).unwrap();
         std::fs::write(d.join("c.txt"), "c").unwrap();
         again.reset_root();
-        assert_eq!(again.scan().unwrap().files, vec![("c.txt".to_string(), Some(b"c".to_vec()))]);
+        assert_eq!(scan(&mut again).unwrap().files, vec![("c.txt".to_string(), Some(b"c".to_vec()))]);
         std::fs::remove_dir_all(&d).unwrap();
         std::fs::remove_dir_all(&away).unwrap();
     }

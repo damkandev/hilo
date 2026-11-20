@@ -164,14 +164,15 @@ fn call_tool(name: &str, args: &Json, session: &str, call: Call) -> (bool, Strin
             return (false, r.unwrap_or_else(|_| format!("{NOT_RUNNING}; go ahead")));
         }
         "read" => locate(call, &path).and_then(|(root, rel)| {
-            if rel.is_empty() || root.join(&rel).is_dir() {
+            let p = root.join(&rel);
+            let m = std::fs::metadata(&p);
+            if rel.is_empty() || m.as_ref().is_ok_and(|m| m.is_dir()) {
                 return Err(format!("{path} is a folder: use list"));
             }
             if is_secret(&rel) {
                 return Err(format!("{rel}: secret files are not readable here (hilo keeps .env values in its vault)"));
             }
-            let p = root.join(&rel);
-            match std::fs::metadata(&p) {
+            match m {
                 Ok(m) if !m.is_file() => Err(format!("{rel}: not a regular file")), // a FIFO would block forever
                 Ok(m) if m.len() > fsops::MAX_FILE => Err(format!("{rel}: too large ({} bytes)", m.len())),
                 _ => std::fs::read(&p).map_err(|e| format!("{rel}: {e}")).map(|d| render(&d, num(args, "offset").unwrap_or(1), num(args, "limit"))),
@@ -271,7 +272,7 @@ pub fn run() -> i32 {
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let Some(resp) = handle(&line, &session, &call) else { continue };
-        if writeln!(out, "{}", resp.to_string()).and_then(|_| out.flush()).is_err() {
+        if writeln!(out, "{resp}").and_then(|_| out.flush()).is_err() {
             break;
         }
     }

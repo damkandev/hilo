@@ -6,7 +6,7 @@ use crate::daemon::{Ev, Shared};
 use crate::lease;
 use crate::wire::{read_frame, write_frame, Msg, Rd, W};
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Sender};
@@ -20,7 +20,23 @@ pub fn socket_path() -> PathBuf {
     }
     // sun_path is ~104 bytes on macOS: deep HILO_HOMEs get a short, stable name instead
     let h = crate::crypto::hex(&crate::crypto::sha256(p.as_os_str().as_encoded_bytes()));
-    std::env::temp_dir().join(format!("hilo-{}.sock", &h[..12]))
+    std::env::temp_dir().join(format!("hilo-{}", &h[..12])).join("hilo.sock")
+}
+
+/// The socket path. A fallback in the temp dir (which others may write to) must sit in a 0700
+/// folder owned by whoever owns the hilo home, or it is refused.
+fn checked_path() -> io::Result<PathBuf> {
+    let p = socket_path();
+    let (Some(d), home) = (p.parent(), crate::config::home()) else { return Ok(p) };
+    if d == home {
+        return Ok(p);
+    }
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(d);
+    let (m, owner) = (std::fs::symlink_metadata(d)?, std::fs::metadata(&home)?.uid());
+    if !m.is_dir() || m.uid() != owner || m.mode() & 0o077 != 0 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} is not a private folder of yours", d.display())));
+    }
+    Ok(p)
 }
 
 fn encode(args: &[String]) -> Vec<u8> {
@@ -39,7 +55,7 @@ fn decode(b: &[u8]) -> Option<Vec<String>> {
 }
 
 pub fn serve(sh: Arc<Shared>, tx: Sender<Ev>) -> io::Result<()> {
-    let p = socket_path();
+    let p = checked_path()?;
     let _ = std::fs::remove_file(&p);
     let l = UnixListener::bind(&p)?;
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
@@ -136,7 +152,7 @@ fn reply(s: &mut UnixStream, code: u8, text: String) -> io::Result<()> {
 
 /// Sends a request to the local daemon.
 pub fn call(args: &[String], timeout: Duration) -> io::Result<(u8, String)> {
-    let mut s = UnixStream::connect(socket_path())?;
+    let mut s = UnixStream::connect(checked_path()?)?;
     s.set_read_timeout(Some(timeout))?;
     s.set_write_timeout(Some(timeout))?;
     write_frame(&mut s, &encode(args))?;

@@ -181,6 +181,7 @@ impl Store {
             f.write_all(d)?;
             f.sync_all()?;
             std::fs::rename(tmp, p)?;
+            File::open(self.root.join("objects"))?.sync_all()?; // the rename itself
             self.sizes.insert(hash, d.len() as u64);
         }
         let e = Entry { t_ms: now_ms(), unit: unit.into(), path: path.into(), hash, kind, origin: origin.into() };
@@ -237,7 +238,7 @@ impl Store {
             .filter_map(|(_, ix)| ix.last().map(|&i| &self.entries[i]))
             .filter(|e| e.hash == NONE)
             .collect();
-        v.sort_by(|a, b| b.t_ms.cmp(&a.t_ms));
+        v.sort_by_key(|e| std::cmp::Reverse(e.t_ms));
         v
     }
 
@@ -318,12 +319,11 @@ impl Store {
     /// it is this path's newest version) and the new version (as `kind`), both synced to disk.
     /// Nothing is written unless both are kept.
     pub fn keep_and_write(&mut self, root: &Path, unit: &str, path: &str, data: Option<&[u8]>, kind: Kind, origin: &str) -> io::Result<Option<Stamp>> {
-        let p = root.join(path);
-        let disk = std::fs::symlink_metadata(&p).ok().filter(|m| m.is_file()).and_then(|_| std::fs::read(&p).ok());
-        if let Some(d) = &disk {
-            let dh = hash_of(Some(d));
-            if self.history(unit, path).first().map(|e| e.hash) != Some(dh) {
-                self.put(unit, path, Some(d), Kind::Replaced, "")?;
+        // a file there that can't be read is an error: it would be overwritten without a copy
+        if let Some(d) = fsops::read(root, path)? {
+            let newest = self.by_key.get(&(unit.to_string(), path.to_string())).and_then(|v| v.last());
+            if newest.map(|&i| self.entries[i].hash) != Some(hash_of(Some(&d))) {
+                self.put(unit, path, Some(&d), Kind::Replaced, "")?;
             }
         }
         self.put(unit, path, data, kind, origin)?;
@@ -447,6 +447,11 @@ mod tests {
         assert!(s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "devbox").is_err());
         assert_eq!(std::fs::read(root.join("f")).unwrap(), b"mine, never synced");
         std::fs::set_permissions(d.join("store/objects"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        // a file that can't be read can't be kept: not overwritten either
+        std::fs::set_permissions(root.join("f"), std::fs::Permissions::from_mode(0o200)).unwrap();
+        assert!(s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "devbox").is_err());
+        std::fs::set_permissions(root.join("f"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read(root.join("f")).unwrap(), b"mine, never synced");
         s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "devbox").unwrap();
         assert_eq!(std::fs::read(root.join("f")).unwrap(), b"theirs");
         let h: Vec<Kind> = s.history("u", "f").iter().map(|e| e.kind).collect();

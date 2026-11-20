@@ -14,6 +14,28 @@ fn sh_quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"))
 }
 
+/// A config file's text: None if it doesn't exist. Any other error (no permission, not UTF-8) is
+/// returned, so a file we couldn't read is never overwritten as if it were empty.
+fn read(p: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        r => r.map(Some),
+    }
+}
+
+/// Atomic replace: temp file + rename next to the real file (a symlinked dotfile stays a symlink),
+/// keeping its permissions.
+fn write(p: &Path, text: &str) -> std::io::Result<()> {
+    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut tmp = p.clone().into_os_string();
+    tmp.push(".hilo-tmp");
+    std::fs::write(&tmp, text)?;
+    if let Ok(m) = std::fs::metadata(&p) {
+        std::fs::set_permissions(&tmp, m.permissions())?;
+    }
+    std::fs::rename(&tmp, &p)
+}
+
 fn is_ours(cmd: &str) -> bool {
     cmd.contains("hilo") && (cmd.ends_with(" hook pre") || cmd.ends_with(" hook post") || cmd.ends_with(" hook stop"))
 }
@@ -53,11 +75,19 @@ fn claude(bin: &Path, add: bool) -> Option<String> {
         return None;
     }
     let p = dir.join("settings.json");
-    let text = std::fs::read_to_string(&p).unwrap_or_else(|_| "{}".into());
-    let Some(mut j @ Json::Obj(_)) = Json::parse(&text) else {
+    let text = match read(&p) {
+        Ok(t) => t,
+        Err(e) => return Some(format!("skipped {}: {e}", p.display())),
+    };
+    let Some(mut j @ Json::Obj(_)) = Json::parse(text.as_deref().unwrap_or("{}")) else {
         return Some(format!("skipped {}: could not parse it", p.display()));
     };
-    let _ = std::fs::write(dir.join("settings.json.hilo-bak"), &text);
+    if let Some(t) = &text {
+        // the first backup is the user's own file: later runs must not replace it with ours
+        use std::io::Write;
+        let bak = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("settings.json.hilo-bak"));
+        let _ = bak.and_then(|mut f| f.write_all(t.as_bytes()));
+    }
     strip_claude(&mut j);
     if add {
         let b = sh_quote(bin);
@@ -81,13 +111,13 @@ fn claude(bin: &Path, add: bool) -> Option<String> {
             d.extend(DENY.iter().map(|s| Json::s(s)));
         }
     }
-    std::fs::write(&p, j.pretty()).ok()?;
+    write(&p, &j.pretty()).ok()?;
     Some(format!("{} hooks in {}", if add { "added" } else { "removed" }, p.display()))
 }
 
 /// Replaces (or removes) the text between our markers.
 fn marked_block(p: &Path, begin: &str, end: &str, body: Option<&str>) -> bool {
-    let text = std::fs::read_to_string(p).unwrap_or_default();
+    let Ok(text) = read(p).map(Option::unwrap_or_default) else { return false };
     let mut out = String::new();
     let mut skip = false;
     for l in text.lines() {
@@ -106,7 +136,7 @@ fn marked_block(p: &Path, begin: &str, end: &str, body: Option<&str>) -> bool {
         }
         out.push_str(&format!("{begin}\n{b}\n{end}\n"));
     }
-    out != text && std::fs::write(p, out).is_ok()
+    out != text && write(p, &out).is_ok()
 }
 
 fn codex(bin: &Path, add: bool) -> Vec<String> {
@@ -132,7 +162,10 @@ fn json_mcp(path: PathBuf, key: &str, entry: Json, add: bool) -> Option<String> 
     if !path.parent()?.is_dir() {
         return None;
     }
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
+    let text = match read(&path) {
+        Ok(t) => t.unwrap_or_else(|| "{}".into()),
+        Err(e) => return Some(format!("skipped {}: {e}", path.display())),
+    };
     let mut j @ Json::Obj(_) = Json::parse(&text)? else { return None };
     let servers = j.entry(key, Json::Obj(vec![]));
     if !matches!(servers, Json::Obj(_)) {
@@ -142,7 +175,7 @@ fn json_mcp(path: PathBuf, key: &str, entry: Json, add: bool) -> Option<String> 
     if add {
         servers.entry("hilo", entry);
     }
-    std::fs::write(&path, j.pretty()).ok()?;
+    write(&path, &j.pretty()).ok()?;
     Some(format!("{} MCP server in {}", if add { "added" } else { "removed" }, path.display()))
 }
 
@@ -273,5 +306,21 @@ mod tests {
         }
         strip_claude(&mut j);
         assert_eq!(j, Json::parse(src).unwrap());
+    }
+
+    #[test]
+    fn unreadable_files_are_left_alone_and_links_stay_links() {
+        let d = std::env::temp_dir().join(format!("hilo-inst-{}", crate::crypto::hex(&crate::crypto::random::<4>())));
+        std::fs::create_dir_all(&d).unwrap();
+        let bad = d.join("AGENTS.md");
+        std::fs::write(&bad, b"\xff not utf-8").unwrap();
+        assert!(!marked_block(&bad, "<!-- hilo -->", "<!-- /hilo -->", Some("x")));
+        assert_eq!(std::fs::read(&bad).unwrap(), b"\xff not utf-8");
+        std::fs::write(d.join("real.toml"), "a = 1\n").unwrap();
+        std::os::unix::fs::symlink(d.join("real.toml"), d.join("config.toml")).unwrap();
+        assert!(marked_block(&d.join("config.toml"), "# >>> hilo", "# <<< hilo", Some("b = 2")));
+        assert!(std::fs::symlink_metadata(d.join("config.toml")).unwrap().file_type().is_symlink());
+        assert!(std::fs::read_to_string(d.join("real.toml")).unwrap().contains("b = 2"));
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }
