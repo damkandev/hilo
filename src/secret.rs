@@ -1,7 +1,9 @@
 //! 32-byte secrets: the machine key, vault keys, the local-layer key.
 //! macOS: login Keychain, readable without a prompt only by the hilo binary that created the item.
-//! Elsewhere (or HILO_KEYCHAIN=0, used by tests): ~/.hilo/secrets/<name>, 0600.
+//! Elsewhere (or HILO_KEYCHAIN=0, used by tests): ~/.hilo/secrets/<name>, 0600 (on Windows, the
+//! profile folder's ACL: only the user, SYSTEM and admins).
 // ponytail: Linux keeps 0600 files; the PRD's dedicated `hilo` user needs repos writable by that user, left to deployment.
+// ponytail: Windows keeps plain files too; DPAPI (CryptProtectData) would also cover copies and backups of the folder.
 use crate::crypto::{hex, unhex};
 use std::io;
 

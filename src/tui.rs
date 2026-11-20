@@ -1,6 +1,7 @@
 //! A tiny terminal kit for the setup wizard: prompts with arrow keys, spinners, gradients.
-//! No crates: raw mode through `stty`, everything else is ANSI escapes.
+//! No crates: raw mode through `stty` (the console API on Windows), everything else is ANSI escapes.
 use std::io::{IsTerminal, Read, Write};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -77,35 +78,85 @@ pub fn show_cursor() {
     }
 }
 
+const CANCELLED: &str = "\r\x1b[2K\x1b[?25h\x1b[38;2;248;113;113m✖\x1b[39m cancelled\n";
+
+#[cfg(unix)]
 extern "C" {
     fn signal(sig: i32, handler: usize) -> usize;
     fn write(fd: i32, buf: *const std::ffi::c_void, n: usize) -> isize;
     fn _exit(code: i32) -> !;
 }
 
+#[cfg(unix)]
 extern "C" fn on_interrupt(_: i32) {
-    let s = "\r\x1b[2K\x1b[?25h\x1b[38;2;248;113;113m✖\x1b[39m cancelled\n".as_bytes();
     unsafe {
-        write(1, s.as_ptr().cast(), s.len());
+        write(1, CANCELLED.as_ptr().cast(), CANCELLED.len());
         _exit(130);
     }
 }
 
 /// Ctrl-C while a spinner runs: give the cursor back before leaving.
+#[cfg(unix)]
 pub fn guard_interrupt() {
     unsafe { signal(2, on_interrupt as *const () as usize) };
 }
 
+#[cfg(windows)]
+mod con {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GetStdHandle(which: u32) -> *mut c_void;
+        pub fn GetConsoleMode(h: *mut c_void, mode: *mut u32) -> i32;
+        pub fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
+        pub fn SetConsoleCtrlHandler(f: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    }
+    pub const STDIN: u32 = -10i32 as u32;
+    pub const STDOUT: u32 = -11i32 as u32;
+    pub const STDERR: u32 = -12i32 as u32;
+
+    pub fn mode(which: u32) -> Option<u32> {
+        let mut m = 0;
+        (unsafe { GetConsoleMode(GetStdHandle(which), &mut m) } != 0).then_some(m)
+    }
+    pub fn set_mode(which: u32, m: u32) {
+        unsafe { SetConsoleMode(GetStdHandle(which), m) };
+    }
+}
+
+/// Lets the console run the ANSI escapes everything here prints (old conhost doesn't by default).
+#[cfg(windows)]
+pub fn enable_vt() {
+    for h in [con::STDOUT, con::STDERR] {
+        if let Some(m) = con::mode(h) {
+            con::set_mode(h, m | 0x4); // ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        }
+    }
+}
+
+/// Ctrl-C while a spinner runs: give the cursor back before leaving.
+#[cfg(windows)]
+pub fn guard_interrupt() {
+    unsafe extern "system" fn on_ctrl(_: u32) -> i32 {
+        let _ = std::io::stdout().write_all(CANCELLED.as_bytes());
+        std::process::exit(130)
+    }
+    unsafe { con::SetConsoleCtrlHandler(Some(on_ctrl), 1) };
+}
+
 // ---------- raw keys ----------
 
+#[cfg(unix)]
 struct Raw(Option<String>);
 
+#[cfg(unix)]
 fn stty(args: &[&str]) -> Option<String> {
     let tty = std::fs::File::open("/dev/tty").ok()?;
     let o = Command::new("stty").args(args).stdin(tty).stderr(Stdio::null()).output().ok()?;
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+#[cfg(unix)]
 impl Raw {
     fn on() -> Raw {
         let saved = stty(&["-g"]);
@@ -113,12 +164,48 @@ impl Raw {
         Raw(saved)
     }
 }
+#[cfg(unix)]
 impl Drop for Raw {
     fn drop(&mut self) {
         if let Some(s) = &self.0 {
             stty(&[s]);
         }
     }
+}
+
+#[cfg(unix)]
+fn tty() -> std::io::Result<std::fs::File> {
+    std::fs::File::open("/dev/tty")
+}
+
+/// Windows: no line editing, echo or Ctrl-C processing (Ctrl-C arrives as byte 3, like `-isig`), and
+/// arrows as the same ESC [ A..D sequences a Unix terminal sends.
+#[cfg(windows)]
+struct Raw(Option<u32>);
+
+#[cfg(windows)]
+impl Raw {
+    fn on() -> Raw {
+        let saved = con::mode(con::STDIN);
+        if let Some(m) = saved {
+            con::set_mode(con::STDIN, (m & !(0x1 | 0x2 | 0x4)) | 0x200); // -processed -line -echo, +VT input
+        }
+        Raw(saved)
+    }
+}
+#[cfg(windows)]
+impl Drop for Raw {
+    fn drop(&mut self) {
+        if let Some(m) = self.0 {
+            con::set_mode(con::STDIN, m);
+        }
+    }
+}
+
+/// std reads a console stdin as UTF-16 and hands back UTF-8, which is what `key` expects.
+#[cfg(windows)]
+fn tty() -> std::io::Result<std::io::Stdin> {
+    Ok(std::io::stdin())
 }
 
 #[derive(Debug, PartialEq)]
@@ -136,7 +223,7 @@ enum Key {
 }
 
 fn key() -> Key {
-    let mut tty = match std::fs::File::open("/dev/tty") {
+    let mut tty = match tty() {
         Ok(t) => t,
         Err(_) => return Key::Cancel,
     };
@@ -440,8 +527,8 @@ pub fn card(lines: &[String]) {
 /// `~/x` for paths under HOME.
 pub fn tilde(p: &std::path::Path) -> String {
     let s = p.to_string_lossy().into_owned();
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
+    match crate::config::user_home().and_then(|h| h.to_str().map(str::to_string)) {
+        Some(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
         _ => s,
     }
 }

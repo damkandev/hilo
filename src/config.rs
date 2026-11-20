@@ -2,13 +2,36 @@
 #![forbid(unsafe_code)]
 use crate::crypto::{hex, hkdf, random, unhex};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+#[cfg(unix)]
+pub use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 
+/// Windows has no mode bits, so `.mode()` is a no-op there: the profile folder the hilo home lives
+/// in is already readable only by its user (and SYSTEM and admins, who could read a 0600 file too).
+#[cfg(windows)]
+pub trait DirBuilderExt {
+    fn mode(&mut self, _: u32) -> &mut Self {
+        self
+    }
+}
+#[cfg(windows)]
+impl DirBuilderExt for std::fs::DirBuilder {}
+#[cfg(windows)]
+pub trait OpenOptionsExt {
+    fn mode(&mut self, _: u32) -> &mut Self {
+        self
+    }
+}
+#[cfg(windows)]
+impl OpenOptionsExt for std::fs::OpenOptions {}
+
+/// The user's home: HOME, or USERPROFILE on Windows (where HOME is usually unset).
+pub fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| if cfg!(windows) { std::env::var_os("USERPROFILE") } else { None }).map(PathBuf::from)
+}
+
 pub fn home() -> PathBuf {
-    std::env::var_os("HILO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".hilo"))
+    std::env::var_os("HILO_HOME").map(PathBuf::from).unwrap_or_else(|| user_home().expect("HOME").join(".hilo"))
 }
 
 pub fn path(name: &str) -> PathBuf {
@@ -90,6 +113,10 @@ pub fn key() -> io::Result<[u8; 32]> {
 pub fn name() -> String {
     if let Some(n) = Config::load().get("name") {
         return n.to_string();
+    }
+    #[cfg(windows)] // hostname.exe has no -s
+    if let Some(n) = std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty()) {
+        return n.to_lowercase();
     }
     std::process::Command::new("hostname")
         .arg("-s")

@@ -46,8 +46,8 @@ pub fn local_ips() -> Vec<(String, String)> {
 // ---------- ssh ----------
 
 fn ssh_hosts() -> Vec<(String, String)> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let text = std::fs::read_to_string(Path::new(&home).join(".ssh/config")).unwrap_or_default();
+    let home = crate::config::user_home().unwrap_or_default();
+    let text = std::fs::read_to_string(home.join(".ssh/config")).unwrap_or_default();
     let mut hosts: Vec<(String, String)> = vec![];
     for l in text.lines() {
         let l = l.trim();
@@ -241,7 +241,11 @@ fn progress() -> HashMap<String, String> {
 fn start_local_daemon_if_needed(service: bool) {
     if !service && progress().is_empty() {
         let log = std::fs::File::create(config::path("daemon.log")).ok();
-        let _ = Command::new(crate::bin()).arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log.map_or(Stdio::null(), Stdio::from)).spawn();
+        let mut c = Command::new(crate::bin());
+        c.arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log.map_or(Stdio::null(), Stdio::from));
+        #[cfg(windows)] // or closing the wizard's console takes the daemon with it
+        crate::detach(&mut c);
+        let _ = c.spawn();
     }
 }
 
@@ -322,7 +326,7 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
                     crate::join_core(&c, &Opts { folder: Some(folder.clone()), service, ..Default::default() })?;
                 }
                 None => {
-                    let path = std::fs::canonicalize(&folder).map_err(|e| e.to_string())?;
+                    let path = crate::fsops::canonical(&folder).map_err(|e| e.to_string())?;
                     if ipc::call(&ipc::args(&["add", &path.to_string_lossy()]), Duration::from_secs(30)).is_err() {
                         let mut cfg = Config::load();
                         cfg.add("folder", &path.to_string_lossy());
@@ -350,7 +354,7 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
                     rr.hilo(&format!("add {rf2}"))?;
                 }
             }
-            let path = std::fs::canonicalize(&folder).map_err(|e| e.to_string())?;
+            let path = crate::fsops::canonical(&folder).map_err(|e| e.to_string())?;
             let _ = ipc::call(&ipc::args(&["add", &path.to_string_lossy()]), Duration::from_secs(30));
             Ok(((), format!("{} joined this machine", rr.host)))
         })?;
@@ -414,7 +418,7 @@ fn guess_folder() -> PathBuf {
     if !crate::repos_in(&cwd).is_empty() {
         return cwd;
     }
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let home = crate::config::user_home().unwrap_or_default();
     ["codigo", "Codigo", "code", "Code", "projects", "Projects", "dev", "src"]
         .iter()
         .map(|d| home.join(d))
@@ -424,14 +428,14 @@ fn guess_folder() -> PathBuf {
 
 fn expand(p: &str) -> PathBuf {
     match p.strip_prefix("~") {
-        Some(rest) => PathBuf::from(format!("{}{rest}", std::env::var("HOME").unwrap_or_default())),
+        Some(rest) => PathBuf::from(format!("{}{rest}", crate::config::user_home().unwrap_or_default().display())),
         None => PathBuf::from(p),
     }
 }
 
 /// The same folder on the remote: same path under home, matching an existing dir regardless of case.
 fn remote_default(local: &Path, r: &Remote) -> String {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let home = crate::config::user_home().unwrap_or_default();
     let rel = local.strip_prefix(&home).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| local.file_name().unwrap_or_default().to_string_lossy().into_owned());
     let first = rel.split('/').next().unwrap_or(&rel);
     let fixed = r.dirs.iter().find(|d| d.eq_ignore_ascii_case(first)).cloned().unwrap_or_else(|| first.to_string());
@@ -445,7 +449,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         return if tui::interactive() { wizard() } else { Err("usage: hilo setup HOST [--folder DIR]".into()) };
     };
     tui::guard_interrupt();
-    let local_folder = std::fs::canonicalize(expand(&flag("--folder").unwrap_or_else(|| guess_folder().to_string_lossy().into()))).map_err(|e| format!("folder: {e}"))?;
+    let local_folder = crate::fsops::canonical(expand(&flag("--folder").unwrap_or_else(|| guess_folder().to_string_lossy().into()))).map_err(|e| format!("folder: {e}"))?;
     let h = host.clone();
     let remote = tui::step(&format!("Connecting to {host}"), move |_| {
         let r = probe(&h)?;
@@ -500,7 +504,7 @@ fn ask_folder(default: &Path) -> Result<PathBuf, String> {
     loop {
         let a = tui::input("Which folder should stay in sync?", &tui::tilde(default)).map_err(cancelled)?;
         let p = expand(a.trim());
-        match std::fs::canonicalize(&p) {
+        match crate::fsops::canonical(&p) {
             Ok(p) if p.is_dir() => {
                 let repos = crate::repos_in(&p);
                 let names: Vec<String> = repos.iter().take(6).map(|r| r.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();

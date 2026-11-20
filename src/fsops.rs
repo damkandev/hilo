@@ -1,10 +1,14 @@
 //! Validating and writing paths that arrive from other machines.
 //! The receiver trusts nothing the sender validated.
 use crate::crypto::{hex, random};
+#[cfg(unix)]
 use std::ffi::{c_char, c_int, CString};
+#[cfg(unix)]
 use std::fs::File;
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -28,7 +32,38 @@ pub fn valid_path(p: &str) -> bool {
         && p.len() <= 4096
         && !p.starts_with('/')
         && !p.contains('\0')
-        && p.split('/').all(|c| !c.is_empty() && c != "." && c != ".." && c.len() <= 255 && !is_dotgit(c))
+        && p.split('/').all(|c| !c.is_empty() && c != "." && c != ".." && c.len() <= 255 && !is_dotgit(c) && (!cfg!(windows) || win_ok(c)))
+}
+
+/// Names Windows can't hold, or that alias another name there: `a\b` is two components, `a:b` a
+/// stream of `a`, `.git.` and `.git ` are `.git`, `GIT~1` its 8.3 short name, `NUL` a device.
+fn win_ok(c: &str) -> bool {
+    let stem = c.split('.').next().unwrap_or(c).trim_end().to_ascii_uppercase();
+    let device = ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str())
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit());
+    !device && !c.ends_with(['.', ' ']) && !c.contains(['\\', ':', '*', '?', '"', '<', '>', '|']) && !c.chars().any(char::is_control) && !c.eq_ignore_ascii_case("git~1")
+}
+
+/// `std::fs::canonicalize` without Windows' `\\?\` prefix: a verbatim path takes no `/` as a separator
+/// (so `root.join("a/b")` would break) and never equals the plain paths git and agents hand us.
+pub fn canonical(p: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let c = std::fs::canonicalize(p)?;
+    #[cfg(windows)]
+    if let Some(s) = c.to_str() {
+        if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{unc}")));
+        }
+        if let Some(d) = s.strip_prefix(r"\\?\").filter(|d| d.as_bytes().get(1) == Some(&b':')) {
+            return Ok(PathBuf::from(d));
+        }
+    }
+    Ok(c)
+}
+
+/// A relative local path as hilo writes it everywhere: `/`-separated (Windows says `a\b`).
+pub fn slash(p: &Path) -> Option<String> {
+    let s = p.to_str()?;
+    Some(if cfg!(windows) { s.replace('\\', "/") } else { s.to_string() })
 }
 
 /// `.env`, `.env.local`, ... (not `.env.example`, which belongs in git). They travel through the vault.
@@ -117,6 +152,7 @@ mod c {
     pub type Mode = u32;
 }
 
+#[cfg(unix)]
 extern "C" {
     fn openat(fd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
     fn mkdirat(fd: c_int, path: *const c_char, mode: c::Mode) -> c_int;
@@ -124,14 +160,17 @@ extern "C" {
     fn unlinkat(fd: c_int, path: *const c_char, flags: c_int) -> c_int;
 }
 
+#[cfg(unix)]
 fn cstr(s: &str) -> io::Result<CString> {
     CString::new(s).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "nul in path"))
 }
 
+#[cfg(unix)]
 fn check(r: c_int) -> io::Result<c_int> {
     if r < 0 { Err(io::Error::last_os_error()) } else { Ok(r) }
 }
 
+#[cfg(unix)]
 fn open_at(dir: &OwnedFd, name: &str, flags: c_int, mode: u32) -> io::Result<OwnedFd> {
     let n = cstr(name)?;
     let fd = check(unsafe { openat(dir.as_raw_fd(), n.as_ptr(), flags | c::O_NOFOLLOW | c::O_CLOEXEC, mode) })?;
@@ -159,6 +198,7 @@ fn case_twin(dir: &Path, name: &str) -> io::Result<()> {
 }
 
 /// Opens every parent of `rel` with O_NOFOLLOW, creating missing ones if asked.
+#[cfg(unix)]
 fn open_parent(root: &Path, rel: &str, create: bool) -> io::Result<(OwnedFd, PathBuf, String)> {
     if !valid_path(rel) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path"));
@@ -185,6 +225,7 @@ fn open_parent(root: &Path, rel: &str, create: bool) -> io::Result<(OwnedFd, Pat
 
 pub type Stamp = (i64, i64, u64, u64); // mtime s, mtime ns, size, inode
 
+#[cfg(unix)]
 pub fn stamp(m: &std::fs::Metadata) -> Stamp {
     use std::os::unix::fs::MetadataExt;
     (m.mtime(), m.mtime_nsec(), m.size(), m.ino())
@@ -196,6 +237,7 @@ pub fn write(root: &Path, rel: &str, data: Option<&[u8]>) -> io::Result<Option<S
 
 /// Atomic write (O_EXCL temp + renameat) or delete. Keeps the existing mode bits (`new_mode` for new files),
 /// never setuid/setgid. Returns the written file's stamp, so the scanner doesn't re-read it.
+#[cfg(unix)]
 pub fn write_mode(root: &Path, rel: &str, data: Option<&[u8]>, new_mode: u32) -> io::Result<Option<Stamp>> {
     let Some(data) = data else {
         let (dir, _, name) = match open_parent(root, rel, false) {
@@ -241,6 +283,104 @@ pub fn write_mode(root: &Path, rel: &str, data: Option<&[u8]>, new_mode: u32) ->
     res
 }
 
+/// (device, inode) of a directory: tells a drive folder from another one later put at its path.
+#[cfg(unix)]
+pub fn dir_id(p: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(p)?;
+    Ok((m.dev(), m.ino()))
+}
+
+// ---- Windows: no openat. Every parent is checked to be a real directory, not a symlink or junction ----
+// ponytail: check-then-use, so a parent swapped for a junction between the check and the write wins
+// the race; per-component handles (NtCreateFile relative to the parent's handle) would close it.
+
+#[cfg(windows)]
+fn open_parent(root: &Path, rel: &str, create: bool) -> io::Result<(PathBuf, String)> {
+    if !valid_path(rel) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path"));
+    }
+    let mut at = root.to_path_buf();
+    let mut comps: Vec<&str> = rel.split('/').collect();
+    let name = comps.pop().unwrap().to_string();
+    for comp in comps {
+        case_twin(&at, comp)?;
+        at.push(comp);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.is_dir() => {} // std reports symlinks and junctions as symlinks, never as dirs
+            Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{comp} is a link or a file"))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && create => std::fs::create_dir(&at)?,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((at, name))
+}
+
+/// 100 ns ticks since 1601. No inode: std has no stable file index, and directory listings carry none.
+#[cfg(windows)]
+pub fn stamp(m: &std::fs::Metadata) -> Stamp {
+    use std::os::windows::fs::MetadataExt;
+    let t = m.last_write_time();
+    ((t / 10_000_000) as i64, (t % 10_000_000 * 100) as i64, m.file_size(), 0)
+}
+
+/// Atomic write (create_new temp + rename, which replaces on Windows) or delete. No mode bits to keep.
+#[cfg(windows)]
+pub fn write_mode(root: &Path, rel: &str, data: Option<&[u8]>, _new_mode: u32) -> io::Result<Option<Stamp>> {
+    let Some(data) = data else {
+        let (at, name) = match open_parent(root, rel, false) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            r => r?,
+        };
+        return match std::fs::remove_file(at.join(name)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            r => r.map(|_| None),
+        };
+    };
+    if data.len() as u64 > MAX_FILE {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "file too large"));
+    }
+    let (at, name) = open_parent(root, rel, true)?;
+    case_twin(&at, &name)?;
+    let target = at.join(&name);
+    match std::fs::symlink_metadata(&target) {
+        Ok(m) if !m.is_file() => return Err(io::Error::new(io::ErrorKind::InvalidInput, "target is not a regular file")),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let tmp = at.join(format!("{TMP_PREFIX}{}", hex(&random::<8>())));
+    let res = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(data)?;
+        let st = stamp(&f.metadata()?); // rename keeps mtime
+        drop(f);
+        std::fs::rename(&tmp, &target).map(|_| Some(st))
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// (volume serial, file index) of a directory, Windows' (device, inode). Not in stable std.
+#[cfg(windows)]
+pub fn dir_id(p: &Path) -> io::Result<(u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(h: *mut std::ffi::c_void, info: *mut [u32; 13]) -> i32;
+    }
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000; // needed to open a directory
+    let f = std::fs::OpenOptions::new().access_mode(0).custom_flags(BACKUP_SEMANTICS).open(p)?;
+    // BY_HANDLE_FILE_INFORMATION: attributes, 3 FILETIMEs, volume serial, size hi/lo, links, index hi/lo
+    let mut i = [0u32; 13];
+    if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut i) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((i[7] as u64, (i[11] as u64) << 32 | i[12] as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,9 +402,16 @@ mod tests {
         assert!(!has_secret(b"data:font/woff2;base64,xxAKIAAgAAAJwApgACAAAAnACqyy")); // base64 blob
         assert!(!has_secret(b" AKIAowAAgAAAogCkluQPWACi ")); // lowercase: not an AWS id
         assert!(has_secret(b"-----BEGIN OPENSSH PRIVATE KEY-----"));
+        for bad in ["a\\b", "f:s", ".git.", ".git ", "GIT~1", "nul", "Com1.txt", "x?", "a."] {
+            assert!(!win_ok(bad), "{bad:?}");
+        }
+        for ok in ["a.txt", ".gitignore", "console.log", "com10", "nullish.ts"] {
+            assert!(win_ok(ok), "{ok:?}");
+        }
     }
 
     #[test]
+    #[cfg(unix)] // symlinks and mode bits
     fn writes_refuse_symlinked_parents() {
         let base = std::env::temp_dir().join(format!("hilo-fs-{}", hex(&random::<4>())));
         let root = base.join("repo");

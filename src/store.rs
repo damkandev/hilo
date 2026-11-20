@@ -12,7 +12,7 @@ use crate::wire::{Rd, W};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use crate::config::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -433,6 +433,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // mode bits
     fn no_overwrite_without_a_copy() {
         use std::os::unix::fs::PermissionsExt;
         let d = tmp();
@@ -459,6 +460,7 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
 
+    #[cfg(unix)]
     fn root_ignores_perms(dir: &Path) -> bool {
         std::fs::write(dir.join("probe"), b"").is_ok_and(|_| std::fs::remove_file(dir.join("probe")).is_ok())
     }
@@ -564,6 +566,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // mode bits
     fn an_unreadable_journal_is_an_error_not_an_empty_store() {
         use std::os::unix::fs::PermissionsExt;
         let d = tmp();
@@ -584,6 +587,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // mode bits
     fn a_failed_prune_leaves_the_store_as_it_was() {
         use std::os::unix::fs::PermissionsExt;
         let d = tmp();

@@ -63,7 +63,8 @@ macro_rules! log {
 
 /// Desktop notification, best effort (HILO_NOTIFY=0 turns it off).
 pub fn notify(msg: &str) {
-    if std::env::var("HILO_NOTIFY").as_deref() == Ok("0") {
+    // ponytail: no Windows toasts (WinRT, or a PowerShell per message); the log has every notice
+    if cfg!(windows) || std::env::var("HILO_NOTIFY").as_deref() == Ok("0") {
         return;
     }
     let msg = msg.to_string();
@@ -163,12 +164,12 @@ pub fn repos_in(dir: &Path) -> Vec<PathBuf> {
 /// One repo if `path` is a repo's top level; otherwise a linked folder (every repo in it, new ones too).
 /// With `drive`, a drive with that label.
 fn register(cfg: &mut Config, path: &Path, drive: Option<&str>) -> Result<String, String> {
-    let path = std::fs::canonicalize(path).map_err(|_| format!("{}: no such folder", path.display()))?;
+    let path = fsops::canonical(path).map_err(|_| format!("{}: no such folder", path.display()))?;
     if let Some(label) = drive {
         daemon::register_drive(cfg, &path, label)?;
         return Ok(format!("drive    {} ({label})", tui::tilde(&path)));
     }
-    let top = git::toplevel(&path).and_then(|t| std::fs::canonicalize(t).ok());
+    let top = git::toplevel(&path).and_then(|t| fsops::canonical(t).ok());
     if let Some(e) = daemon::nests(cfg, &path, if top.as_deref() == Some(path.as_path()) { "repo" } else { "folder" }) {
         return Err(e);
     }
@@ -178,7 +179,7 @@ fn register(cfg: &mut Config, path: &Path, drive: Option<&str>) -> Result<String
         return Ok(format!("repo     {}", tui::tilde(&path)));
     }
     let label = daemon::folder_label(&path);
-    let taken = cfg.all("folder").into_iter().filter_map(|f| std::fs::canonicalize(f).ok()).any(|f| f != path && daemon::folder_label(&f) == label);
+    let taken = cfg.all("folder").into_iter().filter_map(|f| fsops::canonical(f).ok()).any(|f| f != path && daemon::folder_label(&f) == label);
     if taken {
         return Err(format!("another linked folder is already called \"{label}\""));
     }
@@ -217,7 +218,7 @@ fn flag(args: &[String], f: &str) -> Option<String> {
 }
 
 pub fn bin() -> PathBuf {
-    std::env::current_exe().and_then(std::fs::canonicalize).unwrap_or_else(|_| PathBuf::from("hilo"))
+    std::env::current_exe().and_then(fsops::canonical).unwrap_or_else(|_| PathBuf::from("hilo"))
 }
 
 fn setup_common(o: &Opts, cfg: &mut Config) -> Result<(), String> {
@@ -383,16 +384,16 @@ fn duration(s: &str) -> Option<u64> {
 
 /// `--path` on the anchor -> what the token may see: a folder of a drive, or a whole repo.
 fn token_scope(cfg: &Config, p: &str) -> Result<config::Scope, String> {
-    let path = std::fs::canonicalize(p).map_err(|e| format!("{p}: {e}"))?;
+    let path = fsops::canonical(p).map_err(|e| format!("{p}: {e}"))?;
     let dir = if path.is_dir() { path.clone() } else { path.parent().map(Path::to_path_buf).unwrap_or_default() };
-    let repo = git::toplevel(&dir).and_then(|t| std::fs::canonicalize(t).ok());
+    let repo = git::toplevel(&dir).and_then(|t| fsops::canonical(t).ok());
     for (label, root) in cfg.drives() {
-        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let root = fsops::canonical(&root).unwrap_or(root);
         let Ok(rest) = path.strip_prefix(&root) else { continue };
         if repo.as_ref().is_some_and(|r| r.starts_with(&root)) {
             break; // a repo inside the drive: the drive skips it, it syncs as a repo
         }
-        let prefix = rest.to_str().ok_or(format!("{}: not UTF-8", path.display()))?;
+        let prefix = &fsops::slash(rest).ok_or(format!("{}: not UTF-8", path.display()))?;
         return Ok(config::Scope { unit: format!("drive:{label}"), prefix: prefix.to_string() });
     }
     let top = repo.ok_or(format!("{} is not inside a drive or a repo", path.display()))?;
@@ -482,22 +483,58 @@ fn token(args: &[String]) -> Result<(), String> {
 
 /// Starts `hilo daemon` in the background, detached from this shell (no launchd/systemd in a sandbox).
 fn spawn_daemon() -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
-    extern "C" {
-        fn setsid() -> i32;
-    }
     config::ensure_home().map_err(|e| e.to_string())?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(config::path("daemon.log")).map_err(|e| e.to_string())?;
     let mut c = std::process::Command::new(bin());
     c.arg("daemon").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(log);
+    detach(&mut c).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A child that outlives this shell: its own session, so the terminal's hangup doesn't reach it.
+#[cfg(unix)]
+pub fn detach(c: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::unix::process::CommandExt;
+    extern "C" {
+        fn setsid() -> i32;
+    }
     unsafe {
         c.pre_exec(|| {
             setsid();
             Ok(())
-        });
+        })
     }
-    c.spawn().map_err(|e| e.to_string())?;
-    Ok(())
+}
+
+/// Windows: no console (DETACHED_PROCESS) and its own process group, so closing the terminal or a
+/// Ctrl-C there doesn't take the daemon along.
+#[cfg(windows)]
+pub fn detach(c: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    c.creation_flags(0x8 | 0x200)
+}
+
+/// Started at logon from the Run key, the daemon gets a console window of its own: let go of it and
+/// log to daemon.log. Run from a terminal (the shell shares the console) it stays as it is.
+#[cfg(windows)]
+fn leave_own_console() {
+    use std::os::windows::io::IntoRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(list: *mut u32, n: u32) -> u32;
+        fn FreeConsole() -> i32;
+        fn SetStdHandle(which: u32, h: *mut std::ffi::c_void) -> i32;
+    }
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    let mut list = [0u32; 2];
+    if unsafe { GetConsoleProcessList(list.as_mut_ptr(), 2) } != 1 {
+        return;
+    }
+    unsafe { FreeConsole() };
+    let _ = config::ensure_home();
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(config::path("daemon.log")) {
+        unsafe { SetStdHandle(STD_ERROR_HANDLE, f.into_raw_handle()) }; // std looks the handle up on every write
+    }
 }
 
 /// `hilo up`: for setup scripts of cloud agents and dev containers. Joins with HILO_TOKEN (once),
@@ -508,7 +545,7 @@ fn up(args: &[String]) -> Result<(), String> {
     if drive.is_some() {
         std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
     }
-    let folder = std::fs::canonicalize(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    let folder = fsops::canonical(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
     let cfg = Config::load();
     if cfg.get("role").is_none() {
         let token = flag(args, "--token").or_else(|| std::env::var("HILO_TOKEN").ok()).ok_or("set HILO_TOKEN (from `hilo token create` on the anchor)")?;
@@ -563,7 +600,7 @@ fn add(args: &[String]) -> Result<(), String> {
     let label = flag(args, "--as").unwrap_or_default();
     let p = args.iter().enumerate().find(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--as")).ok_or(usage)?.1;
     let mode = if args.iter().any(|a| a == "--drive") || !label.is_empty() { "drive" } else { "auto" }; // only drives have labels
-    let path = std::fs::canonicalize(p).map_err(|_| format!("{p}: no such folder"))?;
+    let path = fsops::canonical(p).map_err(|_| format!("{p}: no such folder"))?;
     if !path.is_dir() {
         return Err(format!("{p} is not a folder"));
     }
@@ -676,13 +713,13 @@ fn run_cmd(args: &[String]) -> Result<i32, String> {
         _ => args,
     };
     let (prog, rest) = cmd.split_first().ok_or("usage: hilo run -- CMD ...")?;
-    let cwd = std::fs::canonicalize(std::env::current_dir().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let cwd = fsops::canonical(std::env::current_dir().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let root = git::toplevel(&cwd).ok_or("not inside a git repo")?;
-    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let root = fsops::canonical(&root).unwrap_or(root);
     let repo = git::repo_id(&root).map_err(|e| e.to_string())?;
     let store = vault::Store::load(&repo);
     let keys = vault::keys();
-    let rel = cwd.strip_prefix(&root).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let rel = cwd.strip_prefix(&root).map(|p| fsops::slash(p).unwrap_or_else(|| p.to_string_lossy().into_owned())).unwrap_or_default();
     let mut dirs = vec![String::new()];
     let mut acc = String::new();
     for part in rel.split('/').filter(|p| !p.is_empty()) {
@@ -722,13 +759,19 @@ fn uninstall() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 extern "C" {
     fn signal(sig: i32, handler: usize) -> usize;
 }
 
 fn main() -> ExitCode {
     // `hilo status | head` should just stop, like any CLI (Rust ignores SIGPIPE by default)
-    unsafe { signal(13, 0) };
+    #[cfg(unix)]
+    unsafe {
+        signal(13, 0)
+    };
+    #[cfg(windows)]
+    tui::enable_vt();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let rest = args.get(1..).unwrap_or_default();
     let res = match args.first().map(String::as_str) {
@@ -743,7 +786,11 @@ fn main() -> ExitCode {
             Ok(())
         }
         Some("setup") => setup::command(rest),
-        Some("daemon") => daemon::run().map_err(|e| e.to_string()),
+        Some("daemon") => {
+            #[cfg(windows)]
+            leave_own_console();
+            daemon::run().map_err(|e| e.to_string())
+        }
         Some("status") => status(rest),
         Some("env") => env(rest),
         Some("run") => match run_cmd(rest) {

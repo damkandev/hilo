@@ -4,13 +4,19 @@ use crate::json::Json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
 const LABEL: &str = "dev.hilo.daemon";
 
 fn home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+    crate::config::user_home().unwrap_or_default()
 }
 
 fn sh_quote(p: &Path) -> String {
+    if cfg!(windows) {
+        // hooks may run under cmd.exe or Git Bash: double quotes mean the same in both, and Windows
+        // paths hold no `"`
+        return format!("\"{}\"", p.display());
+    }
     format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"))
 }
 
@@ -162,10 +168,12 @@ fn mcp_clients(bin: &Path, add: bool) -> Vec<String> {
     .collect()
 }
 
+#[cfg(unix)]
 extern "C" {
     fn getuid() -> u32;
 }
 
+#[cfg(unix)]
 fn xml(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -174,6 +182,7 @@ fn run(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd).args(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
+#[cfg(unix)]
 fn service(bin: &Path, add: bool) -> Option<String> {
     // carry hilo's own settings into the service (tests run with an isolated home and no Keychain)
     let envs: Vec<(String, String)> = ["HILO_HOME", "HILO_KEYCHAIN", "HILO_NOTIFY"].iter().filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?))).collect();
@@ -233,6 +242,34 @@ fn service(bin: &Path, add: bool) -> Option<String> {
             _ => format!("wrote {} but systemctl failed; run `hilo daemon` yourself", p.display()),
         })
     }
+}
+
+/// Windows: a per-user Run key, which needs no admin (an ONLOGON scheduled task does). The daemon
+/// lets go of the console window it gets there (see `leave_own_console`).
+// ponytail: no restart if the daemon dies (launchd KeepAlive, systemd Restart=always), and HILO_HOME and
+// friends aren't carried (set them as user environment variables); a Scheduled Task XML could do both.
+#[cfg(windows)]
+fn service(bin: &Path, add: bool) -> Option<String> {
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    if !add {
+        if !run("reg", &["delete", KEY, "/v", "hilo", "/f"]) {
+            return None;
+        }
+        // stop the running daemon too (like `systemctl disable --now`), or ~/.hilo stays locked
+        let me = format!("PID ne {}", std::process::id());
+        run("taskkill", &["/F", "/IM", "hilo.exe", "/FI", &me]);
+        return Some(format!(r"removed {KEY}\hilo"));
+    }
+    let cmd = format!("\"{}\" daemon", bin.display());
+    if !run("reg", &["add", KEY, "/v", "hilo", "/t", "REG_SZ", "/d", &cmd, "/f"]) {
+        return Some("could not write the Run key; run `hilo daemon` yourself".into());
+    }
+    let log = crate::config::path("daemon.log");
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(log).ok();
+    let mut c = Command::new(bin);
+    c.arg("daemon").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(log.map_or(std::process::Stdio::null(), Into::into));
+    let started = crate::detach(&mut c).spawn().is_ok();
+    Some(if started { format!(r"{KEY}\hilo (starts at logon)") } else { format!(r"wrote {KEY}\hilo but could not start it; run `hilo daemon` yourself") })
 }
 
 pub fn install(bin: &Path, with_service: bool) -> Vec<String> {

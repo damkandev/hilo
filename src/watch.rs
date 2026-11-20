@@ -1,6 +1,6 @@
 //! File-change notifications. macOS: FSEvents (file-level, latency 0, no defer).
-//! Linux: inotify, one watch per non-ignored directory. Either way, events only say *where*
-//! to look; the scanner decides what changed. `None` from the channel = "rescan everything".
+//! Linux: inotify, one watch per non-ignored directory. Windows: ReadDirectoryChangesW, one
+//! recursive watch per root. Either way, events only say *where* to look; the scanner decides what changed. `None` from the channel = "rescan everything".
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
@@ -202,6 +202,99 @@ mod imp {
     }
 }
 
+#[cfg(windows)]
+mod imp {
+    use super::Events;
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn ReadDirectoryChangesW(dir: *mut c_void, buf: *mut c_void, len: u32, subtree: i32, filter: u32, got: *mut u32, ov: *mut c_void, done: *mut c_void) -> i32;
+        fn CancelIoEx(h: *mut c_void, ov: *mut c_void) -> i32;
+    }
+    const LIST_DIRECTORY: u32 = 1;
+    const SHARE_ALL: u32 = 7; // read, write, delete: the watch must not lock the folder
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000; // needed to open a directory
+    const FILTER: u32 = 0x1 | 0x2 | 0x8 | 0x10 | 0x40; // file name, dir name, size, last write, creation
+    const ERROR_NOTIFY_ENUM_DIR: i32 = 1022; // the kernel's buffer overflowed
+
+    pub struct Watcher {
+        dirs: Vec<Arc<File>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Watcher {
+        pub fn new(roots: &[PathBuf], tx: Events) -> Option<Watcher> {
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut dirs = vec![];
+            for root in roots {
+                // a root that can't be opened now is gone; its scan says so
+                let Ok(f) = std::fs::OpenOptions::new().access_mode(LIST_DIRECTORY).share_mode(SHARE_ALL).custom_flags(BACKUP_SEMANTICS).open(root) else { continue };
+                let f = Arc::new(f);
+                dirs.push(f.clone());
+                let (tx, root, stop) = (tx.clone(), root.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u32; 16 * 1024]; // 64 KB (the cap over SMB), DWORD-aligned as required
+                    loop {
+                        let mut got = 0u32;
+                        let ok = unsafe { ReadDirectoryChangesW(f.as_raw_handle(), buf.as_mut_ptr().cast(), (buf.len() * 4) as u32, 1, FILTER, &mut got, std::ptr::null_mut(), std::ptr::null_mut()) };
+                        let ev = match ok {
+                            _ if stop.load(Ordering::Relaxed) => return,
+                            0 if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR) => None,
+                            0 => return, // folder gone or handle broken; the daemon's periodic scans still run
+                            _ if got == 0 => None, // overflow: changes were dropped
+                            _ => Some(parse(unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), got as usize) }, &root)),
+                        };
+                        if tx.send(ev).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            Some(Watcher { dirs, stop })
+        }
+        /// The watch covers whole trees: nothing to add, nothing to re-check.
+        pub fn add_dirs(&mut self, _: &[&Path]) -> Vec<PathBuf> {
+            vec![]
+        }
+    }
+
+    /// FILE_NOTIFY_INFORMATION records: next offset, action, name length in bytes, UTF-16 name
+    /// relative to the root.
+    fn parse(b: &[u8], root: &Path) -> Vec<PathBuf> {
+        let u32_at = |i: usize| b.get(i..i + 4).map_or(0, |w| u32::from_ne_bytes(w.try_into().unwrap()) as usize);
+        let (mut out, mut i) = (vec![], 0);
+        loop {
+            let (next, len) = (u32_at(i), u32_at(i + 8));
+            let Some(name) = b.get(i + 12..i + 12 + len) else { break };
+            let name: Vec<u16> = name.as_chunks::<2>().0.iter().map(|c| u16::from_ne_bytes(*c)).collect();
+            out.push(root.join(String::from_utf16_lossy(&name)));
+            if next == 0 {
+                break;
+            }
+            i += next;
+        }
+        out
+    }
+
+    impl Drop for Watcher {
+        fn drop(&mut self) {
+            // Wakes each thread's blocking call (ERROR_OPERATION_ABORTED); it sees `stop`, returns and
+            // closes its handle. A thread not yet inside the call stops at its next event.
+            self.stop.store(true, Ordering::Relaxed);
+            for f in &self.dirs {
+                unsafe { CancelIoEx(f.as_raw_handle(), std::ptr::null_mut()) };
+            }
+        }
+    }
+}
+
 pub use imp::Watcher;
 
 #[cfg(test)]
@@ -213,7 +306,7 @@ mod tests {
     fn sees_a_write() {
         let d = std::env::temp_dir().join(format!("hilo-watch-{}", crate::crypto::hex(&crate::crypto::random::<4>())));
         std::fs::create_dir_all(d.join("sub")).unwrap();
-        let d = std::fs::canonicalize(&d).unwrap();
+        let d = crate::fsops::canonical(&d).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let mut w = Watcher::new(&[d.clone()], tx).expect("watcher");
         let _ = w.add_dirs(&[&d.join("sub")]);

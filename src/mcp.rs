@@ -303,7 +303,7 @@ mod tests {
         // a fake daemon whose only unit is a temp dir
         let root = std::env::temp_dir().join(format!("hilo-mcp-{}", crate::crypto::hex(&crate::crypto::random::<4>())));
         std::fs::create_dir_all(root.join("src/deep")).unwrap();
-        let root = std::fs::canonicalize(&root).unwrap();
+        let root = crate::fsops::canonical(&root).unwrap();
         std::fs::write(root.join("src/a.txt"), "1\n2\n3\n").unwrap();
         std::fs::write(root.join("img.bin"), b"\x89PNG\0\0").unwrap();
         std::fs::write(root.join(".env"), "K=secret").unwrap();
