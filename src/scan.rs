@@ -74,10 +74,9 @@ impl Scanner {
 
     /// Drives: the root is a folder, and the same folder the index was built from.
     pub fn root_ok(&self) -> io::Result<(u64, u64)> {
-        use std::os::unix::fs::MetadataExt;
         let gone = || io::Error::other(format!("drive folder {} is gone", self.root.display()));
-        let m = std::fs::metadata(&self.root).ok().filter(|m| m.is_dir()).ok_or_else(gone)?;
-        match (m.dev(), m.ino()) {
+        std::fs::metadata(&self.root).ok().filter(|m| m.is_dir()).ok_or_else(gone)?;
+        match fsops::dir_id(&self.root).map_err(|_| gone())? {
             id if self.root_id.is_some_and(|r| r != id) => {
                 Err(io::Error::other(format!("{} is another folder now (unmounted, or moved and recreated); `hilo add --drive` it to sync this one", self.root.display())))
             }
@@ -438,7 +437,7 @@ mod tests {
         w("id.pem", "x");
         w("nested/.git/HEAD", "ref: refs/heads/main\n"); // a repo inside: skipped whole
         w("nested/n.txt", "n");
-        let d = std::fs::canonicalize(&d).unwrap();
+        let d = fsops::canonical(&d).unwrap();
         let mut s = Scanner::drive(&d, &format!("t{}", hex(&crate::crypto::random::<4>())));
         let names = |c: &Changes| {
             let mut v: Vec<String> = c.files.iter().map(|f| f.0.clone()).collect();
@@ -467,7 +466,7 @@ mod tests {
         std::fs::create_dir_all(d.join("sub")).unwrap();
         std::fs::write(d.join("a.txt"), "a").unwrap();
         std::fs::write(d.join("sub/b.txt"), "b").unwrap();
-        let d = std::fs::canonicalize(&d).unwrap();
+        let d = fsops::canonical(&d).unwrap();
         let label = format!("t{}", hex(&crate::crypto::random::<4>()));
         let mut s = Scanner::drive(&d, &label);
         assert_eq!(s.scan().unwrap().files.len(), 2);

@@ -34,8 +34,13 @@ fn touches_hilo_home(s: &str) -> bool {
     s.match_indices(".hilo").any(|(i, _)| {
         let before = s[..i].chars().next_back();
         let after = s[i + 5..].chars().next();
-        before == Some('/') && after.is_none_or(|c| c == '/' || c.is_whitespace() || "'\";|&)".contains(c))
+        before.is_some_and(sep) && after.is_none_or(|c| sep(c) || c.is_whitespace() || "'\";|&)".contains(c))
     })
+}
+
+/// Path separators: Windows takes `\` too.
+fn sep(c: char) -> bool {
+    c == '/' || (cfg!(windows) && c == '\\')
 }
 
 /// Reads of secrets, decided in-process (no socket, no network). Only the paths a tool opens and
@@ -49,7 +54,7 @@ pub fn sensitive(tool: &str, input: &Json) -> Option<&'static str> {
     if looked.iter().any(|s| touches_hilo_home(s)) {
         return Some(HILO_MSG);
     }
-    let name_of = |k: &str| field(k).map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
+    let name_of = |k: &str| field(k).map(|p| p.rsplit(sep).next().unwrap_or(p).to_string());
     let env = match tool {
         "Read" => name_of("file_path").is_some_and(|n| is_env_name(&n)),
         "Grep" => name_of("path").is_some_and(|n| is_env_name(&n)) || field("glob").is_some_and(|g| g.contains(".env") && !g.contains(".env.example")),

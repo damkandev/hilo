@@ -51,6 +51,7 @@ holds at most 16 pending connections.
 | --- | --- | --- |
 | macOS | launchd agent in `~/Library/LaunchAgents/`, starts at login | `~/Library/Logs/hilo.log` |
 | Linux | systemd user unit `~/.config/systemd/user/hilo.service` | `journalctl --user -u hilo` |
+| Windows | `hilo` value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, starts at logon (no admin needed) | `~/.hilo/daemon.log` |
 
 On a Linux server, keep it running after you log out:
 
@@ -67,7 +68,7 @@ logs to `~/.hilo/daemon.log`. `--no-service` skips the service on `setup`, `init
 | --- | --- |
 | `~/.hilo/config` | settings ([reference](commands.md#configuration)) |
 | `~/.hilo/key` · `peers` · `tokens` | this machine's identity, pinned peer keys, cloud tokens |
-| `~/.hilo/secrets` | Linux only, mode 0600: the keys that live in the Keychain on macOS |
+| `~/.hilo/secrets` | Linux and Windows: the keys that live in the Keychain on macOS (mode 0600; on Windows, the profile folder's ACL) |
 | `~/.hilo/store` | the version history behind `hilo log`, `restore` and `trash`, mode 0600 (`history_days`, `history_max_mb`) |
 
 `HILO_HOME` moves all of it. `hilo uninstall` removes the service, hooks and config; your repos stay
@@ -79,7 +80,27 @@ plain git repos. It also removes the version history in the store.
 | --- | --- |
 | macOS | Apple Silicon and Intel |
 | Linux | x86_64 and aarch64, static (musl): any distro, Alpine and old glibc included |
-| Windows | not in v1 |
+| Windows | 10 and later, x86_64; built from source for now (no release binary yet) |
+
+### Windows
+
+```powershell
+cargo build --release
+copy target\release\hilo.exe $HOME\.local\bin\   # or any folder on your PATH
+hilo
+```
+
+What differs from macOS and Linux:
+
+- The service is a per-user Run key, not a supervisor: it starts the daemon at logon but does not
+  restart it if it dies, and it doesn't carry `HILO_HOME` (set it as a user environment variable).
+- The CLI talks to the daemon over loopback TCP with a per-run token in `~/.hilo/hilo.sock`, since
+  Windows has no Unix sockets in std.
+- Set `git config --global core.autocrlf false` (or `input`) on Windows machines: hilo syncs the
+  bytes in the working tree, so CRLF checkouts would show up as changes on the other machines.
+- Files whose names Windows can't hold (`aux.c`, `a:b`, a trailing dot) are refused on Windows.
+- `hilo run -- CMD` starts `CMD` directly: use `npm.cmd`, or `cmd /c npm ...`, for `.cmd` scripts.
+- No desktop notifications; they are in the log.
 
 ## Updating
 

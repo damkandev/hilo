@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/damkandev/hilo/actions/workflows/ci.yml"><img src="https://github.com/damkandev/hilo/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/damkandev/hilo/releases/latest"><img src="https://img.shields.io/github/v/release/damkandev/hilo" alt="Latest release"></a>
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="macOS and Linux">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="macOS, Linux and Windows">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
@@ -46,6 +46,9 @@ files) and gives them one drive:
 curl -fsSL https://raw.githubusercontent.com/damkandev/hilo/main/install.sh | sh
 hilo
 ```
+
+On Windows, build it with `cargo build --release` and put `target\release\hilo.exe` on your PATH
+(see [Deployment](docs/deployment.md#windows)).
 
 `hilo` asks which folder to keep in sync and where your other machine is (it lists the hosts in
 `~/.ssh/config`). Then it does the rest over SSH:

@@ -24,7 +24,7 @@ impl From<snow::Error> for Error {
 }
 
 /// snow's own 25519 / ChaChaPoly / SHA256. The only randomness snow asks for is the ephemeral key,
-/// which hilo draws from /dev/urandom and hands over here, so a responder can replay its side exactly.
+/// which hilo draws from the system RNG (`crypto::random`) and hands over here, so a responder can replay its side exactly.
 struct Resolver([u8; 32]);
 struct Ephemeral([u8; 32]);
 impl Random for Ephemeral {

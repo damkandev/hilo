@@ -1,5 +1,6 @@
 //! SHA-256 and HKDF from RustCrypto (`sha2`, `hkdf`), plus small helpers.
-#![forbid(unsafe_code)]
+#![cfg_attr(unix, forbid(unsafe_code))]
+#![cfg_attr(windows, deny(unsafe_code))] // one audited call: BCryptGenRandom in `random`
 
 use sha2::{Digest, Sha256};
 
@@ -19,12 +20,28 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+#[cfg(unix)]
 pub fn random<const N: usize>() -> [u8; N] {
     use std::io::Read;
     let mut b = [0u8; N];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut b))
         .expect("/dev/urandom");
+    b
+}
+
+/// Windows has no /dev/urandom: the system RNG through bcrypt (Vista+), the same source std uses.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn random<const N: usize>() -> [u8; N] {
+    #[link(name = "bcrypt")]
+    extern "system" {
+        fn BCryptGenRandom(alg: *mut std::ffi::c_void, buf: *mut u8, len: u32, flags: u32) -> i32;
+    }
+    const USE_SYSTEM_PREFERRED_RNG: u32 = 2;
+    let mut b = [0u8; N];
+    let st = unsafe { BCryptGenRandom(std::ptr::null_mut(), b.as_mut_ptr(), N as u32, USE_SYSTEM_PREFERRED_RNG) };
+    assert!(st == 0, "BCryptGenRandom: {st:#x}");
     b
 }
 

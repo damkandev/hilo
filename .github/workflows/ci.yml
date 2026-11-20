@@ -21,6 +21,14 @@ jobs:
       - run: cargo test --release --offline --locked
       - run: cargo build --release --offline --locked && ls -la target/release/hilo
 
+  windows:
+    # builds and links on real Windows; the test suite still assumes a Unix box, so it only compiles
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo test --release --offline --locked --no-run
+      - run: cargo build --release --offline --locked
+
   vet:
     runs-on: ubuntu-24.04
     steps:

@@ -12,7 +12,7 @@ chacha20poly1305 = { version = "=0.10.1", default-features = false, features = [
 sha2 = { version = "=0.10.9", default-features = false }
 hkdf = { version = "=0.12.4", default-features = false }
 # Noise with snow's own resolver for 25519 / ChaChaPoly / SHA256 (same dalek and RustCrypto crates as above).
-# No getrandom: the RNG is /dev/urandom (noise.rs), like everywhere else in hilo.
+# No getrandom: the RNG is crypto::random (/dev/urandom, BCryptGenRandom on Windows), like everywhere else in hilo.
 snow = { version = "=0.10.0", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-sha2"] }
 
 [dev-dependencies]

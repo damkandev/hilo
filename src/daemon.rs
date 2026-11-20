@@ -61,7 +61,7 @@ impl Shared {
         let abs = canonical_maybe_missing(p);
         let roots = self.roots.read().unwrap();
         let (root, id) = roots.iter().filter(|(r, _)| abs.starts_with(r)).max_by_key(|(r, _)| r.as_os_str().len())?;
-        let rel = abs.strip_prefix(root).ok()?.to_str()?.to_string();
+        let rel = fsops::slash(abs.strip_prefix(root).ok()?)?;
         (rel.is_empty() || valid_path(&rel)).then(|| (id.clone(), root.clone(), rel))
     }
     pub fn send(&self, m: Msg) {
@@ -89,7 +89,7 @@ impl Shared {
 
 /// Canonical path even if the file itself doesn't exist yet.
 pub fn canonical_maybe_missing(p: &Path) -> PathBuf {
-    if let Ok(c) = std::fs::canonicalize(p) {
+    if let Ok(c) = fsops::canonical(p) {
         return c;
     }
     match (p.parent(), p.file_name()) {
@@ -117,7 +117,7 @@ pub fn folder_label(p: &Path) -> String {
 /// it, "auto" picks it for a folder with files in it, no repos directly inside, and not a repo
 /// itself (an empty folder stays a folder that receives repos).
 pub fn drive_label(path: &Path, mode: &str, label: &str) -> Option<String> {
-    let top = git::toplevel(path).and_then(|t| std::fs::canonicalize(t).ok()).is_some_and(|t| t == path);
+    let top = git::toplevel(path).and_then(|t| fsops::canonical(t).ok()).is_some_and(|t| t == path);
     let files = std::fs::read_dir(path).into_iter().flatten().flatten().any(|e| !e.file_name().to_string_lossy().starts_with('.'));
     let auto = mode == "auto" && !top && files && crate::repos_in(path).is_empty();
     (mode == "drive" || auto).then(|| if label.is_empty() { folder_label(path) } else { label.to_string() })
@@ -132,7 +132,7 @@ pub fn nests(cfg: &Config, path: &Path, kind: &str) -> Option<String> {
     }
     roots.extend(cfg.drives().into_iter().map(|d| ("drive", d.1)));
     roots.into_iter().filter(|(k, _)| kind == "drive" || *k == "drive").find_map(|(k, r)| {
-        let r = std::fs::canonicalize(&r).unwrap_or(r);
+        let r = fsops::canonical(&r).unwrap_or(r);
         let (p, rr) = (crate::tui::tilde(path), crate::tui::tilde(&r));
         if path.starts_with(&r) && !(kind == "repo" && k == "drive" && path != r) {
             Some(format!("{p} is inside the {k} {rr}; synced folders don't nest"))
@@ -419,7 +419,7 @@ impl D {
                 if !p.join(".git").is_dir() || e.file_name().to_string_lossy().starts_with('.') {
                     continue;
                 }
-                let Ok(p) = std::fs::canonicalize(&p) else { continue };
+                let Ok(p) = fsops::canonical(&p) else { continue };
                 if self.repos.iter().any(|r| r.root == p) {
                     continue;
                 }
@@ -475,7 +475,7 @@ impl D {
         if target.exists() {
             if git::repo_id(&target).ok().as_deref() == Some(&id) {
                 let _ = self.r.applied(&op, op.new, Data::Omitted);
-                let t = std::fs::canonicalize(&target).unwrap_or(target);
+                let t = fsops::canonical(&target).unwrap_or(target);
                 let label = folder_label(&dir);
                 self.add_repo(&t, Some(label));
             } else {
@@ -488,7 +488,7 @@ impl D {
             Ok(()) => {
                 log!("cloned {} from {} into {}", m.name, op.origin, target.display());
                 let _ = self.r.applied(&op, op.new, Data::Omitted);
-                let t = std::fs::canonicalize(&target).unwrap_or(target);
+                let t = fsops::canonical(&target).unwrap_or(target);
                 self.add_repo(&t, Some(folder_label(&dir)));
             }
             Err(e) => {
@@ -500,7 +500,7 @@ impl D {
 
     /// `hilo add <path>`: a folder of repos, one repo, or (`mode`, see `drive_label`) a drive.
     fn add_path(&mut self, p: &str, mode: &str, label: &str) -> (u8, String) {
-        let Ok(path) = std::fs::canonicalize(p) else { return (1, format!("{p}: no such folder")) };
+        let Ok(path) = fsops::canonical(p) else { return (1, format!("{p}: no such folder")) };
         let mut cfg = Config::load();
         if let Some(label) = drive_label(&path, mode, label) {
             return match register_drive(&mut cfg, &path, &label) {
@@ -521,7 +521,7 @@ impl D {
                 }
             };
         }
-        let top = git::toplevel(&path).is_some_and(|t| std::fs::canonicalize(t).ok() == Some(path.clone()));
+        let top = git::toplevel(&path).is_some_and(|t| fsops::canonical(t).ok() == Some(path.clone()));
         if let Some(e) = nests(&cfg, &path, if top { "repo" } else { "folder" }) {
             return (1, e);
         }
@@ -690,7 +690,7 @@ impl D {
             let dirs: Vec<PathBuf> = ch.dirs.iter().map(|d| root.join(d)).collect();
             let fresh = w.add_dirs(&dirs.iter().map(PathBuf::as_path).collect::<Vec<_>>());
             // inotify race: files created before the watch existed. Look at those dirs once more.
-            let rels: Vec<String> = fresh.iter().filter_map(|p| p.strip_prefix(&root).ok()?.to_str().map(str::to_string)).filter(|r| !r.is_empty()).collect();
+            let rels: Vec<String> = fresh.iter().filter_map(|p| fsops::slash(p.strip_prefix(&root).ok()?)).filter(|r| !r.is_empty()).collect();
             if !rels.is_empty() {
                 self.scan_wt(wi, Some(&rels));
             }
@@ -726,11 +726,11 @@ impl D {
         for p in paths {
             let best = self.wts.iter().enumerate().filter(|(_, w)| p.starts_with(&w.root)).max_by_key(|(_, w)| w.root.as_os_str().len());
             let Some((wi, w)) = best else { continue };
-            let Some(rel) = p.strip_prefix(&w.root).ok().and_then(|r| r.to_str()) else { continue };
+            let Some(rel) = p.strip_prefix(&w.root).ok().and_then(fsops::slash) else { continue };
             if rel.split('/').next().is_some_and(fsops::is_dotgit) {
                 continue; // refs and HEAD are checked every tick
             }
-            by_wt.entry(wi).or_default().push(rel.to_string());
+            by_wt.entry(wi).or_default().push(rel);
         }
         for (wi, rels) in by_wt {
             self.scan_wt(wi, Some(&rels));
@@ -749,7 +749,7 @@ impl D {
             self.repos[ri].wt_stamp = Some(stamp);
             let (root, id) = (self.repos[ri].root.clone(), self.repos[ri].id.clone());
             let Ok(list) = git::worktrees(&root) else { continue };
-            let roots: Vec<PathBuf> = list.iter().filter_map(|(p, _)| std::fs::canonicalize(p).ok()).collect();
+            let roots: Vec<PathBuf> = list.iter().filter_map(|(p, _)| fsops::canonical(p).ok()).collect();
             let before = self.wts.len();
             self.wts.retain(|w| w.git().is_none_or(|g| g.repo != id) || roots.contains(&w.root));
             changed |= before != self.wts.len();
@@ -904,7 +904,7 @@ impl D {
             return None;
         }
         log!("mirrored branch {branch} at {}", path.display());
-        let canon = std::fs::canonicalize(&path).ok()?;
+        let canon = fsops::canonical(&path).ok()?;
         self.repos[ri].wt_stamp = None; // re-list worktrees next tick
         let wi = self.add_wt(&canon, repo_id)?;
         self.rebuild_watcher();
@@ -1403,7 +1403,7 @@ impl D {
     /// (worktree index, unit id, path inside it) for a path from the CLI.
     fn locate(&self, p: &str) -> Option<(usize, String, String)> {
         let wi = self.wt_for_cwd(p)?;
-        let rel = canonical_maybe_missing(Path::new(p)).strip_prefix(&self.wts[wi].root).ok()?.to_str()?.to_string();
+        let rel = fsops::slash(canonical_maybe_missing(Path::new(p)).strip_prefix(&self.wts[wi].root).ok()?)?;
         Some((wi, self.wts[wi].id()?, rel))
     }
 
@@ -1547,7 +1547,7 @@ impl D {
         let mut files = vec![];
         for w in self.wts.iter().filter(|w| w.id().is_some()) {
             let prefix = match dir.strip_prefix(&w.root) {
-                Ok(p) => p.to_string_lossy().into_owned(),
+                Ok(p) => fsops::slash(p).unwrap_or_else(|| p.to_string_lossy().into_owned()),
                 Err(_) if w.root.starts_with(&dir) => String::new(),
                 Err(_) => continue,
             };
@@ -1633,7 +1633,7 @@ impl D {
     fn env_cmd(&mut self, cwd: &str, file: &str, cmd: &str, args: &[&str]) -> Result<String, String> {
         let wi = self.wt_for_cwd(cwd).ok_or("not inside a synced worktree")?;
         let repo = self.wts[wi].git().ok_or("env files don't sync in a drive")?.repo.clone();
-        let reldir = canonical_maybe_missing(Path::new(cwd)).strip_prefix(&self.wts[wi].root).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let reldir = canonical_maybe_missing(Path::new(cwd)).strip_prefix(&self.wts[wi].root).ok().and_then(fsops::slash).unwrap_or_default();
         let file = if file.is_empty() { ".env".to_string() } else { file.to_string() };
         let file = if reldir.is_empty() || file.contains('/') { file } else { format!("{reldir}/{file}") };
         if !valid_path(&file) || !is_env_name(file.rsplit('/').next().unwrap_or("")) {
@@ -1816,7 +1816,7 @@ impl D {
                 let abs = canonical_maybe_missing(&p);
                 let best = self.wts.iter().enumerate().filter(|(_, w)| abs.starts_with(&w.root)).max_by_key(|(_, w)| w.root.as_os_str().len()).map(|(i, _)| i);
                 if let Some(wi) = best {
-                    if let Some(rel) = abs.strip_prefix(&self.wts[wi].root).ok().and_then(|r| r.to_str()).map(str::to_string) {
+                    if let Some(rel) = abs.strip_prefix(&self.wts[wi].root).ok().and_then(fsops::slash) {
                         self.scan_wt(wi, Some(&[rel]));
                     }
                 }
@@ -1917,7 +1917,7 @@ pub fn run() -> io::Result<()> {
     let folders: Vec<(PathBuf, String)> = cfg
         .all("folder")
         .into_iter()
-        .filter_map(|f| std::fs::canonicalize(f).ok())
+        .filter_map(|f| fsops::canonical(f).ok())
         .map(|p| {
             let l = folder_label(&p);
             (p, l)
@@ -1925,7 +1925,7 @@ pub fn run() -> io::Result<()> {
         .collect();
     let mut repos: Vec<Repo> = vec![];
     for r in cfg.all("repo") {
-        let root = std::fs::canonicalize(r).unwrap_or_else(|_| PathBuf::from(r));
+        let root = fsops::canonical(r).unwrap_or_else(|_| PathBuf::from(r));
         match (git::repo_id(&root), git::common_dir(&root)) {
             (Ok(id), Ok(common)) if !repos.iter().any(|x| x.id == id) => {
                 let name = root.file_name().map_or("repo".into(), |n| n.to_string_lossy().into_owned());
@@ -1988,7 +1988,7 @@ pub fn run() -> io::Result<()> {
     }
     d.prune();
     for (label, p) in cfg.drives() {
-        let root = std::fs::canonicalize(&p).unwrap_or(p);
+        let root = fsops::canonical(&p).unwrap_or(p);
         match holds_home(&root) {
             Some(e) => log!("drive {label}: {e}; not syncing it"),
             None => d.paused.push(Wt { scanner: Scanner::drive(&root, &label), root, unit: Unit::Drive(label) }),
@@ -2062,7 +2062,7 @@ mod tests {
 
     #[test]
     fn drive_roots_never_nest() {
-        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("hilo-ov-{}", crate::crypto::hex(&crate::crypto::random::<4>())));
+        let base = fsops::canonical(std::env::temp_dir()).unwrap().join(format!("hilo-ov-{}", crate::crypto::hex(&crate::crypto::random::<4>())));
         for d in ["code/app", "notes/sub", "docs/r", "solo", "My Stuff", "empty"] {
             std::fs::create_dir_all(base.join(d)).unwrap();
         }
