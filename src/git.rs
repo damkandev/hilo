@@ -33,6 +33,17 @@ fn git(dir: &Path, args: &[&str]) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&run(c, None)?).trim().to_string())
 }
 
+/// `git` over the network: a dead host, a stalled transfer or a password prompt fails instead of
+/// hanging the daemon. The user's own ssh command, if any, is left alone.
+fn git_net(dir: &Path, args: &[&str]) -> io::Result<String> {
+    let mut c = cmd(dir);
+    c.args(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=20"]).args(args);
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() && git(dir, &["config", "core.sshCommand"]).is_err() {
+        c.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2");
+    }
+    Ok(String::from_utf8_lossy(&run(c, None)?).trim().to_string())
+}
+
 pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     git(dir, &["rev-parse", "--show-toplevel"]).ok().map(PathBuf::from)
 }
@@ -239,8 +250,10 @@ pub fn bundle(root: &Path, tip: &str, exclude: &[String], tmp_dir: &Path) -> io:
     let refname = format!("refs/hilo/out/{}", hex(&random::<4>()));
     git(root, &["update-ref", &refname, tip])?;
     let mut args: Vec<String> = vec!["bundle".into(), "create".into(), "-q".into(), file.to_string_lossy().into(), refname.clone()];
+    let n = args.len();
     args.extend(exclude.iter().filter(|e| valid_sha(e) && has_commit(root, e)).map(|e| format!("^{e}")));
-    if exclude.is_empty() {
+    if args.len() == n {
+        // nothing everyone has is known here: not the whole history, only what origin lacks
         args.extend(["--not".into(), "--remotes".into()]);
     }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -262,7 +275,7 @@ pub fn fetch_bundle(root: &Path, bundle: &[u8], tmp_dir: &Path) -> io::Result<()
     let f = file.to_string_lossy().to_string();
     let res = (|| {
         if git(root, &["bundle", "verify", "-q", &f]).is_err() {
-            let _ = git(root, &["fetch", "-q", "origin"]);
+            let _ = git_net(root, &["fetch", "-q", "origin"]);
             git(root, &["bundle", "verify", "-q", &f])?;
         }
         let heads = git(root, &["bundle", "list-heads", &f])?;
@@ -298,7 +311,7 @@ pub fn clone_into(target: &Path, branch: &str, origin: &str, bundle: Option<&[u8
             r?;
         }
         None if !origin.is_empty() => {
-            git(parent, &["clone", "-q", "-b", branch, "--", origin, &t])?;
+            git_net(parent, &["clone", "-q", "-b", branch, "--", origin, &t])?;
         }
         None => return Err(io::Error::other("too big to send and no origin to clone from")),
     }
@@ -389,8 +402,8 @@ pub mod tests {
         git(&a, &["commit", "-qam", "two"]).unwrap();
         let tip = read_ref(&common_dir(&a).unwrap(), "main").unwrap();
         assert!(is_ancestor(&a, &base, &tip) && !is_ancestor(&a, &tip, &base));
-        let bun = bundle(&a, &tip, &[base.clone()], &tmp).unwrap().unwrap();
-        assert!(bundle(&a, &base, &[tip.clone()], &tmp).unwrap().is_none()); // nothing missing
+        let bun = bundle(&a, &tip, std::slice::from_ref(&base), &tmp).unwrap().unwrap();
+        assert!(bundle(&a, &base, std::slice::from_ref(&tip), &tmp).unwrap().is_none()); // nothing missing
         std::fs::write(b.join("a.txt"), "two").unwrap(); // files arrive before the commit
         fetch_bundle(&b, &bun, &tmp).unwrap();
         reset_mixed(&b, &tip).unwrap();
@@ -402,6 +415,12 @@ pub mod tests {
         assert!(wts.iter().any(|(_, br)| br.as_deref() == Some("feature")));
         assert!(in_head(&b, "a.txt", Some(b"two")) && !in_head(&b, "a.txt", Some(b"three")));
         assert!(valid_branch("feat/x") && !valid_branch("a..b") && !valid_branch("-x"));
+        // no known exclude here: what origin has is left out, not the whole history sent
+        std::fs::write(b.join("a.txt"), "three").unwrap();
+        git(&b, &["commit", "-qam", "three"]).unwrap();
+        let three = read_ref(&common_dir(&b).unwrap(), "main").unwrap();
+        let bun = bundle(&b, &three, &["0".repeat(40)], &tmp).unwrap().unwrap();
+        assert!(bun.split(|&c| c == b'\n').any(|l| l.starts_with(b"-")), "the bundle needs origin's commits");
         for d in [a, b, wt] {
             let _ = std::fs::remove_dir_all(d);
         }

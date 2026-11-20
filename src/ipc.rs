@@ -9,7 +9,7 @@ use std::io;
 #[cfg(windows)]
 use std::net::{TcpListener as Listener, TcpStream as Stream};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,24 @@ pub fn socket_path() -> PathBuf {
     }
     // sun_path is ~104 bytes on macOS: deep HILO_HOMEs get a short, stable name instead
     let h = crate::crypto::hex(&crate::crypto::sha256(p.as_os_str().as_encoded_bytes()));
-    std::env::temp_dir().join(format!("hilo-{}.sock", &h[..12]))
+    std::env::temp_dir().join(format!("hilo-{}", &h[..12])).join("hilo.sock")
+}
+
+/// The socket path. A fallback in the temp dir (which others may write to) must sit in a 0700
+/// folder owned by whoever owns the hilo home, or it is refused.
+#[cfg(unix)]
+fn checked_path() -> io::Result<PathBuf> {
+    let p = socket_path();
+    let (Some(d), home) = (p.parent(), crate::config::home()) else { return Ok(p) };
+    if d == home {
+        return Ok(p);
+    }
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(d);
+    let (m, owner) = (std::fs::symlink_metadata(d)?, std::fs::metadata(&home)?.uid());
+    if !m.is_dir() || m.uid() != owner || m.mode() & 0o077 != 0 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} is not a private folder of yours", d.display())));
+    }
+    Ok(p)
 }
 
 fn encode(args: &[String]) -> Vec<u8> {
@@ -44,7 +61,7 @@ fn decode(b: &[u8]) -> Option<Vec<String>> {
 
 #[cfg(unix)]
 fn listen() -> io::Result<Listener> {
-    let p = socket_path();
+    let p = checked_path()?;
     let _ = std::fs::remove_file(&p);
     let l = Listener::bind(&p)?;
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
@@ -191,7 +208,7 @@ pub fn call(args: &[String], timeout: Duration) -> io::Result<(u8, String)> {
 
 #[cfg(unix)]
 fn dial(args: &[String], timeout: Duration) -> io::Result<(Stream, Vec<String>)> {
-    let s = Stream::connect(socket_path())?;
+    let s = Stream::connect(checked_path()?)?;
     s.set_read_timeout(Some(timeout))?;
     s.set_write_timeout(Some(timeout))?;
     Ok((s, args.to_vec()))

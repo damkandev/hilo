@@ -1,18 +1,19 @@
 //! TCP + Noise. One reader and one writer thread per connection.
 //! Messages above 60 KB go out in chunks; small changes to other files overtake them.
 #![forbid(unsafe_code)]
-use crate::noise::{Cipher, Handshake};
+use crate::noise::{Handshake, RecvCipher, SendCipher};
+use crate::noise;
 use crate::wire::{self, Msg, MAX_FRAME, MAX_MSG};
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Write};
 use std::net::TcpStream;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::Duration;
 
 const PROLOGUE: &[u8] = b"hilo/1";
 pub const ZERO_PSK: [u8; 32] = [0; 32]; // known peers: identity comes from pinned static keys
 const PING: Duration = Duration::from_secs(15);
-const DEAD: Duration = Duration::from_secs(45);
+pub const DEAD: Duration = Duration::from_secs(45);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CHUNK: usize = 60_000; // stays under Noise's 65535-byte message limit
 
@@ -50,7 +51,10 @@ pub fn proxy_for(host: &str) -> Option<String> {
     var("ALL_PROXY").or_else(|| var("HTTPS_PROXY"))
 }
 
-fn split_proxy(p: &str) -> Option<(&str, Option<(String, String)>, &str)> {
+/// (scheme, user:password, host:port)
+type Proxy<'a> = (&'a str, Option<(String, String)>, &'a str);
+
+fn split_proxy(p: &str) -> Option<Proxy<'_>> {
     let (scheme, rest) = p.split_once("://").unwrap_or(("http", p));
     let rest = rest.trim_end_matches('/');
     let (auth, hostport) = match rest.rsplit_once('@') {
@@ -67,8 +71,14 @@ fn split_proxy(p: &str) -> Option<(&str, Option<(String, String)>, &str)> {
 pub fn dial(addr: &str) -> io::Result<TcpStream> {
     let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h).trim_matches(['[', ']']);
     let connect = |a: &str| -> io::Result<TcpStream> {
-        let sa = std::net::ToSocketAddrs::to_socket_addrs(a)?.next().ok_or_else(|| io::Error::other(format!("{a}: no address")))?;
-        TcpStream::connect_timeout(&sa, HANDSHAKE_TIMEOUT)
+        let mut err = io::Error::other(format!("{a}: no address"));
+        for sa in std::net::ToSocketAddrs::to_socket_addrs(a)? {
+            match TcpStream::connect_timeout(&sa, HANDSHAKE_TIMEOUT) {
+                Ok(s) => return Ok(s),
+                Err(e) => err = e,
+            }
+        }
+        Err(err)
     };
     let Some(p) = proxy_for(host) else { return connect(addr) };
     let (scheme, auth, hostport) = split_proxy(&p).ok_or_else(|| io::Error::other("bad proxy"))?;
@@ -143,45 +153,71 @@ pub fn dial(addr: &str) -> io::Result<TcpStream> {
     Ok(s)
 }
 
+/// The receiving side of a connection: the cipher and the message being reassembled from chunks
+/// (small messages may arrive between the chunks of a big one).
+pub struct Rx {
+    c: RecvCipher,
+    part: Vec<u8>,
+}
+
+/// Shuts the connection down unless the handshake ends within HANDSHAKE_TIMEOUT in total
+/// (the read timeout alone would let a slow peer trickle bytes forever). Done when the guard drops.
+fn deadline(s: &TcpStream) -> io::Result<Sender<()>> {
+    let (done, wait) = channel::<()>();
+    let s = s.try_clone()?;
+    std::thread::spawn(move || {
+        if wait.recv_timeout(HANDSHAKE_TIMEOUT) == Err(RecvTimeoutError::Timeout) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    Ok(done)
+}
+
 /// Returns (send, recv, remote static key).
-pub fn initiate(s: &mut TcpStream, key: [u8; 32], psk: &[u8; 32]) -> io::Result<(Cipher, Cipher, [u8; 32])> {
+pub fn initiate(s: &mut TcpStream, key: [u8; 32], psk: &[u8; 32]) -> io::Result<(SendCipher, Rx, [u8; 32])> {
     s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let _guard = deadline(s)?;
     let mut hs = Handshake::new(key, PROLOGUE, true, None).map_err(bad)?;
     wire::write_frame(s, &hs.write1(&[]).map_err(bad)?)?;
-    hs.read2(&wire::read_frame(s, MAX_FRAME)?).map_err(bad)?;
+    hs.read2(&wire::read_frame(s, noise::MAX)?).map_err(bad)?;
     wire::write_frame(s, &hs.write3(&[], psk).map_err(bad)?)?;
-    hs.split().map_err(bad)
+    let (tx, c, rs) = hs.split().map_err(bad)?;
+    Ok((tx, Rx { c, part: vec![] }, rs))
 }
 
 /// Returns (send, recv, remote static key, index of the psk that matched).
-pub fn respond(s: &mut TcpStream, key: [u8; 32], psks: &[[u8; 32]]) -> io::Result<(Cipher, Cipher, [u8; 32], usize)> {
+pub fn respond(s: &mut TcpStream, key: [u8; 32], psks: &[[u8; 32]]) -> io::Result<(SendCipher, Rx, [u8; 32], usize)> {
     s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let _guard = deadline(s)?;
     let mut hs = Handshake::new(key, PROLOGUE, false, None).map_err(bad)?;
-    hs.read1(&wire::read_frame(s, MAX_FRAME)?).map_err(bad)?;
+    hs.read1(&wire::read_frame(s, noise::MAX)?).map_err(bad)?;
     wire::write_frame(s, &hs.write2(&[]).map_err(bad)?)?;
-    let (i, _) = hs.read3(&wire::read_frame(s, MAX_FRAME)?, psks).map_err(bad)?;
-    let (tx, rx, rs) = hs.split().map_err(bad)?;
-    Ok((tx, rx, rs, i))
+    let (i, _) = hs.read3(&wire::read_frame(s, noise::MAX)?, psks).map_err(bad)?;
+    let (tx, c, rs) = hs.split().map_err(bad)?;
+    Ok((tx, Rx { c, part: vec![] }, rs, i))
 }
 
 // Plaintext of each frame: [kind][payload]. 0 = whole message, 1 = chunk with more to come, 2 = last chunk.
-fn send_part(s: &mut TcpStream, c: &mut Cipher, kind: u8, payload: &[u8]) -> io::Result<()> {
+fn send_part(s: &mut TcpStream, c: &mut SendCipher, kind: u8, payload: &[u8]) -> io::Result<()> {
     let mut pt = Vec::with_capacity(payload.len() + 1);
     pt.push(kind);
     pt.extend_from_slice(payload);
-    let ct = c.encrypt(&pt).map_err(|_| io::Error::other("nonce space exhausted: reconnect"))?;
-    wire::write_frame(s, &ct)
+    let mut f = vec![0; 4]; // length, then the ciphertext right behind it: one buffer, one write
+    c.encrypt(&pt, &mut f).map_err(|_| io::Error::other("nonce space exhausted: reconnect"))?;
+    let n = (f.len() - 4) as u32;
+    f[..4].copy_from_slice(&n.to_be_bytes());
+    s.write_all(&f)
 }
 
 /// Blocking send of one message (used before the writer thread exists).
-pub fn send(s: &mut TcpStream, c: &mut Cipher, m: &Msg) -> io::Result<()> {
+pub fn send(s: &mut TcpStream, c: &mut SendCipher, m: &Msg) -> io::Result<()> {
     let enc = wire::encode(m);
     if enc.len() <= CHUNK {
         return send_part(s, c, 0, &enc);
     }
-    let parts: Vec<&[u8]> = enc.chunks(CHUNK).collect();
-    for (i, p) in parts.iter().enumerate() {
-        send_part(s, c, if i + 1 == parts.len() { 2 } else { 1 }, p)?;
+    let n = enc.len().div_ceil(CHUNK);
+    for (i, p) in enc.chunks(CHUNK).enumerate() {
+        send_part(s, c, if i + 1 == n { 2 } else { 1 }, p)?;
     }
     Ok(())
 }
@@ -201,7 +237,7 @@ struct Out {
     off: usize,
 }
 
-pub fn spawn_writer(mut s: TcpStream, mut c: Cipher, rx: Receiver<Msg>) {
+pub fn spawn_writer(mut s: TcpStream, mut c: SendCipher, rx: Receiver<Msg>) {
     std::thread::spawn(move || {
         let mut q: VecDeque<Out> = VecDeque::new();
         let mut closed = false;
@@ -262,29 +298,28 @@ pub fn spawn_writer(mut s: TcpStream, mut c: Cipher, rx: Receiver<Msg>) {
     });
 }
 
-/// Reads one whole message (reassembling chunks).
-pub fn recv(s: &mut TcpStream, c: &mut Cipher) -> io::Result<Msg> {
+/// Reads one whole message. A big one comes in chunks, and whole small ones may arrive between them.
+pub fn recv(s: &mut TcpStream, rx: &mut Rx) -> io::Result<Msg> {
     let bad = |m| io::Error::new(io::ErrorKind::InvalidData, m);
-    let mut buf: Vec<u8> = vec![];
     loop {
         let f = wire::read_frame(s, MAX_FRAME)?;
-        let pt = c.decrypt(&f).map_err(|_| bad("bad mac"))?;
+        let pt = rx.c.decrypt(&f).map_err(|_| bad("bad mac"))?;
         let (&kind, payload) = pt.split_first().ok_or_else(|| bad("empty frame"))?;
-        if kind == 0 && buf.is_empty() {
+        if kind == 0 {
             return wire::decode(payload).ok_or_else(|| bad("bad message"));
         }
-        if !(kind == 1 || kind == 2) || buf.len() + payload.len() > MAX_MSG {
+        if !(kind == 1 || kind == 2) || rx.part.len() + payload.len() > MAX_MSG {
             return Err(bad("bad chunk"));
         }
-        buf.extend_from_slice(payload);
+        rx.part.extend_from_slice(payload);
         if kind == 2 {
-            return wire::decode(&buf).ok_or_else(|| bad("bad message"));
+            return wire::decode(&std::mem::take(&mut rx.part)).ok_or_else(|| bad("bad message"));
         }
     }
 }
 
 /// Calls `f` for every message until the connection dies or `f` returns false.
-pub fn read_loop(s: &mut TcpStream, mut c: Cipher, mut f: impl FnMut(Msg) -> bool) -> io::Result<()> {
+pub fn read_loop(s: &mut TcpStream, mut c: Rx, mut f: impl FnMut(Msg) -> bool) -> io::Result<()> {
     s.set_read_timeout(Some(DEAD))?;
     loop {
         match recv(s, &mut c)? {
@@ -378,5 +413,41 @@ mod tests {
             .collect();
         srv.join().unwrap();
         assert_eq!(paths, [("small".into(), 10), ("big".into(), 1_000_000), ("big".into(), 5)]);
+    }
+
+    /// The writer sends small messages between the chunks of a big one: the reader must keep the big one going.
+    #[test]
+    fn small_between_chunks() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let (mut tx, _, _, _) = respond(&mut s, [1; 32], &[ZERO_PSK]).unwrap();
+            let big = wire::encode(&Msg::Peers(vec!["x".repeat(100_000)]));
+            send_part(&mut s, &mut tx, 1, &big[..CHUNK]).unwrap();
+            send_part(&mut s, &mut tx, 0, &wire::encode(&Msg::CaughtUp)).unwrap();
+            send_part(&mut s, &mut tx, 2, &big[CHUNK..]).unwrap();
+            s
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        let (_tx, mut rx, _) = initiate(&mut c, [2; 32], &ZERO_PSK).unwrap();
+        assert!(matches!(recv(&mut c, &mut rx).unwrap(), Msg::CaughtUp));
+        assert!(matches!(recv(&mut c, &mut rx).unwrap(), Msg::Peers(v) if v[0].len() == 100_000));
+        srv.join().unwrap();
+    }
+
+    /// A peer that opens a connection and says nothing is cut off after HANDSHAKE_TIMEOUT.
+    #[test]
+    fn handshake_has_a_total_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let _c = TcpStream::connect(addr).unwrap();
+        let (s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap(); // only the deadline can end this
+        let t = std::time::Instant::now();
+        let mut s2 = s.try_clone().unwrap();
+        let _guard = deadline(&s).unwrap();
+        assert!(wire::read_frame(&mut s2, noise::MAX).is_err());
+        assert!(t.elapsed() < HANDSHAKE_TIMEOUT * 2);
     }
 }

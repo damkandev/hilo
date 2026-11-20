@@ -29,9 +29,11 @@ pub fn search(files: &[(PathBuf, String)], pattern: &str, ignore_case: bool, max
         if is_binary(&data) {
             continue;
         }
-        for (i, line) in String::from_utf8_lossy(&data).lines().enumerate() {
-            let at = if ignore_case { line.to_ascii_lowercase().find(&pat) } else { line.find(&pat) };
-            if let Some(at) = at {
+        let text = String::from_utf8_lossy(&data);
+        // ASCII lowercasing keeps every byte offset, so both texts walk line by line together
+        let low = if ignore_case { text.to_ascii_lowercase() } else { String::new() };
+        for (i, (line, hay)) in text.lines().zip(if ignore_case { low.lines() } else { text.lines() }).enumerate() {
+            if let Some(at) = hay.find(&pat) {
                 out.push(format!("{shown}:{}: {}", i + 1, clip(line, at)));
                 if out.len() >= max {
                     return out;

@@ -526,9 +526,9 @@ pub fn card(lines: &[String]) {
 
 /// `~/x` for paths under HOME.
 pub fn tilde(p: &std::path::Path) -> String {
-    let s = p.to_string_lossy().into_owned();
-    match crate::config::user_home().and_then(|h| h.to_str().map(str::to_string)) {
-        Some(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
-        _ => s,
+    match crate::config::user_home().filter(|h| !h.as_os_str().is_empty()).and_then(|h| Some(p.strip_prefix(h).ok()?.to_string_lossy().into_owned())) {
+        Some(r) if r.is_empty() => "~".into(),
+        Some(r) => format!("~/{r}"),
+        None => p.to_string_lossy().into_owned(),
     }
 }

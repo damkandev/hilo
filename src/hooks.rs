@@ -29,13 +29,19 @@ pub fn mentions_env(cmd: &str) -> bool {
     false
 }
 
-/// The hilo home as a whole path component (so a `-backup` sibling or `x.hilo.json` don't count).
+/// The hilo home (`.hilo`, or wherever HILO_HOME points) as whole path components
+/// (so a `-backup` sibling or `x.hilo.json` don't count).
 fn touches_hilo_home(s: &str) -> bool {
-    s.match_indices(".hilo").any(|(i, _)| {
-        let before = s[..i].chars().next_back();
-        let after = s[i + 5..].chars().next();
-        before.is_some_and(sep) && after.is_none_or(|c| sep(c) || c.is_whitespace() || "'\";|&)".contains(c))
-    })
+    let at = |n: &str, sep_before: bool| {
+        s.match_indices(n).any(|(i, _)| {
+            let after = s[i + n.len()..].chars().next();
+            (!sep_before || s[..i].chars().next_back().is_some_and(sep)) && after.is_none_or(|c| sep(c) || c.is_whitespace() || "'\";|&)".contains(c))
+        })
+    };
+    let home = crate::config::home();
+    let home = home.to_string_lossy();
+    let home = home.trim_end_matches(['/', '\\']);
+    at(".hilo", true) || (!home.is_empty() && at(home, false))
 }
 
 /// Path separators: Windows takes `\` too.
@@ -120,5 +126,14 @@ mod tests {
         assert!(sensitive("Grep", &home).is_some());
         let write = Json::parse(r#"{"file_path":"/x/notes.md","content":"see ~/.hilo/config"}"#).unwrap();
         assert!(sensitive("Write", &write).is_none()); // writing about it is not reading it
+        let _home = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("HILO_HOME");
+        std::env::set_var("HILO_HOME", "/srv/hstate/");
+        let custom = (touches_hilo_home("cat /srv/hstate/key"), touches_hilo_home("ls /srv/hstate"), touches_hilo_home("ls /srv/hstate-old"));
+        match old {
+            Some(o) => std::env::set_var("HILO_HOME", o),
+            None => std::env::remove_var("HILO_HOME"),
+        }
+        assert_eq!(custom, (true, true, false));
     }
 }

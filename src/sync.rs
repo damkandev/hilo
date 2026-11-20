@@ -6,6 +6,7 @@ use crate::crypto::sha256;
 use crate::fsops::MAX_FILE;
 use crate::wire::{Rd, W};
 use std::collections::{HashMap, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
 
 pub type Hash = [u8; 32];
 /// Hash of "file absent".
@@ -44,17 +45,18 @@ impl Data {
     /// hit is checked against the real bytes and stretched both ways. Moved, inserted and repeated
     /// chunks become copies, so big binaries with scattered edits travel small too.
     pub fn delta(base: &[u8], new: &[u8]) -> Data {
+        debug_assert!(base.len().max(new.len()) <= u32::MAX as usize, "offsets and lengths travel as u32 (callers cap at MAX_FILE)");
         // ~sqrt(len) like rsync: fine blocks for code, few index entries for a 50 MB file
         let b = ((base.len() as f64).sqrt() as usize).clamp(64, 1 << 14);
         let mut w = W::default();
         let mut lit = 0; // start of the bytes not yet covered
         if base.len() >= b && new.len() >= b {
-            let mut idx: HashMap<u32, usize> = HashMap::with_capacity(base.len() / b);
+            let mut idx: HashMap<u32, usize, BuildHasherDefault<Mix>> = HashMap::with_capacity_and_hasher(base.len() / b, Default::default());
             for off in (0..=base.len() - b).step_by(b) {
                 idx.entry(Roll::new(&base[off..off + b]).sum()).or_insert(off);
             }
             let (mut i, mut r) = (0, Roll::new(&new[..b]));
-            // ponytail: one HashMap probe per byte of `new`; a bloom filter in front if huge binaries get slow
+            // ponytail: one cheap HashMap probe per byte of `new`; a bitset in front if huge binaries get slow
             while i + b <= new.len() {
                 if let Some(&off) = idx.get(&r.sum()).filter(|&&o| base[o..o + b] == new[i..i + b]) {
                     let (mut s, mut o) = (i, off);
@@ -106,6 +108,22 @@ impl Data {
             out.extend_from_slice(piece);
         }
         Some(out)
+    }
+}
+
+/// Hasher for the rolling sums, which are checksums already: one multiply spreads them over the
+/// table (SipHash, once per byte of `new`, was most of a delta's time).
+#[derive(Default)]
+struct Mix(u64);
+impl Hasher for Mix {
+    fn write(&mut self, b: &[u8]) {
+        b.iter().for_each(|&x| self.write_u32(x as u32));
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (self.0 ^ n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
     }
 }
 
@@ -313,8 +331,7 @@ impl Replica {
         let mut fx = vec![];
         let mut saved = None;
         let q = self.pending.entry(k).or_default();
-        if q.front().is_some_and(|op| op.new == r.rejected) {
-            let op = q.pop_front().unwrap();
+        if let Some(op) = q.pop_front_if(|op| op.new == r.rejected) {
             if op.new != r.current {
                 fx.push(Effect::Save(op.data));
             }
@@ -332,6 +349,11 @@ impl Replica {
     /// Forget what waits to be sent for `k` (the anchor would never take it); the file stays as it is.
     pub fn drop_pending(&mut self, k: &Key) -> usize {
         self.pending.remove(k).map_or(0, |q| q.len())
+    }
+
+    /// Keys with something waiting to be sent (no copies of the data).
+    pub fn pending_keys(&self) -> impl Iterator<Item = &Key> {
+        self.pending.iter().filter(|(_, q)| !q.is_empty()).map(|(k, _)| k)
     }
 
     /// Catch-up finished: whatever is still pending never reached the anchor. Resend it.

@@ -232,20 +232,22 @@ fn wait_port(addr: &str, secs: u64) -> bool {
     false
 }
 
-fn progress() -> HashMap<String, String> {
+pub fn progress() -> HashMap<String, String> {
     ipc::call(&ipc::args(&["progress"]), Duration::from_secs(2))
         .map(|(_, t)| t.split(' ').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.into(), v.into())).collect())
         .unwrap_or_default()
 }
 
-fn start_local_daemon_if_needed(service: bool) {
-    if !service && progress().is_empty() {
-        let log = std::fs::File::create(config::path("daemon.log")).ok();
-        let mut c = Command::new(crate::bin());
-        c.arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log.map_or(Stdio::null(), Stdio::from));
-        #[cfg(windows)] // or closing the wizard's console takes the daemon with it
-        crate::detach(&mut c);
-        let _ = c.spawn();
+/// Links `folder` here: through the daemon, or in the config when it isn't running (it reads it at start).
+fn link_here(folder: &Path) -> Result<(), String> {
+    match ipc::call(&ipc::args(&["add", &folder.to_string_lossy()]), Duration::from_secs(30)) {
+        Ok((0, _)) => Ok(()),
+        Ok((_, t)) => Err(t),
+        Err(_) => {
+            let mut cfg = Config::load();
+            crate::register(&mut cfg, folder, None)?;
+            cfg.save().map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -325,16 +327,11 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
                 Some(c) => {
                     crate::join_core(&c, &Opts { folder: Some(folder.clone()), service, ..Default::default() })?;
                 }
-                None => {
-                    let path = crate::fsops::canonical(&folder).map_err(|e| e.to_string())?;
-                    if ipc::call(&ipc::args(&["add", &path.to_string_lossy()]), Duration::from_secs(30)).is_err() {
-                        let mut cfg = Config::load();
-                        cfg.add("folder", &path.to_string_lossy());
-                        cfg.save().map_err(|e| e.to_string())?;
-                    }
-                }
+                None => link_here(&crate::fsops::canonical(&folder).map_err(|e| e.to_string())?)?,
             }
-            start_local_daemon_if_needed(service);
+            if !service && progress().is_empty() {
+                crate::spawn_daemon()?;
+            }
             Ok(((), format!("this machine is paired; {} linked", tui::tilde(&folder))))
         })?;
     } else {
@@ -354,8 +351,7 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
                     rr.hilo(&format!("add {rf2}"))?;
                 }
             }
-            let path = crate::fsops::canonical(&folder).map_err(|e| e.to_string())?;
-            let _ = ipc::call(&ipc::args(&["add", &path.to_string_lossy()]), Duration::from_secs(30));
+            link_here(&crate::fsops::canonical(&folder).map_err(|e| e.to_string())?)?;
             Ok(((), format!("{} joined this machine", rr.host)))
         })?;
     }
@@ -368,28 +364,25 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
     let mine = crate::repos_in(&plan.local_folder).len();
     tui::step("Syncing", move |p| {
         let end = Instant::now() + Duration::from_secs(600);
+        let mut asked = Instant::now() - Duration::from_secs(60);
         loop {
             let here = progress();
-            let there: HashMap<String, String> = rr
-                .hilo("info")
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|l| l.split_once('='))
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect();
             let pending: usize = here.get("pending").and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
             let caught = here.get("caught").map(String::as_str) == Some("1");
-            let theirs: usize = there.get("repos").and_then(|v| v.parse().ok()).unwrap_or(0);
-            if caught && pending == 0 && theirs >= mine {
-                return Ok(((), format!("in sync: {mine} repos on both machines")));
-            }
-            p.set(if !caught {
-                "connecting…".to_string()
+            // the other side over SSH only once this one has sent everything, and not more than every 3 s
+            if caught && pending == 0 && asked.elapsed() >= Duration::from_secs(3) {
+                asked = Instant::now();
+                let there: HashMap<String, String> = rr.hilo("info").unwrap_or_default().lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.into(), v.into())).collect();
+                let theirs: usize = there.get("repos").and_then(|v| v.parse().ok()).unwrap_or(0);
+                if theirs >= mine {
+                    return Ok(((), format!("in sync: {mine} repos on both machines")));
+                }
+                p.set(format!("{} has {theirs} of {mine} repos", rr.host));
+            } else if !caught {
+                p.set("connecting…");
             } else if pending > 0 {
-                format!("sending {pending} changes")
-            } else {
-                format!("{} has {theirs} of {mine} repos", rr.host)
-            });
+                p.set(format!("sending {pending} changes"));
+            }
             if Instant::now() > end {
                 return Err("still syncing after 10 minutes; check `hilo status`".into());
             }
@@ -400,7 +393,7 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
     tui::card(&[
         format!("{}  {}", bold(&tui::gradient("hilo is running")), dim("on this machine and on ") + &bold(&host)),
         String::new(),
-        format!("{}  {}  {}", tui::tilde(&plan.local_folder), fg(CYAN, "⇄"), format!("{host}:{}", plan.remote_folder)),
+        format!("{}  {}  {host}:{}", tui::tilde(&plan.local_folder), fg(CYAN, "⇄"), plan.remote_folder),
         String::new(),
         dim("New repos in that folder appear on the other machine on their own."),
         dim("Agents get told before they collide; .env files follow along."),
@@ -444,20 +437,19 @@ fn remote_default(local: &Path, r: &Remote) -> String {
 
 /// `hilo setup HOST [--folder DIR] [--remote-folder DIR] [--listen IP:PORT] [--no-service]`
 pub fn command(args: &[String]) -> Result<(), String> {
-    let flag = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let Some(host) = args.first().filter(|a| !a.starts_with("--")).cloned() else {
         return if tui::interactive() { wizard() } else { Err("usage: hilo setup HOST [--folder DIR]".into()) };
     };
     tui::guard_interrupt();
-    let local_folder = crate::fsops::canonical(expand(&flag("--folder").unwrap_or_else(|| guess_folder().to_string_lossy().into()))).map_err(|e| format!("folder: {e}"))?;
+    let local_folder = crate::fsops::canonical(expand(&crate::flag(args, "--folder").unwrap_or_else(|| guess_folder().to_string_lossy().into()))).map_err(|e| format!("folder: {e}"))?;
     let h = host.clone();
     let remote = tui::step(&format!("Connecting to {host}"), move |_| {
         let r = probe(&h)?;
         let msg = format!("connected to {} — {}, {}", r.host, r.pretty, r.arch);
         Ok((r, msg))
     })?;
-    let remote_folder = flag("--remote-folder").unwrap_or_else(|| remote_default(&local_folder, &remote));
-    let plan = Plan { host, local_folder, remote_folder, listen: flag("--listen"), service: !args.iter().any(|a| a == "--no-service") };
+    let remote_folder = crate::flag(args, "--remote-folder").unwrap_or_else(|| remote_default(&local_folder, &remote));
+    let plan = Plan { host, local_folder, remote_folder, listen: crate::flag(args, "--listen"), service: !args.iter().any(|a| a == "--no-service") };
     run(plan, remote)
 }
 
@@ -597,24 +589,25 @@ fn cloud_flow(cfg: &Config) -> Result<(), String> {
         None => cfg.get("listen").unwrap_or_default().to_string(),
         Some(r) => r.info.get("listen").cloned().unwrap_or_default(),
     };
-    let host = listen.rsplit_once(':').map_or(listen.as_str(), |(h, _)| h);
-    let private = host.parse::<std::net::IpAddr>().is_ok_and(|ip| match ip {
-        std::net::IpAddr::V4(v) => v.is_private() || v.is_loopback() || (v.octets()[0] == 100 && (64..128).contains(&v.octets()[1])),
-        std::net::IpAddr::V6(v) => v.is_loopback(),
-    });
-    if private {
+    if crate::is_private_addr(&listen) {
         println!("  {}", fg(tui::YELLOW, &format!("The anchor listens on {listen}, a private address. Cloud sandboxes can't reach it.")));
         println!("  {}", dim("Give them a public way in: a VPS as anchor, a port forward on your router, or a domain."));
     }
     let addr = tui::input("Address cloud agents should dial", &listen).map_err(cancelled)?;
     let name = tui::input("Name for this token", "cloud agents").map_err(cancelled)?;
     let env = tui::confirm("Give them the project's .env values?", false).map_err(cancelled)?;
-    let args = format!("token create --name {} --addr {}{}", q(&name.replace(' ', "-")), q(&addr), if env { " --env" } else { "" });
+    let mut args = vec!["token".to_string(), "create".into(), "--name".into(), name.replace(' ', "-"), "--addr".into(), addr];
+    if env {
+        args.push("--env".into());
+    }
     let code = tui::step("Creating the token", move |_| {
         let out = match &remote {
-            Some(r) => r.hilo(&args)?,
+            Some(r) => r.hilo(&args.iter().map(|a| q(a)).collect::<Vec<_>>().join(" "))?,
             None => {
-                let o = Command::new(crate::bin()).args(args.split(' ').map(|a| a.trim_matches('\''))).output().map_err(|e| e.to_string())?;
+                let o = Command::new(crate::bin()).args(&args).output().map_err(|e| e.to_string())?;
+                if !o.status.success() {
+                    return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
+                }
                 String::from_utf8_lossy(&o.stdout).into_owned()
             }
         };

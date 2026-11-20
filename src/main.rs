@@ -468,12 +468,7 @@ fn token(args: &[String]) -> Result<(), String> {
             if daemon_up() {
                 return daemon_call(&["revoke", id]);
             }
-            let mut ts = config::cloud_tokens();
-            let t = ts.iter_mut().find(|t| &t.id == id).ok_or(format!("no cloud token {id}"))?;
-            t.revoked = true;
-            config::save_cloud_tokens(&ts).map_err(|e| e.to_string())?;
-            let keep: Vec<config::Peer> = config::peers().into_iter().filter(|p| p.cloud_token() != Some(id.as_str())).collect();
-            config::save_peers(&keep).map_err(|e| e.to_string())?;
+            config::revoke_cloud_token(id).map_err(|e| e.to_string())?.ok_or(format!("no cloud token {id}"))?;
             println!("token {id} revoked");
             Ok(())
         }
@@ -579,9 +574,7 @@ fn up(args: &[String]) -> Result<(), String> {
     }
     let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
-        let p: std::collections::HashMap<String, String> = ipc::call(&ipc::args(&["progress"]), std::time::Duration::from_secs(2))
-            .map(|(_, t)| t.split(' ').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.into(), v.into())).collect())
-            .unwrap_or_default();
+        let p = setup::progress();
         if p.get("caught").map(String::as_str) == Some("1") && p.get("pending").map(String::as_str) == Some("0") {
             println!("hilo: {} in sync ({} repo(s), online: {})", tui::tilde(&folder), p.get("repos").map_or("0", String::as_str), p.get("online").map_or("-", String::as_str));
             return Ok(());

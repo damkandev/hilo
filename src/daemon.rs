@@ -60,7 +60,7 @@ impl Shared {
     pub fn unit_of(&self, p: &Path) -> Option<(String, PathBuf, String)> {
         let abs = canonical_maybe_missing(p);
         let roots = self.roots.read().unwrap();
-        let (root, id) = roots.iter().filter(|(r, _)| abs.starts_with(r)).max_by_key(|(r, _)| r.as_os_str().len())?;
+        let (root, id) = &roots[deepest(roots.iter().map(|r| r.0.as_path()), &abs)?];
         let rel = fsops::slash(abs.strip_prefix(root).ok()?)?;
         (rel.is_empty() || valid_path(&rel)).then(|| (id.clone(), root.clone(), rel))
     }
@@ -85,6 +85,11 @@ impl Shared {
             None => self.broadcast.lock().unwrap().0.push(msg),
         }
     }
+}
+
+/// Index of the longest root holding `p` (a unit may sit inside another's folder).
+fn deepest<'a>(roots: impl Iterator<Item = &'a Path>, p: &Path) -> Option<usize> {
+    roots.enumerate().filter(|(_, r)| p.starts_with(r)).max_by_key(|(_, r)| r.as_os_str().len()).map(|(i, _)| i)
 }
 
 /// Canonical path even if the file itself doesn't exist yet.
@@ -272,6 +277,7 @@ struct D {
     anchor_addr: String,
     atx: Option<Sender<anchor::In>>,
     dirty: bool,
+    rescan: bool,
     warned: HashSet<String>,
     paused: Vec<Wt>, // drives whose folder is gone or another folder now: back when the same one is
     scope: Option<(config::Scope, bool)>, // from the anchor, when this sandbox joined with a scoped token (+ read-only)
@@ -344,7 +350,6 @@ impl D {
         self.repos.push(Repo { root: root.into(), id, common, name, wt_stamp: None, label });
         let ri = self.repos.len() - 1;
         self.announce(ri);
-        self.discover();
         Some(ri)
     }
 
@@ -360,10 +365,11 @@ impl D {
             let _ = w.scanner.save_index();
             let id = w.id().unwrap_or_default();
             // unsent edits go; the stale index entries make them be read again on the way back
-            for k in self.r.caught_up().into_iter().filter(|o| o.wt == id).map(|o| (o.wt, o.path)) {
+            for k in self.r.pending_keys().filter(|k| k.0 == id).cloned().collect::<Vec<_>>() {
                 self.r.drop_pending(&k);
             }
             self.outstanding.retain(|k, _| k.0 != id);
+            self.dirty = true; // the resume point may move
             self.paused.push(w);
         }
         if self.wts.len() != before {
@@ -430,6 +436,7 @@ impl D {
                 self.add_repo(&p, Some(label.clone()));
             }
         }
+        self.discover(); // once for every repo added: each watcher rebuild costs
     }
 
     /// Tells the other machines about a repo in a linked folder, once.
@@ -439,13 +446,13 @@ impl D {
         }
         let Some(label) = self.repos[ri].label.clone() else { return };
         let (root, name, id) = (self.repos[ri].root.clone(), self.repos[ri].name.clone(), self.repos[ri].id.clone());
-        let origin = git::origin_url(&root);
-        let h = meta_hash(&label, &name, &origin);
         let key = (format!("repo:{id}"), META.to_string());
         // once anyone has announced a repo, nobody re-announces it (folder names may differ per machine)
         if self.r.expected(&key) != NONE || !crate::sync::safe_name(&name) {
             return;
         }
+        let origin = git::origin_url(&root);
+        let h = meta_hash(&label, &name, &origin);
         let branch = git::branch(&git::gitdir(&root).unwrap_or_default()).unwrap_or_else(|| "main".into());
         let bundle = git::bundle_all(&root, &self.tmp, 48 << 20);
         if let Some(op) = self.r.local(&key.0, META, h, Data::Full(meta_payload(&label, &name, &origin, &branch, bundle.as_deref()))) {
@@ -478,6 +485,7 @@ impl D {
                 let t = fsops::canonical(&target).unwrap_or(target);
                 let label = folder_label(&dir);
                 self.add_repo(&t, Some(label));
+                self.discover();
             } else {
                 self.log_once(format!("exists {}", target.display()), format!("not cloning {}: {} already exists and is something else", m.name, target.display()));
                 self.bump(op.seq);
@@ -490,6 +498,7 @@ impl D {
                 let _ = self.r.applied(&op, op.new, Data::Omitted);
                 let t = fsops::canonical(&target).unwrap_or(target);
                 self.add_repo(&t, Some(folder_label(&dir)));
+                self.discover();
             }
             Err(e) => {
                 log!("could not clone {}: {e}", m.name);
@@ -533,6 +542,7 @@ impl D {
             let _ = cfg.save();
             let label = self.folders.iter().find(|f| path.parent() == Some(f.0.as_path())).map(|f| f.1.clone());
             self.add_repo(&path, label);
+            self.discover();
             return (0, format!("syncing {}", crate::tui::tilde(&path)));
         }
         if self.folders.iter().any(|f| f.0 == path) {
@@ -563,13 +573,23 @@ impl D {
         if self.watcher.is_none() {
             self.log_once("watcher".into(), "file watcher unavailable; polling every second".into());
         }
+        self.rescan = true; // a new watcher has only the roots (inotify): a full scan adds the folders under them
+    }
+
+    /// Never persist or resume past a change we still have to fetch.
+    fn safe_seq(&self) -> u64 {
+        self.outstanding.values().map(|s| s.saturating_sub(1)).min().unwrap_or(u64::MAX).min(self.r.last_seq)
     }
 
     fn save(&mut self) {
+        for wt in &mut self.wts {
+            let _ = wt.scanner.save_index();
+        }
+        if !self.dirty {
+            return;
+        }
         let mut w = W::default();
-        // never persist past a change we still have to fetch
-        let safe = self.outstanding.values().map(|s| s.saturating_sub(1)).min().unwrap_or(u64::MAX).min(self.r.last_seq);
-        w.u64(safe);
+        w.u64(self.safe_seq());
         for ((wt, path), h) in &self.r.confirmed {
             w.str(wt).str(path).hash(h);
         }
@@ -577,14 +597,10 @@ impl D {
         for x in &self.held {
             h.str(&x.wt).str(&x.path).data(&x.data).str(&x.origin).str(&x.reason);
         }
-        let res = config::write_private("state", &w.0).and_then(|_| config::write_private("held", &h.0));
-        if let Err(e) = res {
-            log!("cannot save state: {e}");
+        match config::write_private("state", &w.0).and_then(|_| config::write_private("held", &h.0)) {
+            Ok(()) => self.dirty = false,
+            Err(e) => log!("cannot save state: {e}"), // still dirty: tried again next time
         }
-        for wt in &mut self.wts {
-            let _ = wt.scanner.save_index();
-        }
-        self.dirty = false;
     }
 
     // ---------- outgoing ----------
@@ -617,8 +633,7 @@ impl D {
     fn on_scope(&mut self, s: config::Scope, ro: bool) {
         log!("this sandbox's token syncs {s}{}", if ro { ", read-only" } else { "" });
         self.scope = Some((s, ro));
-        let mut keys: Vec<Key> = self.r.caught_up().into_iter().map(|o| (o.wt, o.path)).filter(|k| !self.may_send(&k.0, &k.1)).collect();
-        keys.dedup();
+        let keys: Vec<Key> = self.r.pending_keys().filter(|k| !self.may_send(&k.0, &k.1)).cloned().collect();
         for k in keys {
             let h = self.r.expected(&k);
             self.r.drop_pending(&k);
@@ -638,15 +653,18 @@ impl D {
             return self.log_once(format!("outside {}\0{}", op.wt, op.path), format!("not sending {} {:?}: outside what this sandbox's token may sync", op.wt, op.path));
         }
         if let Some(Some(d)) = op.data.content() {
-            let d = d.to_vec();
-            self.cache.put(op.new, &d);
-            if op.path != REF && !op.wt.starts_with("vault:") && d.len() > 4096 {
-                if let Some(base) = self.cache.map.get(&op.base) {
-                    let delta = Data::delta(base, &d);
-                    if matches!(&delta, Data::Delta(p) if p.len() < d.len() / 2) {
-                        op.data = delta;
-                    }
+            let mut delta = None;
+            if self.caught && op.path != REF && !op.wt.starts_with("vault:") && d.len() > 4096 {
+                // the cache holds files up to 1 MB; bigger bases come from the history
+                delta = match self.cache.map.get(&op.base) {
+                    Some(base) => Some(Data::delta(base, d)),
+                    None => self.store.get(&op.base).ok().flatten().map(|base| Data::delta(&base, d)),
                 }
+                .filter(|x| matches!(x, Data::Delta(p) if p.len() < d.len() / 2));
+            }
+            self.cache.put(op.new, d); // after reading the base: putting can evict it
+            if let Some(x) = delta {
+                op.data = x;
             }
         }
         if !self.caught {
@@ -701,17 +719,17 @@ impl D {
         if self.wts[wi].id().is_none() {
             return;
         }
+        let mut ch = Changes::default();
         let res = match rels {
-            None => self.wts[wi].scanner.scan(),
-            Some(r) => self.wts[wi].scanner.check(r),
+            None => self.wts[wi].scanner.scan(&mut ch),
+            Some(r) => self.wts[wi].scanner.check(r, &mut ch),
         };
-        match res {
-            Ok(ch) => self.local_changes(wi, ch),
-            Err(e) => {
-                let root = self.wts[wi].root.display().to_string();
-                self.log_once(format!("scan {root}"), format!("scan {root}: {e}"));
-            }
+        if let Err(e) = res {
+            let root = self.wts[wi].root.display().to_string();
+            self.log_once(format!("scan {root}"), format!("scan {root}: {e}"));
         }
+        // what was found before the error is already marked seen: send it now or never
+        self.local_changes(wi, ch);
     }
 
     fn full_scan(&mut self) {
@@ -724,8 +742,8 @@ impl D {
         let Some(paths) = paths else { return self.full_scan() };
         let mut by_wt: HashMap<usize, Vec<String>> = HashMap::new();
         for p in paths {
-            let best = self.wts.iter().enumerate().filter(|(_, w)| p.starts_with(&w.root)).max_by_key(|(_, w)| w.root.as_os_str().len());
-            let Some((wi, w)) = best else { continue };
+            let Some(wi) = deepest(self.wts.iter().map(|w| w.root.as_path()), &p) else { continue };
+            let w = &self.wts[wi];
             let Some(rel) = p.strip_prefix(&w.root).ok().and_then(fsops::slash) else { continue };
             if rel.split('/').next().is_some_and(fsops::is_dotgit) {
                 continue; // refs and HEAD are checked every tick
@@ -842,6 +860,9 @@ impl D {
         let Some(g) = self.wts[wi].git() else { return };
         let (common, repo) = (g.common.clone(), g.repo.clone());
         let (Some(id), Some(branch)) = (self.wts[wi].id(), g.branch.clone()) else { return };
+        if self.held.iter().any(|h| h.wt == id && h.path == REF) {
+            return; // a branch move waits for approval: ours is not a new commit on top of it
+        }
         let Some(tip) = git::read_ref(&common, &branch) else { return };
         let h = ref_hash(&tip);
         if h == self.r.expected(&(id.clone(), REF.into())) {
@@ -951,11 +972,12 @@ impl D {
         let root = self.wts[wi].root.clone();
         let disk = read_disk(&root, &op.path);
         let dh = hash_of(disk.as_deref());
+        let mut rebuilt = false; // already checked against op.new
         if self.r.needs_content(&op, dh) && op.data.content().is_none() {
-            let base = self.cache.map.get(&op.base).cloned().or_else(|| (dh == op.base).then(|| disk.clone()).flatten());
-            let full = base.and_then(|b| op.data.apply_delta(&b)).filter(|d| sha256(d) == op.new);
+            let base = self.cache.map.get(&op.base).map(Vec::as_slice).or(disk.as_deref().filter(|_| dh == op.base));
+            let full = base.and_then(|b| op.data.apply_delta(b)).filter(|d| sha256(d) == op.new);
             match full {
-                Some(d) => op.data = Data::Full(d),
+                Some(d) => (op.data, rebuilt) = (Data::Full(d), true),
                 None => {
                     self.outstanding.insert(k.clone(), op.seq);
                     return self.send(Msg::NeedFull { wt: k.0, path: k.1 });
@@ -963,7 +985,7 @@ impl D {
             }
         }
         if let Some(c) = op.data.content() {
-            if hash_of(c) != op.new || c.map_or(0, |d| d.len() as u64) > MAX_FILE {
+            if (!rebuilt && hash_of(c) != op.new) || c.map_or(0, |d| d.len() as u64) > MAX_FILE {
                 log!("refused remote change to {:?}: bad content", op.path);
                 return self.bump(op.seq);
             }
@@ -1114,8 +1136,13 @@ impl D {
                 self.ref_sha.insert(rej.wt.clone(), sha);
             }
             let (dh, disk) = self.ref_disk(wi);
+            let k = (rej.wt.clone(), REF.to_string());
+            let before = self.r.confirmed.get(&k).copied();
             let fx = self.r.rejected(&rej, dh, disk);
-            return self.apply_ref(wi, fx, &rej.origin, false);
+            if !self.apply_ref(wi, fx, &rej.origin, false) {
+                self.unconfirm(k, before);
+            }
+            return;
         }
         if !valid_path(&rej.path) || excluded(&rej.path) || hash_of(rej.data.content().flatten()) != rej.current || self.wts[wi].in_nested_repo(&rej.path) {
             return;
@@ -1156,14 +1183,20 @@ impl D {
         }
         self.ref_sha.insert(op.wt.clone(), sha);
         let (dh, disk) = self.ref_disk(wi);
+        let k = (op.wt.clone(), REF.to_string());
+        let before = self.r.confirmed.get(&k).copied();
         let fx = self.r.applied(&op, dh, disk);
-        self.apply_ref(wi, fx, &op.origin, false);
+        if !self.apply_ref(wi, fx, &op.origin, false) {
+            // the branch stays where it was: sending it later as if on top of theirs would rewind everyone
+            self.unconfirm(k, before);
+        }
     }
 
-    fn apply_ref(&mut self, wi: usize, fx: Vec<Effect>, origin: &str, approved: bool) {
+    /// False if the branch could not be moved (it is left alone).
+    fn apply_ref(&mut self, wi: usize, fx: Vec<Effect>, origin: &str, approved: bool) -> bool {
         let root = self.wts[wi].root.clone();
         let id = self.wts[wi].id().unwrap_or_default();
-        let Some(g) = self.wts[wi].git() else { return };
+        let Some(g) = self.wts[wi].git() else { return true };
         let (branch, common) = (g.branch.clone().unwrap_or_default(), g.common.clone());
         for e in fx {
             let Some(Some((sha, _, bundle))) = (match &e {
@@ -1181,7 +1214,7 @@ impl D {
                         Ok(b) => log!("{branch}: another machine committed first; this machine's commit {} is on {b}", &sha[..7]),
                         Err(e) => {
                             log!("{branch}: could not keep commit {}: {e}; leaving the branch alone", &sha[..7]);
-                            return;
+                            return false;
                         }
                     }
                 }
@@ -1199,23 +1232,32 @@ impl D {
                     }
                     if !git::has_commit(&root, &sha) {
                         log!("{branch}: commit {} is missing here (try `git fetch`)", &sha[..7]);
-                        return;
+                        return false;
                     }
                     if git::read_ref(&common, &branch).as_deref() != Some(&sha) {
                         match git::reset_mixed(&root, &sha) {
                             Ok(()) => log!("{branch} -> {}", &sha[..7]),
-                            Err(e) => log!("{branch}: {e}"),
+                            Err(e) => {
+                                log!("{branch}: {e}");
+                                return false;
+                            }
                         }
                     }
                 }
             }
         }
+        true
     }
 
     // ---------- envs ----------
 
     fn vault(&mut self, repo: &str) -> &mut Store {
-        self.vaults.entry(repo.to_string()).or_insert_with(|| Store::load(repo))
+        self.vault_keys(repo).0
+    }
+
+    /// The vault and the keys that open it, borrowed at once.
+    fn vault_keys(&mut self, repo: &str) -> (&mut Store, &BTreeMap<u32, [u8; 32]>) {
+        (self.vaults.entry(repo.to_string()).or_insert_with(|| Store::load(repo)), &self.vkeys)
     }
 
     fn save_vault(&mut self, repo: &str) {
@@ -1243,8 +1285,8 @@ impl D {
             return;
         }
         let wanted: BTreeMap<String, String> = vault::parse(&String::from_utf8_lossy(&data)).into_iter().collect();
-        let keys = self.vkeys.clone();
-        let eff = self.vault(&repo).effective(&keys, rel, false);
+        let (st, keys) = self.vault_keys(&repo);
+        let eff = st.effective(keys, rel, false);
         let mut changed = false;
         for (k, v) in &wanted {
             if eff.get(k) != Some(v) {
@@ -1259,17 +1301,15 @@ impl D {
         }
     }
 
+    /// The caller saves the vault (`materialize` does).
     fn set_key(&mut self, repo: &str, file: &str, k: &str, v: &str) -> Result<(), String> {
-        let keys = self.vkeys.clone();
-        let st = self.vault(repo);
+        let (st, keys) = self.vault_keys(repo);
         if let Some((_, val)) = st.local.get_mut(&(file.to_string(), k.to_string())) {
             *val = v.to_string();
-            self.save_vault(repo);
             return Ok(());
         }
-        let ct = vault::seal(&keys, repo, file, k, v.as_bytes()).ok_or("no vault key yet (is this machine paired?)")?;
+        let ct = vault::seal(keys, repo, file, k, v.as_bytes()).ok_or("no vault key yet (is this machine paired?)")?;
         st.set_shared(file, k, Some(ct.clone()));
-        self.save_vault(repo);
         if let Some(op) = self.r.local(&vault::wt_of(repo), &vault::key_path(file, k), sha256(&ct), Data::Full(ct)) {
             self.send_op(op);
         }
@@ -1284,7 +1324,6 @@ impl D {
                 self.send_op(op);
             }
         }
-        self.save_vault(repo);
         Ok(())
     }
 
@@ -1305,7 +1344,6 @@ impl D {
     }
 
     fn apply_vault(&mut self, repo: &str, file: &str, key: &str, fx: Vec<Effect>, origin: &str, approved: bool) {
-        let keys = self.vkeys.clone();
         for e in fx {
             match e {
                 Effect::Save(d) => {
@@ -1321,9 +1359,9 @@ impl D {
                         continue;
                     }
                     let Some(ct) = d.content().map(|c| c.map(<[u8]>::to_vec)) else { continue };
-                    let st = self.vault(repo);
-                    let prev = st.current(file, key).and_then(|c| vault::open(&keys, repo, file, key, c)).filter(|p| !vault::is_mark(p));
-                    let now_local = ct.as_ref().and_then(|c| vault::open(&keys, repo, file, key, c)).is_some_and(|p| p == vault::LOCAL_MARK);
+                    let (st, keys) = self.vault_keys(repo);
+                    let prev = st.current(file, key).and_then(|c| vault::open(keys, repo, file, key, c)).filter(|p| !vault::is_mark(p));
+                    let now_local = ct.as_ref().and_then(|c| vault::open(keys, repo, file, key, c)).is_some_and(|p| p == vault::LOCAL_MARK);
                     let lk = (file.to_string(), key.to_string());
                     if now_local && !st.local.contains_key(&lk) {
                         if let Some(p) = prev {
@@ -1334,8 +1372,7 @@ impl D {
                 }
             }
         }
-        self.save_vault(repo);
-        self.materialize(repo, file, None);
+        self.materialize(repo, file, None); // saves the vault
     }
 
     fn materialize_all(&mut self, wi: usize) {
@@ -1360,8 +1397,8 @@ impl D {
         if self.strict || self.wts[wi].git().is_none_or(|g| g.branch.is_none()) {
             return;
         }
-        let keys = self.vkeys.clone();
-        let values = self.vault(repo).effective(&keys, file, false);
+        let (st, keys) = self.vault_keys(repo);
+        let values = st.effective(keys, file, false);
         let root = self.wts[wi].root.clone();
         let p = root.join(file);
         if !p.parent().is_some_and(Path::is_dir) || (values.is_empty() && !p.exists()) {
@@ -1452,7 +1489,7 @@ impl D {
                     return Ok(format!("{rel} already has that version"));
                 }
                 self.store.keep_and_write(&root, &id, &rel, Some(&data), Kind::Restored, &self.sh.name).map_err(|e| format!("could not restore {rel}: {e}"))?;
-                self.scan_wt(wi, Some(&[rel.clone()])); // syncs as a new write
+                self.scan_wt(wi, Some(std::slice::from_ref(&rel))); // syncs as a new write
                 Ok(format!("{rel}: restored the version from {when}"))
             }
             ["trash", dir, rest @ ..] => {
@@ -1476,8 +1513,7 @@ impl D {
     // ---------- the socket's slow path ----------
 
     fn wt_for_cwd(&self, cwd: &str) -> Option<usize> {
-        let c = canonical_maybe_missing(Path::new(cwd));
-        self.wts.iter().enumerate().filter(|(_, w)| c.starts_with(&w.root)).max_by_key(|(_, w)| w.root.as_os_str().len()).map(|(i, _)| i)
+        deepest(self.wts.iter().map(|w| w.root.as_path()), &canonical_maybe_missing(Path::new(cwd)))
     }
 
     fn ipc(&mut self, a: Vec<String>) -> (u8, String) {
@@ -1487,7 +1523,7 @@ impl D {
             ["add", path] => self.add_path(path, "", ""),
             ["add", path, mode, label] => self.add_path(path, mode, label),
             ["progress"] => {
-                let pending = self.r.caught_up().len();
+                let pending = self.r.pending_keys().count();
                 (0, format!("pending={pending} caught={} repos={} worktrees={} online={}", self.caught as u8, self.repos.len(), self.wts.len(), self.peers.join(",")))
             }
             ["env", cwd, file, cmd, args @ ..] => match self.env_cmd(cwd, file, cmd, args) {
@@ -1514,12 +1550,11 @@ impl D {
                 (0, format!("{name}: {mode}"))
             }
             ["revoke", id] => {
-                let mut ts = config::cloud_tokens();
-                let Some(t) = ts.iter_mut().find(|t| t.id == *id) else { return (1, format!("no cloud token {id}")) };
-                t.revoked = true;
-                let _ = config::save_cloud_tokens(&ts);
-                let (gone, keep): (Vec<config::Peer>, Vec<config::Peer>) = config::peers().into_iter().partition(|p| p.cloud_token() == Some(*id));
-                let _ = config::save_peers(&keep);
+                let gone = match config::revoke_cloud_token(id) {
+                    Ok(Some(g)) => g,
+                    Ok(None) => return (1, format!("no cloud token {id}")),
+                    Err(e) => return (1, format!("revoke {id}: {e}")),
+                };
                 if let Some(atx) = &self.atx {
                     let _ = atx.send(anchor::In::Kick(gone.iter().map(|p| p.key).collect()));
                 }
@@ -1551,7 +1586,8 @@ impl D {
                 Err(_) if w.root.starts_with(&dir) => String::new(),
                 Err(_) => continue,
             };
-            let mut rels: Vec<&String> = w.scanner.files.keys().filter(|r| prefix.is_empty() || **r == prefix || r.starts_with(&format!("{prefix}/"))).collect();
+            let under = format!("{prefix}/");
+            let mut rels: Vec<&String> = w.scanner.files.keys().filter(|r| prefix.is_empty() || **r == prefix || r.starts_with(&under)).collect();
             rels.sort();
             for r in rels {
                 let p = w.root.join(r);
@@ -1580,8 +1616,7 @@ impl D {
                 s += &format!("          {} files outside the scope, kept here only\n", self.outside.len());
             }
         }
-        let pending = self.r.caught_up();
-        let waiting = |w: &Wt| match w.id().map_or(0, |id| pending.iter().filter(|o| o.wt == id).count()) {
+        let waiting = |w: &Wt| match w.id().map_or(0, |id| self.r.pending_keys().filter(|k| k.0 == id).count()) {
             0 => String::new(),
             n => format!(" {n} changes waiting to send"),
         };
@@ -1639,23 +1674,22 @@ impl D {
         if !valid_path(&file) || !is_env_name(file.rsplit('/').next().unwrap_or("")) {
             return Err(format!("{file} is not an env file"));
         }
-        let keys = self.vkeys.clone();
+        // every request ends in `materialize`, which saves the vault once
         let res = match (cmd, args) {
             ("set", [k, v]) if vault::valid_key(k) => self.set_key(&repo, &file, k, v).map(|_| format!("{k} set in {file}")),
             ("unset", [k]) => self.unset_key(&repo, &file, k).map(|_| format!("{k} removed from {file}")),
             ("local" | "prod", [k]) => {
-                let st = self.vault(&repo);
-                let val = st.effective(&keys, &file, true).get(*k).cloned().ok_or(format!("{k} is not set in {file}"))?;
+                let (st, keys) = self.vault_keys(&repo);
+                let val = st.effective(keys, &file, true).get(*k).cloned().ok_or(format!("{k} is not set in {file}"))?;
                 st.local.insert((file.clone(), k.to_string()), (cmd == "prod", val));
                 if st.current(&file, k).is_some() {
                     let m = if cmd == "prod" { vault::PROD_MARK } else { vault::LOCAL_MARK };
-                    let mark = vault::seal(&keys, &repo, &file, k, m).ok_or("no vault key")?;
+                    let mark = vault::seal(keys, &repo, &file, k, m).ok_or("no vault key")?;
                     st.set_shared(&file, k, Some(mark.clone()));
                     if let Some(op) = self.r.local(&vault::wt_of(&repo), &vault::key_path(&file, k), sha256(&mark), Data::Full(mark)) {
                         self.send_op(op);
                     }
                 }
-                self.save_vault(&repo);
                 Ok(if cmd == "prod" {
                     format!("{k} now lives only on this machine and only reaches processes started with `hilo run`")
                 } else {
@@ -1663,12 +1697,12 @@ impl D {
                 })
             }
             ("ls", []) => {
-                let st = self.vault(&repo);
+                let (st, keys) = self.vault_keys(&repo);
                 let mut out = String::new();
                 for f in st.files() {
                     let mut ks: BTreeMap<String, &str> = BTreeMap::new();
                     for ((ff, k), v) in &st.shared {
-                        if *ff == f && vault::open(&keys, &repo, ff, k, v).is_some_and(|p| !vault::is_mark(&p)) {
+                        if *ff == f && vault::open(keys, &repo, ff, k, v).is_some_and(|p| !vault::is_mark(&p)) {
                             ks.insert(k.clone(), "shared");
                         }
                     }
@@ -1697,9 +1731,9 @@ impl D {
             }
             ("revert", [k, rest @ ..]) => {
                 let n: usize = rest.first().and_then(|n| n.parse().ok()).unwrap_or(1).max(1);
-                let st = self.vault(&repo);
+                let (st, keys) = self.vault_keys(&repo);
                 let ct = st.history.iter().rev().filter(|h| h.1 == file && h.2 == *k).filter_map(|h| h.3.clone()).nth(n - 1).ok_or("no such version")?;
-                let pt = vault::open(&keys, &repo, &file, k, &ct).ok_or("cannot open that version")?;
+                let pt = vault::open(keys, &repo, &file, k, &ct).ok_or("cannot open that version")?;
                 let v = String::from_utf8_lossy(&pt).into_owned();
                 self.set_key(&repo, &file, k, &v).map(|_| format!("{k} reverted"))
             }
@@ -1743,7 +1777,7 @@ impl D {
             take
         };
         self.dirty = true;
-        let n = pick.len();
+        let (n, mut failed) = (pick.len(), 0);
         for h in pick {
             if deny {
                 // keep ours: the next scan sends this machine's version
@@ -1757,21 +1791,25 @@ impl D {
                     self.apply_vault(&repo, &f, &k, vec![Effect::Write(h.data)], &h.origin, true);
                 }
             } else if let Some(wi) = self.wt_index(&h.wt) {
-                if h.path == REF {
-                    self.apply_ref(wi, vec![Effect::Write(h.data)], &h.origin, true);
-                } else {
-                    self.apply_file(wi, &h.path, vec![Effect::Write(h.data)], &h.origin, true);
+                let fx = vec![Effect::Write(h.data.clone())];
+                let ok = if h.path == REF { self.apply_ref(wi, fx, &h.origin, true) } else { self.apply_file(wi, &h.path, fx, &h.origin, true) };
+                if !ok {
+                    // it keeps waiting: dropped, the next scan would send this machine's version over it
+                    self.held.push(h);
+                    failed += 1;
                 }
             }
         }
-        (0, format!("{} {n} change(s)", if deny { "rejected" } else { "applied" }))
+        match failed {
+            0 => (0, format!("{} {n} change(s)", if deny { "rejected" } else { "applied" })),
+            _ => (1, format!("applied {} change(s); {failed} could not be applied and still wait (see the daemon log)", n - failed)),
+        }
     }
 
     fn on_event(&mut self, ev: Ev) {
         match ev {
             Ev::Up(o) => {
-                let resume = self.outstanding.values().map(|s| s.saturating_sub(1)).min().unwrap_or(u64::MAX).min(self.r.last_seq);
-                let _ = o.send(Msg::Hello { last_seq: resume, name: self.sh.name.clone() });
+                let _ = o.send(Msg::Hello { last_seq: self.safe_seq(), name: self.sh.name.clone() });
                 *self.sh.out.lock().unwrap() = Some(o.clone());
                 self.out = Some(o);
                 self.caught = false;
@@ -1813,12 +1851,8 @@ impl D {
             Ev::Net(_) => {}
             Ev::Fs(paths) => self.on_fs(paths),
             Ev::Touched(p) => {
-                let abs = canonical_maybe_missing(&p);
-                let best = self.wts.iter().enumerate().filter(|(_, w)| abs.starts_with(&w.root)).max_by_key(|(_, w)| w.root.as_os_str().len()).map(|(i, _)| i);
-                if let Some(wi) = best {
-                    if let Some(rel) = abs.strip_prefix(&self.wts[wi].root).ok().and_then(fsops::slash) {
-                        self.scan_wt(wi, Some(&[rel]));
-                    }
+                if let Some((wi, _, rel)) = p.to_str().and_then(|p| self.locate(p)) {
+                    self.scan_wt(wi, Some(&[rel]));
                 }
             }
             // the file list is cheap; reading the files happens off the main loop so syncing never waits on it
@@ -1849,6 +1883,7 @@ fn connect_loop(addr: String, key: [u8; 32], anchor_key: [u8; 32], tx: Sender<Ev
             let (otx, orx) = channel();
             net::spawn_writer(s.try_clone()?, ctx, orx);
             let _ = tx.send(Ev::Up(otx));
+            wait = Duration::from_secs(1); // connected: the next drop starts the backoff over
             let r = net::read_loop(&mut s, crx, |m| tx.send(Ev::Net(m)).is_ok());
             let _ = s.shutdown(std::net::Shutdown::Both);
             r
@@ -1943,7 +1978,7 @@ pub fn run() -> io::Result<()> {
         r: load_state(),
         repos,
         folders,
-        last_folders: Instant::now() - Duration::from_secs(60),
+        last_folders: Instant::now(), // scan_folders runs below
         wts: vec![],
         vaults: HashMap::new(),
         store,
@@ -1968,6 +2003,7 @@ pub fn run() -> io::Result<()> {
         anchor_addr: cfg.get("anchor").unwrap_or_default().to_string(),
         atx: atx_keep,
         dirty: false,
+        rescan: false,
         warned: HashSet::new(),
         paused: vec![],
         scope: None,
@@ -1975,15 +2011,11 @@ pub fn run() -> io::Result<()> {
         tmp: config::path("tmp"),
     };
     // confirmed branch tips: needed to build small bundles
-    for ((wt, path), _) in d.r.confirmed.clone() {
-        if path == REF {
-            if let Some(i) = wt.split_once(':').and_then(|(repo, b)| d.repos.iter().find(|r| r.id == repo).map(|r| (r, b))) {
-                if let Some(sha) = git::read_ref(&i.0.common, i.1) {
-                    if d.r.confirmed.get(&(wt.clone(), REF.into())) == Some(&ref_hash(&sha)) {
-                        d.ref_sha.insert(wt.clone(), sha);
-                    }
-                }
-            }
+    for ((wt, _), h) in d.r.confirmed.iter().filter(|(k, _)| k.1 == REF) {
+        let Some((repo, b)) = wt.split_once(':') else { continue };
+        let Some(sha) = d.repos.iter().find(|r| r.id == repo).and_then(|r| git::read_ref(&r.common, b)) else { continue };
+        if ref_hash(&sha) == *h {
+            d.ref_sha.insert(wt.clone(), sha);
         }
     }
     d.prune();
@@ -1995,8 +2027,7 @@ pub fn run() -> io::Result<()> {
         }
     }
     d.resume_drives();
-    d.scan_folders();
-    d.discover();
+    d.scan_folders(); // and discover()
     if d.watcher.is_none() && !d.wts.is_empty() {
         d.rebuild_watcher(); // drives only: discover() had nothing to watch
     }
@@ -2018,8 +2049,8 @@ pub fn run() -> io::Result<()> {
             last_tick = Instant::now();
             d.tick();
         }
-        if last_full.elapsed() >= if d.watcher.is_some() { VERIFY } else { POLL } {
-            last_full = Instant::now();
+        if d.rescan || last_full.elapsed() >= if d.watcher.is_some() { VERIFY } else { POLL } {
+            (last_full, d.rescan) = (Instant::now(), false);
             d.full_scan();
         }
         if d.role == "member" && d.out.is_some() && last_time.elapsed() >= TIME_SYNC {

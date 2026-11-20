@@ -121,12 +121,15 @@ mod imp {
     use std::collections::HashMap;
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     extern "C" {
         fn inotify_init1(flags: c_int) -> c_int;
         fn inotify_add_watch(fd: c_int, path: *const c_char, mask: u32) -> c_int;
+        fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int;
         fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
+        fn close(fd: c_int) -> c_int;
     }
     const IN_CLOEXEC: c_int = 0x80000;
     const MASK: u32 = 0x2 | 0x4 | 0x8 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x0100_0000; // modify..move_self, onlydir
@@ -136,6 +139,8 @@ mod imp {
     pub struct Watcher {
         fd: c_int,
         dirs: Arc<Mutex<HashMap<c_int, PathBuf>>>,
+        /// set (holding the `dirs` lock) on drop: the reader thread closes the fd and ends
+        stop: Arc<AtomicBool>,
     }
 
     impl Watcher {
@@ -144,16 +149,22 @@ mod imp {
             if fd < 0 {
                 return None;
             }
-            let w = Watcher { fd, dirs: Arc::new(Mutex::new(HashMap::new())) };
+            let w = Watcher { fd, dirs: Arc::new(Mutex::new(HashMap::new())), stop: Arc::new(AtomicBool::new(false)) };
             for r in roots {
                 w.add(r);
             }
-            let dirs = w.dirs.clone();
+            let (dirs, stop) = (w.dirs.clone(), w.stop.clone());
             std::thread::spawn(move || {
                 let mut buf = vec![0u8; 64 * 1024];
                 loop {
                     let n = unsafe { read(fd, buf.as_mut_ptr().cast(), buf.len()) };
                     if n <= 0 {
+                        return;
+                    }
+                    let mut d = dirs.lock().unwrap();
+                    if stop.load(Ordering::SeqCst) {
+                        // Drop set `stop` holding this lock and is done with the fd: only now is closing it safe
+                        unsafe { close(fd) };
                         return;
                     }
                     let mut out = vec![];
@@ -170,7 +181,6 @@ mod imp {
                             rescan = true;
                             continue;
                         }
-                        let mut d = dirs.lock().unwrap();
                         if mask & IN_IGNORED != 0 {
                             d.remove(&wd);
                             continue;
@@ -179,6 +189,7 @@ mod imp {
                             out.push(if name.is_empty() { dir.clone() } else { dir.join(name) });
                         }
                     }
+                    drop(d);
                     if tx.send(if rescan { None } else { Some(out) }).is_err() {
                         return;
                     }
@@ -198,6 +209,21 @@ mod imp {
         /// anything written there before the watch existed was missed, so the caller looks again.
         pub fn add_dirs(&mut self, dirs: &[&Path]) -> Vec<PathBuf> {
             dirs.iter().filter(|d| self.add(d)).map(|d| d.to_path_buf()).collect()
+        }
+    }
+
+    /// Removing the watches queues IN_IGNORED events, which wake the reader blocked in read();
+    /// it sees `stop` and closes the fd itself (closing it here could hit a reused fd number).
+    impl Drop for Watcher {
+        fn drop(&mut self) {
+            let d = self.dirs.lock().unwrap();
+            self.stop.store(true, Ordering::SeqCst);
+            // one more watch, so there is an event even when no directory is watched anymore
+            // ponytail: if "/" can't be watched either, the reader thread and its fd stay until exit
+            let extra = unsafe { inotify_add_watch(self.fd, c"/".as_ptr(), MASK) };
+            for wd in d.keys().copied().chain((extra >= 0).then_some(extra)) {
+                unsafe { inotify_rm_watch(self.fd, wd) };
+            }
         }
     }
 }
@@ -308,7 +334,7 @@ mod tests {
         std::fs::create_dir_all(d.join("sub")).unwrap();
         let d = crate::fsops::canonical(&d).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut w = Watcher::new(&[d.clone()], tx).expect("watcher");
+        let mut w = Watcher::new(std::slice::from_ref(&d), tx).expect("watcher");
         let _ = w.add_dirs(&[&d.join("sub")]);
         std::thread::sleep(Duration::from_millis(100));
         std::fs::write(d.join("sub/f.txt"), "x").unwrap();
