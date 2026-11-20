@@ -105,4 +105,4 @@ What differs from macOS and Linux:
 ## Updating
 
 Run the installer again. It replaces the binary in `~/.local/bin` (or `HILO_BIN_DIR`); pin a release
-with `HILO_VERSION=v0.3.0`.
+with `HILO_VERSION=v0.4.0`.
