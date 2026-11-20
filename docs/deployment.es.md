@@ -51,6 +51,7 @@ y acepta como mucho 16 conexiones pendientes.
 | --- | --- | --- |
 | macOS | agente de launchd en `~/Library/LaunchAgents/`, arranca al iniciar sesión | `~/Library/Logs/hilo.log` |
 | Linux | unidad de usuario de systemd `~/.config/systemd/user/hilo.service` | `journalctl --user -u hilo` |
+| Windows | valor `hilo` en `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, arranca al iniciar sesión (sin admin) | `~/.hilo/daemon.log` |
 
 En un servidor Linux, para que siga corriendo después de cerrar sesión:
 
@@ -67,7 +68,7 @@ escribe en `~/.hilo/daemon.log`. `--no-service` omite el servicio en `setup`, `i
 | --- | --- |
 | `~/.hilo/config` | la configuración ([referencia](commands.es.md#configuración)) |
 | `~/.hilo/key` · `peers` · `tokens` | la identidad de esta máquina, las llaves fijadas de los pares, los tokens de la nube |
-| `~/.hilo/secrets` | solo Linux, permisos 0600: las llaves que en macOS viven en el Keychain |
+| `~/.hilo/secrets` | Linux y Windows: las llaves que en macOS viven en el Keychain (permisos 0600; en Windows, la ACL de la carpeta del perfil) |
 | `~/.hilo/store` | el historial de versiones detrás de `hilo log`, `restore` y `trash`, permisos 0600 (`history_days`, `history_max_mb`) |
 
 `HILO_HOME` mueve todo eso. `hilo uninstall` quita el servicio, los hooks y la configuración; tus
@@ -79,7 +80,27 @@ repos quedan como repos git normales. También borra el historial de versiones d
 | --- | --- |
 | macOS | Apple Silicon e Intel |
 | Linux | x86_64 y aarch64, estático (musl): cualquier distro, incluidas Alpine y glibc viejas |
-| Windows | fuera de la v1 |
+| Windows | 10 o posterior, x86_64; por ahora se compila desde el código (aún no hay binario en los releases) |
+
+### Windows
+
+```powershell
+cargo build --release
+copy target\release\hilo.exe $HOME\.local\bin\   # o cualquier carpeta de tu PATH
+hilo
+```
+
+Lo que cambia respecto de macOS y Linux:
+
+- El servicio es una clave Run del usuario, no un supervisor: arranca el daemon al iniciar sesión
+  pero no lo reinicia si se cae, y no lleva `HILO_HOME` (defínelo como variable de entorno del usuario).
+- La CLI habla con el daemon por TCP en loopback con un token por arranque en `~/.hilo/hilo.sock`,
+  porque std no tiene sockets Unix en Windows.
+- Usa `git config --global core.autocrlf false` (o `input`) en las máquinas Windows: hilo sincroniza
+  los bytes del árbol de trabajo, así que un checkout con CRLF aparecería como cambios en las otras.
+- Los archivos con nombres que Windows no admite (`aux.c`, `a:b`, un punto al final) se rechazan en Windows.
+- `hilo run -- CMD` arranca `CMD` directamente: usa `npm.cmd`, o `cmd /c npm ...`, para scripts `.cmd`.
+- Sin notificaciones de escritorio; quedan en el log.
 
 ## Actualizar
 
