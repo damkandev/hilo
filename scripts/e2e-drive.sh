@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End to end check for drive folders: two daemons (an anchor "mac" and a member "acer") on this
+# End to end check for drive folders: two daemons (an anchor "mac" and a member "devbox") on this
 # machine, each with its own HOME and HILO_HOME under one temp dir, each with a drive labelled
 # "notes". Nothing outside that temp dir is touched; the trap stops both daemons and removes it.
 #
@@ -56,83 +56,83 @@ on_a init --listen "127.0.0.1:$PORT" --no-service --name mac --folder "$T/a/code
 start a
 wait_for "anchor daemon up" up a
 CODE=$(on_a invite | awk '{print $3}')
-on_b join "$CODE" --no-service --name acer --folder "$T/b/code" >/dev/null
+on_b join "$CODE" --no-service --name devbox --folder "$T/b/code" >/dev/null
 start b
 wait_for "member daemon up" up b
 printf '*.log\n' >"$A/.gitignore"
 echo one >"$A/a.txt"
-echo "pre-existing on acer" >"$B/b.txt"
+echo "pre-existing on devbox" >"$B/b.txt"
 on_a add --drive "$A" | sed 's/^/     /'
 on_b add "$B" --as notes | sed 's/^/     /' # no repos inside: a drive on its own
 on_b add --drive "$T/b" --as all 2>/dev/null && fail "a drive around another drive was refused" || ok "a drive around another drive is refused"
 
 echo "== create, edit, delete, both ways"
-wait_for "a.txt reaches acer" has "$B/a.txt" one
-wait_for "b.txt (already on acer) reaches mac" has "$A/b.txt" "pre-existing on acer"
+wait_for "a.txt reaches devbox" has "$B/a.txt" one
+wait_for "b.txt (already on devbox) reaches mac" has "$A/b.txt" "pre-existing on devbox"
 mkdir -p "$A/deep/er"
 echo nested >"$A/deep/er/n.md"
-wait_for "a new file in a new subfolder reaches acer" has "$B/deep/er/n.md" nested
+wait_for "a new file in a new subfolder reaches devbox" has "$B/deep/er/n.md" nested
 echo two >"$B/a.txt"
-wait_for "an edit on acer reaches mac" has "$A/a.txt" two
+wait_for "an edit on devbox reaches mac" has "$A/a.txt" two
 echo three >"$A/a.txt"
-wait_for "an edit on mac reaches acer" has "$B/a.txt" three
+wait_for "an edit on mac reaches devbox" has "$B/a.txt" three
 echo "K=1" >"$A/.env"
 echo noise >"$A/x.log"
 mkdir -p "$A/node_modules/m" "$A/inner/.git"
 echo m >"$A/node_modules/m/i.js"
 echo r >"$A/inner/r.txt"
 echo marker >"$A/marker.txt"
-wait_for "marker reaches acer" has "$B/marker.txt" marker
+wait_for "marker reaches devbox" has "$B/marker.txt" marker
 for f in .env x.log node_modules/m/i.js inner/r.txt; do gone "$B/$f" || fail "$f should not sync"; done
 ok ".env, ignored files, node_modules and a nested repo stay on mac"
 rm "$B/b.txt"
-wait_for "a delete on acer reaches mac" gone "$A/b.txt"
+wait_for "a delete on devbox reaches mac" gone "$A/b.txt"
 rm "$A/deep/er/n.md"
-wait_for "a delete on mac reaches acer" gone "$B/deep/er/n.md"
+wait_for "a delete on mac reaches devbox" gone "$B/deep/er/n.md"
 
-echo "== trash and restore on acer (deleted by mac)"
+echo "== trash and restore on devbox (deleted by mac)"
 in_dir "$B" on_b trash | sed 's/^/     /'
 in_dir "$B" on_b trash | grep -q "deep/er/n.md  deleted by mac" || fail "trash lists deep/er/n.md"
 ok "hilo trash lists the file mac deleted"
 on_b restore "$B/deep/er/n.md" | sed 's/^/     /'
-has "$B/deep/er/n.md" nested || fail "restore brings it back on acer"
+has "$B/deep/er/n.md" nested || fail "restore brings it back on devbox"
 wait_for "the restored file syncs back to mac" has "$A/deep/er/n.md" nested
 
 echo "== a concurrent edit to the same file"
 echo base >"$A/c.txt"
-wait_for "c.txt reaches acer" has "$B/c.txt" base
-wait_for "acer settled" synced b
+wait_for "c.txt reaches devbox" has "$B/c.txt" base
+wait_for "devbox settled" synced b
 PB=${PIDS[1]}
-kill -STOP "$PB" # acer's daemon can't send its edit before mac's lands
-echo "acer's version" >"$B/c.txt"
+kill -STOP "$PB" # devbox's daemon can't send its edit before mac's lands
+echo "devbox's version" >"$B/c.txt"
 echo "mac's version" >"$A/c.txt"
 mac_sent() { [ "$(on_a log "$A/c.txt" | grep -c ' local ')" -ge 2 ] && synced a; }
 wait_for "mac's edit is accepted" mac_sent
 kill -CONT "$PB"
-wait_for "mac's version wins on acer" has "$B/c.txt" "mac's version"
+wait_for "mac's version wins on devbox" has "$B/c.txt" "mac's version"
 sleep 1
 has "$A/c.txt" "mac's version" || fail "mac keeps its version"
 ok "one winner on both disks"
 on_b log "$B/c.txt" | sed 's/^/     /'
-on_b log "$B/c.txt" | grep -q " conflict " || fail "acer's log shows the conflict"
+on_b log "$B/c.txt" | grep -q " conflict " || fail "devbox's log shows the conflict"
 on_b status | grep -q "1 in drives" || fail "status counts the drive conflict"
-ok "acer's log and status show the conflict"
+ok "devbox's log and status show the conflict"
 on_b restore "$B/c.txt" --conflict | sed 's/^/     /'
-has "$B/c.txt" "acer's version" || fail "restore --conflict brings acer's version back"
-wait_for "the restored version syncs to mac" has "$A/c.txt" "acer's version"
+has "$B/c.txt" "devbox's version" || fail "restore --conflict brings devbox's version back"
+wait_for "the restored version syncs to mac" has "$A/c.txt" "devbox's version"
 
 echo "== a version from outside the history is kept before hilo overwrites it"
-# acer's history is lost (pruned, or from before hilo kept one): the copy on disk has no record
+# devbox's history is lost (pruned, or from before hilo kept one): the copy on disk has no record
 kill "$PB"; wait "$PB" 2>/dev/null || true; PIDS[1]=
 rm -rf "$T/b/hilo/store"
 start b
-wait_for "acer back up" up b
-wait_for "acer settled again" synced b
+wait_for "devbox back up" up b
+wait_for "devbox settled again" synced b
 echo "mac again" >"$A/a.txt"
-wait_for "the edit reaches acer" has "$B/a.txt" "mac again"
+wait_for "the edit reaches devbox" has "$B/a.txt" "mac again"
 on_b log "$B/a.txt" | sed 's/^/     /'
-on_b log "$B/a.txt" | grep -q " replaced " || fail "acer kept what was on disk as replaced"
-ok "acer's log has the replaced version"
+on_b log "$B/a.txt" | grep -q " replaced " || fail "devbox kept what was on disk as replaced"
+ok "devbox's log has the replaced version"
 on_b log "$B/a.txt" | grep -q " remote " || fail "remote entry"
 on_a log "$A/a.txt" | grep -q " local " || fail "local entry on mac"
 on_a log "$A/a.txt" | sed 's/^/     /'
@@ -162,39 +162,39 @@ on_c status | grep -q "^scope     drive:notes/clientes$" || fail "status shows t
 grep -q "fuera.md is outside what this sandbox's token may sync (drive:notes/clientes)" "$T/c/daemon.log" || fail "the sandbox logs why"
 ok "the sandbox's status and log say why fuera.md stays there"
 
-echo "== acer's drive folder goes away (unmounted) and comes back"
+echo "== devbox's drive folder goes away (unmounted) and comes back"
 paused() { run_on "$1" status | grep -q "^drive .*(paused: "; }
 syncing() { run_on "$1" status | grep -q "^drive .*notes, "; }
 mv "$B" "$B.away"
-wait_for "acer pauses the drive" paused b
-echo "mac while acer was away" >"$A/a.txt"
-echo "created while acer was away" >"$A/new1.txt"
+wait_for "devbox pauses the drive" paused b
+echo "mac while devbox was away" >"$A/a.txt"
+echo "created while devbox was away" >"$A/new1.txt"
 rm "$A/marker.txt"
 wait_for "mac settled" synced a
 mv "$B.away" "$B"
-wait_for "acer syncs the drive again" syncing b
-wait_for "acer gets the edit it missed" has "$B/a.txt" "mac while acer was away"
-wait_for "acer gets the file created meanwhile" has "$B/new1.txt" "created while acer was away"
-wait_for "acer gets the deletion it missed" gone "$B/marker.txt"
-has "$A/a.txt" "mac while acer was away" || fail "mac's edit was reverted"
+wait_for "devbox syncs the drive again" syncing b
+wait_for "devbox gets the edit it missed" has "$B/a.txt" "mac while devbox was away"
+wait_for "devbox gets the file created meanwhile" has "$B/new1.txt" "created while devbox was away"
+wait_for "devbox gets the deletion it missed" gone "$B/marker.txt"
+has "$A/a.txt" "mac while devbox was away" || fail "mac's edit was reverted"
 ok "mac's edit is not reverted"
 
-echo "== the same, with acer restarting while the folder is back"
+echo "== the same, with devbox restarting while the folder is back"
 PB=${PIDS[2]}
 mv "$B" "$B.away"
-wait_for "acer pauses the drive" paused b
+wait_for "devbox pauses the drive" paused b
 echo "mac again while away" >"$A/a.txt"
 echo "second new file" >"$A/new2.txt"
 wait_for "mac settled" synced a
 mv "$B.away" "$B"
 kill "$PB"; wait "$PB" 2>/dev/null || true; PIDS[2]=
 start b
-wait_for "acer back up" up b
-wait_for "acer gets the edit it missed" has "$B/a.txt" "mac again while away"
-wait_for "acer gets the file created meanwhile" has "$B/new2.txt" "second new file"
+wait_for "devbox back up" up b
+wait_for "devbox gets the edit it missed" has "$B/a.txt" "mac again while away"
+wait_for "devbox gets the file created meanwhile" has "$B/new2.txt" "second new file"
 sleep 2
-has "$A/a.txt" "mac again while away" || fail "acer's stale copy reverted mac's edit"
-ok "acer's stale copy does not revert mac's edit"
+has "$A/a.txt" "mac again while away" || fail "devbox's stale copy reverted mac's edit"
+ok "devbox's stale copy does not revert mac's edit"
 
 echo "== mac's drive folder is swapped for an empty one (an unmounted mount point)"
 mv "$A" "$A.real"
@@ -202,13 +202,13 @@ mkdir "$A"
 wait_for "mac pauses the drive instead of deleting everything" paused a
 on_a status | grep "^drive" | sed 's/^/     /'
 sleep 5
-for f in a.txt c.txt new1.txt new2.txt clientes/plan.md; do [ -f "$B/$f" ] || fail "$f was deleted on acer"; done
-ok "acer keeps every file"
+for f in a.txt c.txt new1.txt new2.txt clientes/plan.md; do [ -f "$B/$f" ] || fail "$f was deleted on devbox"; done
+ok "devbox keeps every file"
 rmdir "$A"
 mv "$A.real" "$A"
 wait_for "the same folder back: mac syncs it again" syncing a
 echo "after the swap" >"$A/new1.txt"
-wait_for "and its edits reach acer" has "$B/new1.txt" "after the swap"
+wait_for "and its edits reach devbox" has "$B/new1.txt" "after the swap"
 
 echo "== hilo's own folder never syncs"
 out=$(on_a add --drive "$T/a" --as all 2>&1) && fail "a drive holding HILO_HOME was accepted"

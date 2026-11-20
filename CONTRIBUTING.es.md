@@ -10,9 +10,13 @@
 HILO_KEYCHAIN=0 HILO_NOTIFY=0 cargo test --offline   # incluye la simulación de 400.000 pasos
 cargo test -- --ignored keychain                      # usa el Keychain real de tu sesión
 cargo vet
+cargo build --release && bash scripts/e2e-drive.sh target/release/hilo   # daemons reales en una carpeta temporal
 ```
 
-Todos los crates están vendorizados en `vendor/`, así que la compilación nunca toca la red.
+Todos los crates están vendorizados en `vendor/`, así que la compilación nunca toca la red. `scripts/e2e-drive.sh` levanta
+un ancla, un miembro y un sandbox con alcance, cada uno con su propio `HOME` y `HILO_HOME` dentro de una carpeta
+temporal, y prueba de punta a punta la sincronización de drives, los conflictos, el historial, los tokens con alcance
+y las protecciones de los drives; nunca toca tu propia configuración.
 
 ## Reglas del código
 

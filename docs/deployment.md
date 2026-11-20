@@ -68,9 +68,10 @@ logs to `~/.hilo/daemon.log`. `--no-service` skips the service on `setup`, `init
 | `~/.hilo/config` | settings ([reference](commands.md#configuration)) |
 | `~/.hilo/key` · `peers` · `tokens` | this machine's identity, pinned peer keys, cloud tokens |
 | `~/.hilo/secrets` | Linux only, mode 0600: the keys that live in the Keychain on macOS |
+| `~/.hilo/store` | the version history behind `hilo log`, `restore` and `trash`, mode 0600 (`history_days`, `history_max_mb`) |
 
 `HILO_HOME` moves all of it. `hilo uninstall` removes the service, hooks and config; your repos stay
-plain git repos.
+plain git repos. It also removes the version history in the store.
 
 ## Platforms
 

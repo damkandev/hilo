@@ -22,7 +22,9 @@ cambia uno, el otro no lo ve hasta que alguien hace commit, push y pull. Mientra
 trabajan sobre código viejo y cada `.env` hay que copiarlo a mano a cada máquina y cada worktree.
 
 hilo vive debajo de tus agentes (Claude Code, Codex, T3 Code, Cursor, OpenCode, cualquier cosa que
-escriba archivos) y mantiene las máquinas al día a nivel de archivos y git.
+escriba archivos) y mantiene las máquinas al día a nivel de archivos y git. También funciona como un
+drive compartido para agentes: cualquier carpeta, con historial, búsqueda y herramientas de archivos
+por MCP, en tus propias máquinas.
 
 ## Para empezar
 
@@ -61,13 +63,14 @@ Mira [Despliegue](docs/deployment.es.md) para direcciones, servicios y plataform
 | | |
 | --- | --- |
 | **Cada escritura, en todas partes** | Un archivo que escribe un agente aparece en la otra máquina en unos 50 ms, con una Wi-Fi de casa. |
-| **No se pierde nada** | Si dos máquinas cambian el mismo archivo a la vez, una gana y la versión de la otra queda guardada en una rama `hilo/conflict/<rama>/<fecha>`. |
+| **No se pierde nada** | Si dos máquinas cambian el mismo archivo a la vez, una gana y la versión de la otra queda guardada: en una rama `hilo/conflict/<rama>/<fecha>` si es un repo, y en el historial de hilo siempre. Cada versión que hilo sobrescribe o borra se puede recuperar con `hilo log`, `hilo restore` y `hilo trash` (30 días por defecto). |
 | **Los agentes se enteran antes** | Antes de que un agente edite un archivo que otro está editando, Claude Code bloquea la edición y le dice quién lo tiene, dónde y por cuánto tiempo. |
 | **Ramas y commits** | Los commits viajan con los archivos, las ramas avanzan en todas las máquinas y un worktree nuevo en una aparece en las demás. |
 | **Repos nuevos, solos** | Haz `git init` en una carpeta vinculada, el primer commit, y el repo aparece en la otra máquina con su historial y sus archivos sin commitear. |
-| **También carpetas normales** | `hilo add ~/notas` sobre una carpeta sin repos la deja como [drive](docs/architecture.es.md#carpetas-drive): se sincroniza tal cual, y cada versión queda en `hilo log`. |
+| **También carpetas normales** | `hilo add --drive ~/notas` convierte cualquier carpeta en un [drive](docs/architecture.es.md#carpetas-drive): notas, specs, CSV y JSON que comparten los agentes, sincronizados tal cual, respetando `.gitignore` y sin mandar nunca un `.env`. |
+| **Agentes sin hooks ni disco** | Por MCP, cualquier agente puede leer, escribir, listar y buscar (`read`, `write`, `list`, `search`) en las carpetas sincronizadas, y en nada fuera de ellas. `hilo grep` busca en todo el drive desde la terminal. |
 | **`.env` sin copiar** | Las variables viajan cifradas, clave por clave, y se escriben en cada worktree que las necesita. Una clave puede quedar por máquina o solo en producción. |
-| **También agentes en la nube** | Los sandboxes de Claude Code en la web, Codex, Cursor y Codespaces se unen con un token, y su rama aparece en tu Mac mientras trabajan. [Cómo →](docs/cloud-agents.es.md) |
+| **También agentes en la nube** | Los sandboxes de Claude Code en la web, Codex, Cursor y Codespaces se unen con un token, y su rama aparece en tu Mac mientras trabajan. Un token puede limitarse a una carpeta, vencer solo y ser de solo lectura: el sandbox nunca ve el resto. [Cómo →](docs/cloud-agents.es.md) |
 
 ## Cómo funciona
 
@@ -87,9 +90,9 @@ mezcla ni se descarta: queda guardada en una rama de conflicto. [Más detalle �
 
 | | |
 | --- | --- |
-| [Arquitectura](docs/architecture.es.md) | el ancla, la regla de escritura, ramas vivas, leases, la bóveda de `.env` |
-| [Agentes en la nube](docs/cloud-agents.es.md) | tokens, `hilo up`, proxies, qué puede ver un sandbox |
-| [Comandos y configuración](docs/commands.es.md) | cada comando, `~/.hilo/config`, variables de entorno |
+| [Arquitectura](docs/architecture.es.md) | el ancla, la regla de escritura, ramas vivas, carpetas drive, historial, leases, la bóveda de `.env` |
+| [Agentes en la nube](docs/cloud-agents.es.md) | tokens, tokens con alcance y de solo lectura, `hilo up`, proxies, qué puede ver un sandbox |
+| [Comandos y configuración](docs/commands.es.md) | cada comando, herramientas MCP, `~/.hilo/config`, variables de entorno |
 | [Despliegue](docs/deployment.es.md) | elegir el ancla, direcciones, servicios en segundo plano, archivos, plataformas |
 | [Seguridad](SECURITY.es.md) | red, archivos, llaves, criptografía, cadena de suministro, verificar descargas, reportes |
 | [Contribuir](CONTRIBUTING.es.md) | compilar, testear, CI y releases |
@@ -97,7 +100,7 @@ mezcla ni se descarta: queda guardada en una rama de conflicto. [Más detalle �
 ## Estado
 
 hilo es joven (v0.3) y no tiene auditoría de seguridad externa. Un solo binario de Rust de unos
-1,6 MB; los únicos crates son de criptografía.
+1,8 MB (2,1 MB en Linux); los únicos crates son de criptografía.
 
 **Fuera de la v1:** Windows, atravesar NAT (el ancla necesita una dirección que las demás puedan
 alcanzar) y sincronizar la conversación del agente.

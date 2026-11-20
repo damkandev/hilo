@@ -156,16 +156,17 @@ production keys in `hilo env prod`.
 
 ## The binary
 
-One Rust binary of about 1.6 MB. JSON, the wire format, the terminal UI and the FSEvents and inotify
+One Rust binary of about 1.8 MB (2.1 MB on Linux). JSON, the wire format, the terminal UI and the FSEvents and inotify
 bindings are written against the standard library and system calls. The only crates are for
 cryptography: `snow`, `x25519-dalek`, `chacha20poly1305`, `sha2` and `hkdf`. See
 [SECURITY.md](../SECURITY.md) for how they're pinned and checked.
 
 | Module | |
 | --- | --- |
-| `anchor.rs` | orders changes, accepts or rejects writes, broadcasts leases |
-| `daemon.rs` | watches linked folders, applies remote changes, mirrors branches |
+| `anchor.rs` | orders changes, accepts or rejects writes, broadcasts leases, filters what a scoped token sees |
+| `daemon.rs` | watches linked folders and drives, applies remote changes, mirrors branches |
 | `sync.rs` · `git.rs` | file and commit transfer, conflict branches, bundles |
+| `store.rs` | the version history: every version kept by hash, `hilo log`, `restore`, `trash` |
 | `watch.rs` · `scan.rs` · `fsops.rs` | FSEvents and inotify, scanning, safe path handling |
 | `net.rs` · `noise.rs` · `wire.rs` · `crypto.rs` | connections and proxies, the Noise channel, framing |
 | `vault.rs` · `secret.rs` | the `.env` vault, the Keychain and `~/.hilo/secrets` |

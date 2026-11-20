@@ -359,7 +359,7 @@ mod tests {
         let d = tmp();
         let mut s = open(&d);
         let h1 = s.put("r:main", "a.txt", Some(b"one"), Kind::Local, "mac").unwrap();
-        let h2 = s.put("r:main", "a.txt", Some(b"two"), Kind::Remote, "acer").unwrap();
+        let h2 = s.put("r:main", "a.txt", Some(b"two"), Kind::Remote, "devbox").unwrap();
         s.put("r:main", "b.txt", Some(b"one"), Kind::Local, "mac").unwrap();
         assert_eq!(s.get(&h1).unwrap().as_deref(), Some(&b"one"[..]));
         assert_eq!(s.get(&NONE).unwrap(), None);
@@ -388,7 +388,7 @@ mod tests {
         let mut s = open(&d);
         for p in ["src/a.rs", "src/b.rs", "srcx/c.rs", "d.rs"] {
             s.put("u", p, Some(p.as_bytes()), Kind::Local, "mac").unwrap();
-            s.put("u", p, None, Kind::Remote, "acer").unwrap();
+            s.put("u", p, None, Kind::Remote, "devbox").unwrap();
         }
         s.put("u", "src/b.rs", Some(b"back"), Kind::Restored, "mac").unwrap();
         s.put("other", "src/z.rs", None, Kind::Local, "mac").unwrap();
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(s.totals(), (2, 11));
         // over the size cap: drops old versions even if they are recent, still never the newest
         let mut s = s;
-        s.put("u", "a", Some(b"newer a"), Kind::Remote, "acer").unwrap();
+        s.put("u", "a", Some(b"newer a"), Kind::Remote, "devbox").unwrap();
         for e in &mut s.entries {
             e.t_ms = now_ms();
         }
@@ -444,16 +444,16 @@ mod tests {
         if std::fs::write(d.join("store/objects/probe"), b"").is_ok() {
             return std::fs::remove_dir_all(d).unwrap(); // root ignores permissions: nothing to test
         }
-        assert!(s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "acer").is_err());
+        assert!(s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "devbox").is_err());
         assert_eq!(std::fs::read(root.join("f")).unwrap(), b"mine, never synced");
         std::fs::set_permissions(d.join("store/objects"), std::fs::Permissions::from_mode(0o700)).unwrap();
-        s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "acer").unwrap();
+        s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "devbox").unwrap();
         assert_eq!(std::fs::read(root.join("f")).unwrap(), b"theirs");
         let h: Vec<Kind> = s.history("u", "f").iter().map(|e| e.kind).collect();
         assert_eq!(h, [Kind::Remote, Kind::Replaced]);
         assert_eq!(s.get(&s.history("u", "f")[1].hash).unwrap().as_deref(), Some(&b"mine, never synced"[..]));
         // already on record: not kept twice
-        s.keep_and_write(&root, "u", "f", None, Kind::Remote, "acer").unwrap();
+        s.keep_and_write(&root, "u", "f", None, Kind::Remote, "devbox").unwrap();
         assert_eq!(s.history("u", "f").len(), 3);
         assert!(!root.join("f").exists());
         std::fs::remove_dir_all(d).unwrap();
@@ -469,7 +469,7 @@ mod tests {
         let mut s = open(&d);
         let day = 86_400_000;
         let kept = s.put("u", "old", Some(b"written 60 days ago, deleted today"), Kind::Local, "").unwrap();
-        s.put("u", "old", None, Kind::Remote, "acer").unwrap();
+        s.put("u", "old", None, Kind::Remote, "devbox").unwrap();
         let a = s.put("u", "f", Some(b"a"), Kind::Local, "").unwrap();
         let b = s.put("u", "f", Some(b"b"), Kind::Local, "").unwrap();
         s.put("u", "f", Some(b"c"), Kind::Local, "").unwrap();
@@ -491,9 +491,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let mut s = open(&d.join("store"));
         s.put("u", "f", Some(b"A"), Kind::Local, "").unwrap();
-        s.put("u", "f", Some(b"B"), Kind::Remote, "acer").unwrap();
+        s.put("u", "f", Some(b"B"), Kind::Remote, "devbox").unwrap();
         std::fs::write(root.join("f"), b"A").unwrap(); // went back to A here, not scanned yet
-        s.keep_and_write(&root, "u", "f", Some(b"C"), Kind::Remote, "acer").unwrap();
+        s.keep_and_write(&root, "u", "f", Some(b"C"), Kind::Remote, "devbox").unwrap();
         let h: Vec<Kind> = s.history("u", "f").iter().map(|e| e.kind).collect();
         assert_eq!(h, [Kind::Remote, Kind::Replaced, Kind::Remote, Kind::Local]);
         std::fs::remove_dir_all(d).unwrap();
@@ -530,11 +530,11 @@ mod tests {
             assert!(s.broken(), "{what}");
             assert_eq!(std::fs::metadata(&j).unwrap().len(), bytes.len() as u64, "{what}");
             assert!(std::fs::read_dir(&d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("journal.bad.")), "{what}");
-            assert!(s.put("u", "f", Some(b"three"), Kind::Remote, "acer").is_err(), "{what}");
+            assert!(s.put("u", "f", Some(b"three"), Kind::Remote, "devbox").is_err(), "{what}");
             let root = d.join("wt");
             std::fs::create_dir_all(&root).unwrap();
             std::fs::write(root.join("f"), b"mine").unwrap();
-            assert!(s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "acer").is_err(), "{what}");
+            assert!(s.keep_and_write(&root, "u", "f", Some(b"theirs"), Kind::Remote, "devbox").is_err(), "{what}");
             assert_eq!(std::fs::read(root.join("f")).unwrap(), b"mine", "{what}");
             assert_eq!(s.prune(0, 0).unwrap(), (0, 0), "{what}");
             assert!(d.join("objects").join(hex(&h)).exists(), "{what}");

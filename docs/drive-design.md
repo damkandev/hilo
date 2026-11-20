@@ -1,7 +1,9 @@
 # hilo drive: design (phases 1 and 2)
 
-Internal design note for building the drive. It fixes the interfaces so the pieces can be built in
-parallel. Read `docs/architecture.md` first.
+Internal design note for building the drive. It fixed the interfaces so the pieces could be built in
+parallel, and is kept as the record of that design. The behavior that shipped, including the changes
+reviews asked for (checksummed journal, paused drives, the scope message), is described in
+`docs/architecture.md`, `docs/commands.md`, `docs/cloud-agents.md` and `SECURITY.md`.
 
 Rules that do not change: one anchor orders everything; the first write on a base wins; nothing is
 overwritten before it is saved; the only crates are for cryptography; `#![forbid(unsafe_code)]`
@@ -138,4 +140,4 @@ CLI (all through the daemon's IPC; `PATH` absolute or relative to the cwd, must 
 - `cargo test --release --offline --locked`, with `HILO_KEYCHAIN=0 HILO_NOTIFY=0` and `HILO_HOME` set
   to a temp dir. Never run a daemon or the CLI against the real `~/.hilo`.
 - Each piece leaves its own focused tests; the simulation in `sync.rs` must keep passing.
-- End to end (after merge): two daemons with separate `HILO_HOME`s on another port, Mac and acer.
+- End to end (after merge): two daemons with separate `HILO_HOME`s on another port, two machines.

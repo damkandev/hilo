@@ -22,7 +22,8 @@ changes, the other doesn't see until someone commits, pushes and pulls. Meanwhil
 other, work on stale code, and every `.env` has to be copied by hand to every machine and worktree.
 
 hilo sits underneath your agents (Claude Code, Codex, T3 Code, Cursor, OpenCode, anything that writes
-files) and keeps the machines in step at the level of files and git.
+files) and keeps the machines in step at the level of files and git. It also works as a shared drive
+for agents: any folder, with history, search and file tools over MCP, on your own machines.
 
 ## Get started
 
@@ -61,13 +62,14 @@ See [Deployment](docs/deployment.md) for addresses, services and platforms.
 | | |
 | --- | --- |
 | **Every write, everywhere** | A file an agent writes appears on the other machine in about 50 ms on a home Wi-Fi. |
-| **Nothing is lost** | If two machines change the same file at once, one wins and the other's version is kept on a `hilo/conflict/<branch>/<date>` branch. |
+| **Nothing is lost** | If two machines change the same file at once, one wins and the other's version is kept: on a `hilo/conflict/<branch>/<date>` branch in a repo, and in hilo's history everywhere. Every version hilo overwrites or deletes stays recoverable with `hilo log`, `hilo restore` and `hilo trash` (30 days by default). |
 | **Agents hear about it first** | Before an agent edits a file another agent is editing, Claude Code blocks the edit and tells it who has the file, where, and for how long. |
 | **Branches and commits** | Commits travel with the files, branches move on every machine, and a new worktree on one machine appears on the others. |
 | **New repos on their own** | `git init` a repo in a linked folder, make the first commit, and it shows up on the other machine with its history and uncommitted files. |
-| **Plain folders too** | `hilo add ~/notes` on a folder with no repos makes it a [drive](docs/architecture.md#drive-folders): it syncs as it is, and every version stays in `hilo log`. |
+| **Plain folders too** | `hilo add --drive ~/notes` makes any folder a [drive](docs/architecture.md#drive-folders): notes, specs, CSV and JSON that agents share, synced as they are, `.gitignore` respected, `.env` never sent. |
+| **Agents without hooks or a disk** | Over MCP, any agent can `read`, `write`, `list` and `search` the synced folders, and nothing outside them. `hilo grep` searches the whole drive from the terminal. |
 | **`.env` without copying** | Variables are encrypted, synced key by key, and written into every worktree that needs them. Keys can stay per machine or production-only. |
-| **Cloud agents too** | Claude Code on the web, Codex, Cursor and Codespaces sandboxes join with a token, and their branch shows up on your Mac while they work. [How →](docs/cloud-agents.md) |
+| **Cloud agents too** | Claude Code on the web, Codex, Cursor and Codespaces sandboxes join with a token, and their branch shows up on your Mac while they work. A token can be limited to one folder, expire on its own and be read-only: the sandbox never sees the rest. [How →](docs/cloud-agents.md) |
 
 ## How it works
 
@@ -87,17 +89,17 @@ it's saved on a conflict branch. [Read more →](docs/architecture.md)
 
 | | |
 | --- | --- |
-| [Architecture](docs/architecture.md) | the anchor, the write rule, live branches, leases, the `.env` vault |
-| [Cloud agents](docs/cloud-agents.md) | tokens, `hilo up`, proxies, what a sandbox can see |
-| [Commands and configuration](docs/commands.md) | every command, `~/.hilo/config`, environment variables |
+| [Architecture](docs/architecture.md) | the anchor, the write rule, live branches, drive folders, history, leases, the `.env` vault |
+| [Cloud agents](docs/cloud-agents.md) | tokens, scoped and read-only tokens, `hilo up`, proxies, what a sandbox can see |
+| [Commands and configuration](docs/commands.md) | every command, MCP tools, `~/.hilo/config`, environment variables |
 | [Deployment](docs/deployment.md) | choosing the anchor, addresses, background services, files, platforms |
 | [Security](SECURITY.md) | network, files, keys, cryptography, supply chain, verifying downloads, reporting |
 | [Contributing](CONTRIBUTING.md) | building, testing, CI and releases |
 
 ## Status
 
-hilo is young (v0.3) and has had no external security audit. One Rust binary of about 1.6 MB; the
-only crates are for cryptography.
+hilo is young (v0.3) and has had no external security audit. One Rust binary of about 1.8 MB
+(2.1 MB on Linux); the only crates are for cryptography.
 
 **Not in v1:** Windows, NAT traversal (the anchor needs an address the others can reach), and syncing
 the agent's conversation.

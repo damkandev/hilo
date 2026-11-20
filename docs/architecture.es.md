@@ -161,16 +161,17 @@ lances con `hilo run`, y guarda las llaves de producción con `hilo env prod`.
 
 ## El binario
 
-Un solo binario de Rust de unos 1,6 MB. JSON, el formato de red, la interfaz de terminal y los
+Un solo binario de Rust de unos 1,8 MB (2,1 MB en Linux). JSON, el formato de red, la interfaz de terminal y los
 bindings de FSEvents e inotify están escritos sobre la biblioteca estándar y llamadas al sistema. Los
 únicos crates son de criptografía: `snow`, `x25519-dalek`, `chacha20poly1305`, `sha2` y `hkdf`. Mira
 [SECURITY.es.md](../SECURITY.es.md) para saber cómo se fijan y se verifican.
 
 | Módulo | |
 | --- | --- |
-| `anchor.rs` | ordena los cambios, acepta o rechaza escrituras, reparte los leases |
-| `daemon.rs` | vigila las carpetas vinculadas, aplica cambios remotos, espeja ramas |
+| `anchor.rs` | ordena los cambios, acepta o rechaza escrituras, reparte los leases, filtra lo que ve un token con alcance |
+| `daemon.rs` | vigila las carpetas vinculadas y los drives, aplica cambios remotos, espeja ramas |
 | `sync.rs` · `git.rs` | transferencia de archivos y commits, ramas de conflicto, bundles |
+| `store.rs` | el historial de versiones: cada versión guardada por su hash, `hilo log`, `restore`, `trash` |
 | `watch.rs` · `scan.rs` · `fsops.rs` | FSEvents e inotify, escaneo, manejo seguro de rutas |
 | `net.rs` · `noise.rs` · `wire.rs` · `crypto.rs` | conexiones y proxies, el canal Noise, el framing |
 | `vault.rs` · `secret.rs` | la bóveda de `.env`, el Keychain y `~/.hilo/secrets` |
