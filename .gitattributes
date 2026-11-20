@@ -1,0 +1,2 @@
+# Vendored crates are checked by checksum: a CRLF checkout (Windows autocrlf) breaks the build.
+vendor/** -text
