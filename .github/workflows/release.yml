@@ -58,15 +58,55 @@ jobs:
           name: hilo-${{ matrix.target }}
           path: dist/
 
+  # hilo.app (Apple silicon) in hilo-macos.dmg: the app and the CLI inside it. Signed and notarized
+  # when the Apple secrets exist; otherwise ad hoc, and macOS asks once before opening it.
+  mac-app:
+    runs-on: macos-latest
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERT_P12_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Keychain with the signing certificate
+        if: env.HAS_APPLE_CERT == 'true'
+        env:
+          APPLE_CERT: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          echo "$APPLE_CERT" | base64 --decode > cert.p12
+          security create-keychain -p ci build.keychain
+          security import cert.p12 -k build.keychain -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
+          security list-keychains -s build.keychain
+          security unlock-keychain -p ci build.keychain
+      - run: app/bundle.sh
+        env:
+          SIGN_ID: ${{ env.HAS_APPLE_CERT == 'true' && secrets.APPLE_IDENTITY || '' }}
+      - name: Notarize
+        if: env.HAS_APPLE_CERT == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool submit app/dist/hilo-macos.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple app/dist/hilo-macos.dmg
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: app/dist/hilo-macos.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hilo-macos-app
+          path: app/dist/hilo-macos.dmg
+
   publish:
-    needs: build
+    needs: [build, mac-app]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - run: cd dist && sha256sum hilo-*.tar.gz > SHA256SUMS
+      - run: cd dist && sha256sum hilo-*.tar.gz hilo-macos.dmg > SHA256SUMS
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/SHA256SUMS

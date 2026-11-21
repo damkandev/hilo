@@ -82,7 +82,7 @@ See [Deployment](docs/deployment.md) for addresses, services and platforms.
 from `~/.ssh/config` (or paste a join code), and that folder holds the same files on both. From the
 app you also see who's online, add and remove folders, bring back any version of a file and restore
 deleted ones. It runs the `hilo` CLI that ships inside it. Build it with `app/bundle.sh`, which also
-makes the `.dmg`; Windows comes later.
+makes the `.dmg`; each release has it as `hilo-macos.dmg` (Apple silicon). Windows comes later.
 
 </details>
 

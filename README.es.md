@@ -85,7 +85,7 @@ Mira [Despliegue](docs/deployment.es.md) para direcciones, servicios y plataform
 otra máquina de `~/.ssh/config` (o pegas un código de unión) y esa carpeta tiene los mismos archivos en
 las dos. Desde la app también ves quién está conectado, agregas y quitas carpetas, traes de vuelta
 cualquier versión de un archivo y recuperas los borrados. Usa el CLI `hilo` que viene adentro. Se arma
-con `app/bundle.sh`, que también genera el `.dmg`; Windows viene después.
+con `app/bundle.sh`, que también genera el `.dmg`; cada release lo trae como `hilo-macos.dmg` (Apple silicon). Windows viene después.
 
 </details>
 
