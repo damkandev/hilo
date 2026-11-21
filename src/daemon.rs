@@ -6,6 +6,7 @@ use crate::config::{self, Config};
 use crate::crypto::{ct_eq, sha256, unhex};
 use crate::fsops::{self, excluded, is_env_name, runs_code, scripts_of, valid_path, MAX_FILE};
 use crate::git;
+use crate::json::Json;
 use crate::lease;
 use crate::log;
 use crate::net;
@@ -1446,10 +1447,22 @@ impl D {
 
     fn history_cmd(&mut self, a: &[&str]) -> Result<String, String> {
         let file = |d: &Self, p: &str| d.locate(p).filter(|x| valid_path(&x.2)).ok_or(format!("{p} is not a file in a synced folder"));
+        // `--json` last: the same answer for the desktop app
+        let (a, json) = match a {
+            [rest @ .., "--json"] => (rest, true),
+            _ => (a, false),
+        };
         match a {
             ["log", p] => {
                 let (_, id, rel) = file(self, p)?;
                 let h = self.store.history(&id, &rel);
+                if json {
+                    let rows = h.iter().enumerate().map(|(i, e)| {
+                        let size = if e.hash == NONE { Json::Null } else { self.store.size(&e.hash).map_or(Json::Null, |n| Json::n(n as i64)) };
+                        Json::obj(vec![("n", Json::n(i as i64 + 1)), ("time", Json::n((e.t_ms / 1000) as i64)), ("kind", Json::s(e.kind.name())), ("origin", Json::s(&e.origin)), ("size", size)])
+                    });
+                    return Ok(Json::Arr(rows.collect()).to_string());
+                }
                 if h.is_empty() {
                     return Ok(format!("no history for {rel}"));
                 }
@@ -1496,14 +1509,12 @@ impl D {
                 let (wi, id, rel) = self.locate(dir).ok_or(format!("{dir} is not in a synced folder"))?;
                 let prefix = if rest == ["--unit"] { "" } else { &rel };
                 let root = self.wts[wi].root.clone();
-                let out: Vec<String> = self
-                    .store
-                    .deleted(&id, prefix)
-                    .into_iter()
-                    .filter(|e| self.store.history(&id, &e.path).iter().any(|v| v.hash != NONE))
-                    .filter(|e| !root.join(&e.path).exists())
-                    .map(|e| format!("{}  {}  deleted by {}", crate::date(e.t_ms / 1000), e.path, if e.origin.is_empty() { "?" } else { &e.origin }))
-                    .collect();
+                let gone = self.store.deleted(&id, prefix).into_iter().filter(|e| self.store.history(&id, &e.path).iter().any(|v| v.hash != NONE)).filter(|e| !root.join(&e.path).exists());
+                if json {
+                    let rows = gone.map(|e| Json::obj(vec![("time", Json::n((e.t_ms / 1000) as i64)), ("path", Json::s(&root.join(&e.path).to_string_lossy())), ("origin", Json::s(&e.origin))]));
+                    return Ok(Json::Arr(rows.collect()).to_string());
+                }
+                let out: Vec<String> = gone.map(|e| format!("{}  {}  deleted by {}", crate::date(e.t_ms / 1000), e.path, if e.origin.is_empty() { "?" } else { &e.origin })).collect();
                 Ok(if out.is_empty() { "nothing deleted here is in the history".into() } else { format!("{}\n\nhilo restore PATH brings one back", out.join("\n")) })
             }
             _ => Err("unknown request".into()),
@@ -1519,6 +1530,7 @@ impl D {
     fn ipc(&mut self, a: Vec<String>) -> (u8, String) {
         let a: Vec<&str> = a.iter().map(String::as_str).collect();
         match a.as_slice() {
+            ["status", "--json"] => (0, self.status_json().to_string()),
             ["status", rest @ ..] => (0, self.status(rest.contains(&"--latency"))),
             ["add", path] => self.add_path(path, "", ""),
             ["add", path, mode, label] => self.add_path(path, mode, label),
@@ -1596,6 +1608,43 @@ impl D {
             }
         }
         files
+    }
+
+    /// `hilo status --json`, for the desktop app.
+    fn status_json(&self) -> Json {
+        let p = |p: &Path| Json::s(&p.to_string_lossy());
+        let pending = |w: &Wt| Json::n(w.id().map_or(0, |id| self.r.pending_keys().filter(|k| k.0 == id).count()) as i64);
+        let conn = if self.out.is_some() && self.caught { "in sync" } else if self.out.is_some() { "catching up" } else { "offline" };
+        let mut drives: Vec<Json> = vec![];
+        for w in &self.wts {
+            if let Unit::Drive(l) = &w.unit {
+                drives.push(Json::obj(vec![("path", p(&w.root)), ("label", Json::s(l)), ("files", Json::n(w.scanner.files.len() as i64)), ("pending", pending(w)), ("paused", Json::Null)]));
+            }
+        }
+        for w in &self.paused {
+            let why = w.scanner.root_ok().err().map_or("starting".into(), |e| e.to_string());
+            let l = if let Unit::Drive(l) = &w.unit { l.as_str() } else { "" };
+            drives.push(Json::obj(vec![("path", p(&w.root)), ("label", Json::s(l)), ("files", Json::n(0)), ("pending", Json::n(0)), ("paused", Json::s(&why))]));
+        }
+        let folders = self.folders.iter().map(|(f, _)| Json::obj(vec![("path", p(f)), ("repos", Json::n(self.repos.iter().filter(|r| r.root.parent() == Some(f.as_path())).count() as i64))]));
+        let wts = self.wts.iter().filter_map(|w| Some(Json::obj(vec![("path", p(&w.root)), ("branch", w.git()?.branch.as_deref().map_or(Json::Null, Json::s)), ("pending", pending(w))])));
+        let (versions, bytes) = self.store.totals();
+        Json::obj(vec![
+            ("machine", Json::s(&self.sh.name)),
+            ("role", Json::s(&self.role)),
+            ("anchor", Json::s(&self.anchor_addr)),
+            ("connection", Json::s(if self.role == "anchor" { "in sync" } else { conn })),
+            ("online", Json::Arr(self.peers.iter().map(|n| Json::s(n)).collect())),
+            ("folders", Json::Arr(folders.collect())),
+            ("drives", Json::Arr(drives)),
+            ("worktrees", Json::Arr(wts.collect())),
+            ("leases", Json::n(self.sh.leases.lock().unwrap().snapshot().len() as i64)),
+            ("conflicts", Json::n(self.repos.iter().map(|r| git::conflict_branches(&r.root)).sum::<usize>() as i64)),
+            ("drive_conflicts", Json::n(self.store.conflicts("drive:") as i64)),
+            ("versions", Json::n(versions as i64)),
+            ("history_bytes", Json::n(bytes as i64)),
+            ("waiting_approval", Json::n(self.held.len() as i64)),
+        ])
     }
 
     fn status(&self, latency: bool) -> String {

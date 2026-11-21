@@ -17,10 +17,13 @@ You only need `hilo`. Everything else is there when you want to look or change s
 | `hilo add DIR` | link another folder of repos, or a single repo. A folder with files and no repos in it becomes a [drive](architecture.md#drive-folders): its files sync as they are. An empty folder stays a folder that receives repos |
 | `hilo add --drive DIR [--as LABEL]` | link `DIR` as a drive, empty or with repos in it (they are skipped; `hilo add` one to sync it as a repo). Machines match drives by `LABEL`, by default the folder's name lowercased; `--as` alone also means a drive. On a drive whose folder was unmounted or replaced, it makes the folder there now the drive |
 | `hilo up [--read-only] [--drive LABEL]` | in a sandbox's setup script: join, link, start, wait until in sync ([Cloud agents](cloud-agents.md)). `--drive LABEL` links the folder (created if missing) as that drive |
+| `hilo remove DIR` | stop syncing a linked folder, repo or drive here; its files stay where they are |
 | `hilo uninstall` | remove the service, hooks and config; your repos stay plain git repos |
 
 `init`, `join` and `setup` link the folder you run them in, or `--folder DIR`. They also take
-`--name NAME` and `--no-service` (don't install launchd or systemd).
+`--as LABEL` (link it as that drive; `setup` does it on both machines), `--name NAME` and
+`--no-service` (don't install launchd or systemd). `hilo setup --hosts` lists the hosts in
+`~/.ssh/config`. `status`, `log PATH` and `trash DIR` take `--json`, for the Mac app.
 
 ## Day to day
 

@@ -18,10 +18,13 @@ línea de comandos está en inglés.
 | `hilo add DIR` | vincula otra carpeta de repos, o un solo repo. Una carpeta con archivos y sin repos adentro queda como [drive](architecture.es.md#carpetas-drive): sus archivos se sincronizan tal cual. Una carpeta vacía queda como carpeta que recibe repos |
 | `hilo add --drive DIR [--as ETIQUETA]` | vincula `DIR` como drive, vacía o con repos adentro (se saltan; `hilo add` sobre uno lo sincroniza como repo). Las máquinas reconocen un drive por `ETIQUETA`, por defecto el nombre de la carpeta en minúsculas; `--as` solo también significa drive. Sobre un drive cuya carpeta se desmontó o se reemplazó, deja como drive la carpeta que está ahí ahora |
 | `hilo up [--read-only] [--drive ETIQUETA]` | en el script de setup de un sandbox: une, vincula, arranca y espera a quedar al día ([Agentes en la nube](cloud-agents.es.md)). `--drive ETIQUETA` vincula la carpeta (la crea si no existe) como ese drive |
+| `hilo remove DIR` | deja de sincronizar aquí una carpeta, repo o drive vinculado; sus archivos se quedan donde están |
 | `hilo uninstall` | quita el servicio, los hooks y la configuración; tus repos quedan como repos git normales |
 
 `init`, `join` y `setup` vinculan la carpeta donde los corres, o `--folder DIR`. También aceptan
-`--name NOMBRE` y `--no-service` (no instala launchd ni systemd).
+`--as ETIQUETA` (la vincula como ese drive; `setup` lo hace en las dos máquinas), `--name NOMBRE` y
+`--no-service` (no instala launchd ni systemd). `hilo setup --hosts` lista los hosts de
+`~/.ssh/config`. `status`, `log RUTA` y `trash DIR` aceptan `--json`, para la app de Mac.
 
 ## Día a día
 

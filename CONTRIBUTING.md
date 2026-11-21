@@ -17,6 +17,21 @@ Every crate is vendored in `vendor/`, so the build never touches the network. `s
 member and a scoped sandbox, each with its own `HOME` and `HILO_HOME` under one temp dir, and checks drive sync,
 conflicts, history, scoped tokens and the drive safety guards end to end; it never touches your own setup.
 
+### The Mac app
+
+`app/` is the desktop app, built with [gpui](https://gpui.rs). It is its own cargo workspace so gpui's
+~700 crates stay out of the CLI, `vendor/` and `cargo vet`: the CLI's rules below don't apply to it.
+It does nothing on its own; it runs the `hilo` CLI (`status --json`, `setup`, `add`, `remove`, `log`,
+`restore`, `trash`). Its build uses crates.io, so build it from outside the repo's cargo config:
+
+```sh
+(cd / && cargo run --manifest-path "$PWD/app/Cargo.toml")   # uses ~/.local/bin/hilo, or a hilo next to the binary
+app/bundle.sh                                               # app/dist/hilo.app and hilo-macos.dmg
+```
+
+`bundle.sh` signs ad hoc unless `SIGN_ID` names a Developer ID; a public `.dmg` also needs notarizing
+(`xcrun notarytool submit … --wait`, then `xcrun stapler staple`).
+
 ## Rules of the codebase
 
 - **Only cryptography comes from crates.** JSON, the wire format, the terminal UI and the file

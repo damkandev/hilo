@@ -93,6 +93,7 @@ create there appear on the other machines on their own. The rest is optional:
 
   hilo add FOLDER [--drive] [--as LABEL]    link another folder of repos, a single repo, or a folder
                                             of files as a drive (--drive or --as: always a drive)
+  hilo remove FOLDER                        stop syncing it here (its files stay)
 
 Cloud agents (Claude Code on the web, Codex, Cursor, Codespaces, dev containersâ€¦):
 
@@ -117,7 +118,8 @@ Cloud agents (Claude Code on the web, Codex, Cursor, Codespaces, dev containersâ
   hilo unpair MACHINE                       cut a machine off and rotate the vault key (anchor)
   hilo uninstall                            remove service, hooks and config
 
-Flags for init/join/setup: --folder DIR, --no-service (don't install launchd/systemd), --name NAME.
+Flags for init/join/setup: --folder DIR, --as LABEL (link it as a drive), --no-service (don't install
+launchd/systemd), --name NAME.
 init only: --bind IP:PORT when the anchor listens on a different address than the one it advertises (NAT, containers).";
 
 /// What `init` / `join` (and the wizard) were asked to set up.
@@ -142,7 +144,7 @@ impl Opts {
             listen: flag(args, "--listen"),
             bind: flag(args, "--bind"),
             public: args.iter().any(|a| a == "--public"),
-            drive: None,
+            drive: flag(args, "--as"),
         }
     }
 }
@@ -607,6 +609,37 @@ fn add(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `hilo remove PATH`: stop syncing a linked folder, repo or drive here. Its files stay where they are.
+fn remove(p: &str) -> Result<(), String> {
+    let path = fsops::canonical(Path::new(p)).unwrap_or_else(|_| PathBuf::from(abs(p)));
+    let same = |v: &str| fsops::canonical(Path::new(v)).unwrap_or_else(|_| PathBuf::from(v)) == path;
+    let mut cfg = Config::load();
+    let mut hit = false;
+    for k in ["folder", "repo", "drive"] {
+        let vs: Vec<String> = cfg.all(k).into_iter().map(str::to_string).collect();
+        cfg.remove(k);
+        for v in vs {
+            // `drive = <label> <path>`
+            let dir = if k == "drive" { v.split_once(' ').map_or(v.as_str(), |x| x.1.trim_start()) } else { &v };
+            if same(dir) {
+                hit = true;
+            } else {
+                cfg.add(k, &v);
+            }
+        }
+    }
+    if !hit {
+        return Err(format!("{} is not linked here", tui::tilde(&path)));
+    }
+    cfg.save().map_err(|e| e.to_string())?;
+    println!("{} no longer syncs here; its files stay where they are", tui::tilde(&path));
+    // the daemon reads the folders at start
+    if daemon_up() && !install::restart_service() {
+        println!("restart the daemon to stop watching it (`hilo daemon`)");
+    }
+    Ok(())
+}
+
 /// Machine-readable facts, for `hilo setup` probing over SSH.
 fn info() {
     let cfg = Config::load();
@@ -646,6 +679,26 @@ fn daemon_call(a: &[&str]) -> Result<(), String> {
 }
 
 fn status(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|x| x == "--json") {
+        if daemon_call(&["status", "--json"]).is_ok() {
+            return Ok(());
+        }
+        // what the config knows; the app tells "not set up" (no role) from "daemon not running"
+        let cfg = Config::load();
+        let p = |p: &Path| json::Json::s(&p.to_string_lossy());
+        let drives = cfg.drives().iter().map(|(l, d)| json::Json::obj(vec![("path", p(d)), ("label", json::Json::s(l)), ("paused", json::Json::s("the daemon isn't running"))])).collect();
+        let folders = cfg.all("folder").iter().map(|f| json::Json::obj(vec![("path", json::Json::s(f))])).collect();
+        let j = json::Json::obj(vec![
+            ("machine", json::Json::s(&config::name())),
+            ("role", json::Json::s(cfg.get("role").unwrap_or_default())),
+            ("anchor", json::Json::s(cfg.get("anchor").unwrap_or_default())),
+            ("daemon", json::Json::Bool(false)),
+            ("drives", json::Json::Arr(drives)),
+            ("folders", json::Json::Arr(folders)),
+        ]);
+        println!("{j}");
+        return Ok(());
+    }
     let mut a = vec!["status"];
     if args.iter().any(|x| x == "--latency") {
         a.push("--latency");
@@ -772,6 +825,10 @@ fn main() -> ExitCode {
         Some("join") => join(rest),
         Some("invite") => invite(),
         Some("add") => add(rest),
+        Some("remove") => match rest {
+            [p] => remove(p),
+            _ => Err("usage: hilo remove FOLDER".into()),
+        },
         Some("token") => token(rest),
         Some("up") => up(rest),
         Some("info") => {
@@ -792,6 +849,7 @@ fn main() -> ExitCode {
         },
         Some("log") => match rest {
             [p] => daemon_call(&["log", &abs(p)]),
+            [p, j] if j == "--json" => daemon_call(&["log", &abs(p), j]),
             _ => Err("usage: hilo log PATH".into()),
         },
         Some("restore") => match rest {
@@ -805,6 +863,7 @@ fn main() -> ExitCode {
         Some("trash") => match rest {
             [] => daemon_call(&["trash", &abs("."), "--unit"]),
             [d] => daemon_call(&["trash", &abs(d)]),
+            [d, j] if j == "--json" => daemon_call(&["trash", &abs(d), j]),
             _ => Err("usage: hilo trash [DIR]".into()),
         },
         Some("approve") => {

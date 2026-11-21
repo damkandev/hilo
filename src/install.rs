@@ -305,6 +305,22 @@ fn service(bin: &Path, add: bool) -> Option<String> {
     Some(if started { format!(r"{KEY}\hilo (starts at logon)") } else { format!(r"wrote {KEY}\hilo but could not start it; run `hilo daemon` yourself") })
 }
 
+/// Restarts the background service, if this machine has one. False: there is none (or it failed).
+#[cfg(unix)]
+pub fn restart_service() -> bool {
+    if cfg!(target_os = "macos") {
+        home().join(format!("Library/LaunchAgents/{LABEL}.plist")).exists() && run("launchctl", &["kickstart", "-k", &format!("gui/{}/{LABEL}", unsafe { getuid() })])
+    } else {
+        home().join(".config/systemd/user/hilo.service").exists() && run("systemctl", &["--user", "restart", "hilo.service"])
+    }
+}
+
+// ponytail: a Run key can't be asked to restart; `hilo remove` tells the user to restart the daemon
+#[cfg(windows)]
+pub fn restart_service() -> bool {
+    false
+}
+
 pub fn install(bin: &Path, with_service: bool) -> Vec<String> {
     let mut v: Vec<String> = vec![];
     v.extend(claude(bin, true));

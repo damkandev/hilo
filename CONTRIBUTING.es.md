@@ -18,6 +18,22 @@ un ancla, un miembro y un sandbox con alcance, cada uno con su propio `HOME` y `
 temporal, y prueba de punta a punta la sincronización de drives, los conflictos, el historial, los tokens con alcance
 y las protecciones de los drives; nunca toca tu propia configuración.
 
+### La app para Mac
+
+`app/` es la app de escritorio, hecha con [gpui](https://gpui.rs). Es su propio workspace de cargo para
+que los ~700 crates de gpui queden fuera del CLI, de `vendor/` y de `cargo vet`: las reglas del CLI de
+abajo no aplican a ella. No hace nada por su cuenta; corre el CLI `hilo` (`status --json`, `setup`,
+`add`, `remove`, `log`, `restore`, `trash`). Su compilación usa crates.io, así que se compila desde
+fuera de la configuración de cargo del repo:
+
+```sh
+(cd / && cargo run --manifest-path "$PWD/app/Cargo.toml")   # usa ~/.local/bin/hilo, o un hilo junto al binario
+app/bundle.sh                                               # app/dist/hilo.app y hilo-macos.dmg
+```
+
+`bundle.sh` firma ad hoc salvo que `SIGN_ID` nombre un Developer ID; un `.dmg` público además necesita
+notarización (`xcrun notarytool submit … --wait` y luego `xcrun stapler staple`).
+
 ## Reglas del código
 
 - **Solo la criptografía viene de crates.** JSON, el formato de red, la interfaz de terminal y los
