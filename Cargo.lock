@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "hilo"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chacha20poly1305",
  "hkdf",
