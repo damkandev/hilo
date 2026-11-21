@@ -79,7 +79,9 @@ pub fn run(kind: &str) -> i32 {
             if let Some(m) = sensitive(tool, &input) {
                 (2, m.to_string())
             } else if let (true, Some(p)) = (EDIT_TOOLS.contains(&tool), &path) {
-                call(&["claim", &session, p]).unwrap_or((0, String::new()))
+                // Edit and MultiEdit change some lines of what the agent just read: they may share a file
+                let mode = if matches!(tool, "Edit" | "MultiEdit") { "edit" } else { "write" };
+                call(&["claim", &session, p, mode]).unwrap_or((0, String::new()))
             } else {
                 (0, String::new())
             }

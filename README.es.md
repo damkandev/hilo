@@ -37,9 +37,9 @@ escriba archivos) y les da un solo drive:
 - **Cualquier otra carpeta también se sincroniza.** Notas, specs, memoria de agentes, CSV y JSON,
   iguales en todas las máquinas.
 - **Nunca se pierde nada.** Antes de sobrescribir o borrar un archivo, hilo guarda la versión
-  anterior. ¿Dos agentes escriben a la vez? Uno gana, la versión del otro queda guardada y su agente
-  se entera.
-- **Los agentes sin disco también entran.** Por MCP leen, escriben, listan y buscan en el drive.
+  anterior. ¿Dos agentes editan el mismo archivo a la vez? Si tocan líneas distintas, se mezclan;
+  si tocan las mismas, uno gana, la versión del otro queda guardada y su agente se entera.
+- **Los agentes sin disco también entran.** Por MCP leen, editan, escriben, listan y buscan en el drive.
 - **Un sandbox en la nube recibe una sola carpeta.** Con alcance, con vencimiento y de solo lectura si
   quieres: nunca ve el resto.
 
@@ -105,11 +105,11 @@ hilo token create --path ~/notas/clientes --expires 7d --read-only   # una carpe
 | | |
 | --- | --- |
 | **Cada escritura, en todas partes** | Un archivo que escribe un agente aparece en tus otras máquinas en milisegundos, en repos y en drives. |
-| **No se pierde nada** | Si dos máquinas cambian el mismo archivo a la vez, una gana y la versión de la otra queda guardada: en una rama `hilo/conflict/<rama>/<fecha>` si es un repo, en el historial de hilo si es un drive. Al agente que perdió se le dice dónde quedó su versión. |
-| **Los agentes se enteran antes** | Antes de que un agente edite un archivo que otro está editando, Claude Code bloquea la edición y le dice quién lo tiene, dónde y por cuánto tiempo. |
+| **No se pierde nada** | Si dos máquinas cambian líneas distintas del mismo archivo a la vez, el archivo queda con las dos ediciones. Si cambian las mismas líneas, una gana y la versión de la otra queda guardada: en una rama `hilo/conflict/<rama>/<fecha>` si es un repo, en el historial de hilo si es un drive. Al agente que perdió se le dice dónde quedó su versión. |
+| **Los agentes se enteran antes** | Antes de que un agente reescriba entero un archivo que otro está editando, Claude Code lo bloquea y le dice quién lo tiene, dónde y por cuánto tiempo. Las ediciones de algunas líneas pasan, y se mezclan. |
 | **Ramas y commits** | Los commits viajan con los archivos, las ramas avanzan en todas las máquinas y un worktree nuevo en una aparece en las demás. |
 | **Repos nuevos, solos** | Haz `git init` en una carpeta vinculada, el primer commit, y el repo aparece en la otra máquina con su historial y sus archivos sin commitear. |
-| **Agentes sin hooks ni disco** | `hilo mcp` le da a cualquier agente `read`, `write`, `list` y `search` sobre las carpetas sincronizadas, y sobre nada fuera de ellas. Un `write` toma el lease y se sincroniza al instante. |
+| **Agentes sin hooks ni disco** | `hilo mcp` le da a cualquier agente `read`, `edit`, `write`, `list` y `search` sobre las carpetas sincronizadas, y sobre nada fuera de ellas. Un `edit` cambia algunas líneas y puede compartir el archivo con otros agentes; un `write` toma el lease. Los dos se sincronizan al instante. |
 | **`.env` sin copiar** | Las variables viajan cifradas, clave por clave, y se escriben en cada worktree que las necesita. Una clave puede quedar por máquina o solo en producción. |
 | **Agentes en la nube, con correa** | Los sandboxes de Claude Code en la web, Codex, Cursor y Codespaces se unen con un token, y su trabajo aparece en tu Mac mientras lo hacen. Un token puede limitarse a una carpeta, vencer solo y ser de solo lectura. El ancla filtra todo lo que le manda, y el sandbox conoce sus límites y lo dice. [Cómo →](docs/cloud-agents.es.md) |
 
@@ -135,9 +135,10 @@ hilo token create --path ~/notas/clientes --expires 7d --read-only   # una carpe
 
 Una máquina, el **ancla**, le pone un número de secuencia a cada cambio; las demás se conectan a
 ella con una conexión saliente y cifrada. Cada escritura lleva el hash de la versión sobre la que se
-hizo, y el ancla acepta solo la primera escritura sobre cada versión. La edición que pierde nunca se
-mezcla ni se descarta: primero se guarda, en una rama de conflicto si es un repo o en el historial de
-hilo si es un drive, y recién entonces se reemplaza. [Más detalle →](docs/architecture.es.md)
+hizo, y el ancla acepta solo la primera escritura sobre cada versión. Si las dos ediciones tocan
+líneas distintas, la que perdió las mezcla y manda el resultado. Si no, la edición que pierde nunca se
+descarta: primero se guarda, en una rama de conflicto si es un repo o en el historial de hilo si es
+un drive, y recién entonces se reemplaza. [Más detalle →](docs/architecture.es.md)
 
 ## Documentación
 
@@ -157,7 +158,7 @@ hilo es joven (v0.3) y no tiene auditoría de seguridad externa. Un solo binario
 determinista de 400.000 pasos y por un script de punta a punta que corre daemons reales.
 
 **Todavía no:** Windows; atravesar NAT (el ancla necesita una dirección que las demás puedan
-alcanzar); mezclar dos ediciones del mismo archivo (hilo guarda ambas y nunca mezcla); drives que
+alcanzar); mezclar ediciones de las mismas líneas de un archivo (una gana, la otra se guarda); drives que
 aparezcan solos en máquinas nuevas (se agregan en cada una); sincronizar la conversación del agente.
 
 ## Licencia

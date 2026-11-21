@@ -49,6 +49,7 @@ daemon is not running".
 | --- | --- |
 | `claim` · `release` · `who` | take a file before editing it, let it go, see who holds it |
 | `read` `path` `offset?` `limit?` | text of a file, cut at 256 KB (`offset`/`limit` in lines); binary files answer with their size |
+| `edit` `path` `old_string` `new_string` | replaces one exact piece of text (it must appear once) in the file as it is now; works while other agents edit the same file, and edits to different lines are merged |
 | `write` `path` `content` | claims the file, writes it whole and atomically, syncs it at once; refused if another agent holds it, or on a read-only token |
 | `list` `path?` `depth?` | files and folders with sizes, `depth` 1 to 4 |
 | `search` `pattern` `path?` `ignore_case?` | same as `hilo grep`: `path:line: text`, at most 200 results |

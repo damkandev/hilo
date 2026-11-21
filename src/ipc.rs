@@ -87,12 +87,18 @@ fn handle(mut s: UnixStream, sh: &Shared, tx: &Sender<Ev>) -> io::Result<()> {
     let req = decode(&read_frame(&mut s, 1 << 20)?).ok_or_else(|| io::Error::other("bad request"))?;
     let a: Vec<&str> = req.iter().map(String::as_str).collect();
     let (code, text) = match a.as_slice() {
-        // PreToolUse: may this session edit that file?
-        ["claim", session, path] => match sh.locate(Path::new(path)) {
+        // PreToolUse: may this session edit that file? A partial edit ("edit") goes ahead even when
+        // another session holds it: if both land at once on different lines, the daemon merges them.
+        // A whole-file write is refused, since it would replace the other agent's lines.
+        ["claim", session, path, mode @ ..] => match sh.locate(Path::new(path)) {
             None => with_notices(sh, session, 0, String::new()),
             Some((wt, rel)) => {
                 let mut t = sh.leases.lock().unwrap();
                 match t.holder(&wt, &rel) {
+                    Some(e) if e.session != *session && mode == ["edit"] => {
+                        drop(t);
+                        with_notices(sh, session, 0, String::new())
+                    }
                     Some(e) if e.session != *session => (2, lease::busy_message(&rel, e)),
                     _ => {
                         t.claim(&wt, &rel, session, &sh.name); // optimistic; the anchor has the last word

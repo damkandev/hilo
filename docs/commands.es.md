@@ -50,6 +50,7 @@ herramientas de archivos responden "hilo daemon is not running".
 | --- | --- |
 | `claim` · `release` · `who` | toma un archivo antes de editarlo, lo suelta, muestra quién lo tiene |
 | `read` `path` `offset?` `limit?` | el texto de un archivo, cortado en 256 KB (`offset`/`limit` en líneas); los binarios responden con su tamaño |
+| `edit` `path` `old_string` `new_string` | reemplaza un trozo exacto de texto (tiene que aparecer una vez) en el archivo tal como está ahora; funciona mientras otros agentes editan el mismo archivo, y las ediciones en líneas distintas se mezclan |
 | `write` `path` `content` | toma el archivo, lo escribe entero y de forma atómica, y lo sincroniza al tiro; se rechaza si otro agente lo tiene, o con un token de solo lectura |
 | `list` `path?` `depth?` | archivos y carpetas con su tamaño, `depth` de 1 a 4 |
 | `search` `pattern` `path?` `ignore_case?` | igual que `hilo grep`: `ruta:línea: texto`, máximo 200 resultados |

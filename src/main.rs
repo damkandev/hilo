@@ -10,6 +10,7 @@ mod install;
 mod ipc;
 mod json;
 mod lease;
+mod merge;
 mod mcp;
 mod net;
 mod noise;

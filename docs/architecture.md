@@ -20,9 +20,10 @@ machine sees changes in the same order and converges, without clocks or CRDTs.
 ## The rule
 
 A write travels with the hash of the version its writer had. The anchor accepts the first write on
-a version and rejects the rest. hilo never merges two edits: the machine that lost saves its version
-on a `hilo/conflict/<branch>/<date>` branch, with `git commit-tree` so the worktree isn't touched,
-and takes the winner.
+a version and rejects the rest. If the two edits are on different lines, the machine that lost
+merges them ([below](#edits-to-different-lines)). Otherwise it saves its version on a
+`hilo/conflict/<branch>/<date>` branch, with `git commit-tree` so the worktree isn't touched, and
+takes the winner.
 
 ```mermaid
 sequenceDiagram
@@ -62,6 +63,35 @@ conflict branch, not on top of the newer version.
 A deterministic simulation (3 machines, 400,000 random steps with dropped connections) checks that
 nothing is ever overwritten before it's saved.
 
+## Edits to different lines
+
+Before taking the winner, the machine that lost tries a three-way merge: the version both edits
+started from (from hilo's history), its own and the winner's. If the edits are on lines that don't
+touch, it:
+
+1. **Keeps both versions** in its history: `hilo log PATH` shows its own as the `conflict` line.
+2. **Writes the merge**, only if the file still holds what it merged. An agent that wrote again in
+   the meantime gets the usual rule.
+3. **Sends the merge** to the anchor on top of the winner, like any write. If it loses again, the
+   same happens.
+4. **Tells its agent** that the file has both edits and to re-read it. `hilo restore PATH --conflict`
+   brings back its own version alone.
+
+The same happens when the winner arrives before this machine even sent its edit (the agent wrote a
+few milliseconds earlier and the scan hadn't seen it yet).
+
+There is no merge, and the usual rule applies, when:
+
+- the edits overlap or touch (adjacent lines, or two insertions at the same spot), as in git;
+- one side deleted the file, or it is binary, over 1 MB, or changed in more than 1,000 lines;
+- it is a lockfile, a notebook (`.ipynb`) or minified, or a `.json` that would no longer parse;
+- the base version is no longer in the history (pruned, or this machine only had its hash);
+- the merge would wait for `hilo approve`, or the sandbox's token is read-only;
+- the file was merged 3 times in the last minute.
+
+A clean merge is textual: if two agents add the same function in different places, both land. That
+is why the notice asks the agent to re-read the file.
+
 ## Live branches, not folders
 
 A worktree is identified by its repo and branch, not its path: `~/code/x` on one machine and `/srv/x`
@@ -95,9 +125,12 @@ machine: `hilo log PATH` lists it and `hilo restore PATH --conflict` brings it b
 ## Leases
 
 Claude Code's `PreToolUse` hook takes a 120-second lease on the file. The anchor broadcasts the lease
-table, so the hook answers from the local daemon in a few milliseconds. Agents without hooks
-(Codex, Cursor, OpenCode) use `claim`, `release` and `who` over MCP, and its file tools (`read`,
-`write`, `list`, `search`) only reach synced files ([Commands](commands.md#agents-over-mcp)).
+table, so the hook answers from the local daemon in a few milliseconds. `Write` and `NotebookEdit`,
+which replace the whole file, are blocked while another session holds it. `Edit` and `MultiEdit`,
+which change some lines of what the agent just read, go through: if two land at once, they are
+[merged](#edits-to-different-lines). Agents without hooks (Codex, Cursor, OpenCode) use `claim`,
+`release` and `who` over MCP, and its file tools (`read`, `edit`, `write`, `list`, `search`) only
+reach synced files ([Commands](commands.md#agents-over-mcp)).
 
 ```mermaid
 sequenceDiagram
@@ -111,7 +144,7 @@ sequenceDiagram
     DS->>A: claim app.ts for session B
     A-->>DS: lease: B on server, 120 s
     A-->>DM: lease: B on server, 120 s
-    MA->>DM: PreToolUse: Edit app.ts
+    MA->>DM: PreToolUse: Write app.ts
     DM-->>MA: blocked: agent B on server has app.ts, for 2 min
 ```
 

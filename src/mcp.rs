@@ -1,4 +1,4 @@
-//! `hilo mcp`: leases (claim / release / who) and file tools (read / write / list / search) over MCP
+//! `hilo mcp`: leases (claim / release / who) and file tools (read / edit / write / list / search) over MCP
 //! (JSON-RPC on stdio), for agents without hooks and sandboxes that only see synced files.
 //! Leases are cooperative: an agent that ignores them is still protected by the anchor's ordering rule.
 #![forbid(unsafe_code)]
@@ -14,7 +14,7 @@ use std::time::Duration;
 const NOT_RUNNING: &str = "hilo daemon is not running";
 const MAX_READ: usize = 256 << 10;
 const MAX_ENTRIES: usize = 1000;
-const INSTRUCTIONS: &str = "Files here are synced live between machines by hilo. Before editing a file, call claim with its path; if another agent holds it, work on something else, and call release when done. read, write, list and search work on synced files (paths absolute or relative to the working directory); write claims the file for you and syncs it at once.";
+const INSTRUCTIONS: &str = "Files here are synced live between machines by hilo. read, edit, write, list and search work on synced files (paths absolute or relative to the working directory). To change part of a file, use edit: several agents can edit the same file at once, and edits to different lines are merged. write replaces the whole file and is refused while another agent holds it (claim, release and who show who does). Both sync at once.";
 
 type Call<'a> = &'a dyn Fn(&[&str]) -> io::Result<(u8, String)>;
 
@@ -42,8 +42,13 @@ fn tools() -> Json {
             &[PATH, ("offset?", "integer", "First line to read, from 1"), ("limit?", "integer", "How many lines to read")],
         ),
         tool(
+            "edit",
+            "Replace one exact piece of text in a synced file, as it is now. Works while other agents edit the same file: edits to different lines are merged. old_string must appear exactly once.",
+            &[PATH, ("old_string", "string", "The text to replace, exactly as in the file, with enough context to be unique"), ("new_string", "string", "The text to put instead")],
+        ),
+        tool(
             "write",
-            "Write a whole file (created if missing). Claims it first, writes it atomically and syncs it to the other machines at once. Refused if another agent holds it.",
+            "Write a whole file (created if missing). Claims it first, writes it atomically and syncs it to the other machines at once. Refused if another agent holds it: to change part of a file, use edit.",
             &[PATH, ("content", "string", "The new content of the whole file")],
         ),
         tool("list", "Files and folders in a synced folder, with sizes.", &[DIR, ("depth?", "integer", "How many levels down (default 1, at most 4)")]),
@@ -200,6 +205,47 @@ fn call_tool(name: &str, args: &Json, session: &str, call: Call) -> (bool, Strin
             notes.insert(0, format!("wrote {rel} ({} bytes)", content.len()));
             Ok(notes.join("\n\n"))
         })(),
+        "edit" => (|| {
+            let (old, new) = (arg("old_string").ok_or("edit needs old_string")?, arg("new_string").ok_or("edit needs new_string")?);
+            if old.is_empty() {
+                return Err("old_string is empty: use write to create a file".into());
+            }
+            if Config::load().get("scope_ro") == Some("1") {
+                return Err("this machine joined with a read-only token: edit is refused".into());
+            }
+            let (root, rel) = locate(call, &path)?;
+            if rel.is_empty() || is_secret(&rel) {
+                return Err(format!("{path}: not editable here (folders and secret files are refused; use `hilo env set` for .env)"));
+            }
+            let mut notes = vec![];
+            match call(&["claim", session, &path, "edit"]) {
+                Err(e) => return Err(failed(e, "claim")),
+                Ok((_, t)) => notes.push(t),
+            }
+            let p = root.join(&rel);
+            match std::fs::symlink_metadata(&p) {
+                Ok(m) if !m.is_file() => return Err(format!("{rel}: not a regular file")),
+                Ok(m) if m.len() > fsops::MAX_FILE => return Err(format!("{rel}: too large ({} bytes)", m.len())),
+                _ => {}
+            }
+            let before = std::fs::read(&p).map_err(|e| format!("{rel}: {e}"))?;
+            let text = std::str::from_utf8(&before).map_err(|_| format!("{rel}: not UTF-8 text: use write"))?;
+            match text.matches(old).count() {
+                0 => return Err(format!("{rel}: old_string not found; the file may have changed, read it again")),
+                1 => {}
+                n => return Err(format!("{rel}: old_string appears {n} times; add context so it appears once")),
+            }
+            let out = text.replacen(old, new, 1);
+            // ponytail: re-checked just before writing, still not atomic; a sync landing in that instant is kept in hilo's history
+            if std::fs::read(&p).ok().as_deref() != Some(&before[..]) {
+                return Err(format!("{rel} changed while editing it; read it again"));
+            }
+            fsops::write(&root, &rel, Some(out.as_bytes())).map_err(|e| format!("{rel}: {e}"))?;
+            notes.push(call(&["touch", session, &path]).map(|r| r.1).unwrap_or_default());
+            notes.retain(|n| !n.is_empty());
+            notes.insert(0, format!("edited {rel}"));
+            Ok(notes.join("\n\n"))
+        })(),
         "list" => locate(call, &path).map(|(root, rel)| {
             let mut out = vec![];
             walk(&root.join(&rel), "", num(args, "depth").unwrap_or(1).clamp(1, 4), &mut out);
@@ -296,7 +342,7 @@ mod tests {
         let down = |_: &[&str]| -> io::Result<(u8, String)> { Err(io::Error::from(io::ErrorKind::NotFound)) }; // no socket file
         let list = handle(r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#, "s", &down).unwrap();
         let names: Vec<&str> = list.at(&["result", "tools"]).unwrap().arr().iter().filter_map(|t| t.get("name").and_then(Json::str)).collect();
-        assert_eq!(names, ["claim", "release", "who", "read", "write", "list", "search"]);
+        assert_eq!(names, ["claim", "release", "who", "read", "edit", "write", "list", "search"]);
         assert!(handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#, "s", &down).is_none());
         assert_eq!(text(&handle(&req("read", r#"{"path":"/x"}"#), "s", &down).unwrap()), (true, NOT_RUNNING.into()));
         assert!(!text(&handle(&req("claim", r#"{"path":"/x"}"#), "s", &down).unwrap()).0); // leases fail open
@@ -316,7 +362,7 @@ mod tests {
                     Ok(rel) => (0, format!("drive:t\0{}\0{}", r2.display(), rel.display())),
                     Err(_) => (1, format!("{p} is not in a synced folder")),
                 },
-                ["claim", _, p] if p.ends_with("busy.txt") => (2, "hilo: busy.txt is being edited by another agent (m, session abcd, 3 s ago).".into()),
+                ["claim", _, p, mode @ ..] if p.ends_with("busy.txt") && mode != ["edit"] => (2, "hilo: busy.txt is being edited by another agent (m, session abcd, 3 s ago).".into()),
                 ["touch", ..] => (2, "note: someone else saved x".into()),
                 ["grep", pat, ..] => (0, format!("grep {pat}")),
                 _ => (0, String::new()),
@@ -334,8 +380,17 @@ mod tests {
         let w = r("write", format!(r#"{{"path":"{}","content":"hi"}}"#, at("new/dir/b.txt")));
         assert_eq!(w, (false, "wrote new/dir/b.txt (2 bytes)\n\nnote: someone else saved x".into()));
         assert_eq!(std::fs::read(root.join("new/dir/b.txt")).unwrap(), b"hi");
+        // edit: one exact match, even on a file another agent holds
+        std::fs::write(root.join("busy.txt"), "one\ntwo\ntwo\n").unwrap();
+        let e = |old: &str, new: &str| r("edit", format!(r#"{{"path":"{}","old_string":"{old}","new_string":"{new}"}}"#, at("busy.txt")));
+        assert_eq!(e("one", "uno"), (false, "edited busy.txt\n\nnote: someone else saved x".into()));
+        assert!(e("two", "dos").1.contains("appears 2 times"));
+        assert!(e("three", "tres").1.contains("not found"));
+        assert!(e("", "x").0);
+        assert_eq!(std::fs::read_to_string(root.join("busy.txt")).unwrap(), "uno\ntwo\ntwo\n");
+        assert!(r("edit", format!(r#"{{"path":"{}","old_string":"K","new_string":"x"}}"#, at(".env"))).0);
         let l = r("list", format!(r#"{{"path":"{}","depth":2}}"#, root.display())).1;
-        assert_eq!(l, ".env  8 bytes\nimg.bin  6 bytes\nnew/\nnew/dir/\nsrc/\nsrc/a.txt  6 bytes\nsrc/deep/");
+        assert_eq!(l, ".env  8 bytes\nbusy.txt  12 bytes\nimg.bin  6 bytes\nnew/\nnew/dir/\nsrc/\nsrc/a.txt  6 bytes\nsrc/deep/");
         assert_eq!(r("search", format!(r#"{{"pattern":"x","path":"{}"}}"#, root.display())), (false, "grep x".into()));
         assert!(r("search", r#"{"pattern":"x","path":"/etc"}"#.into()).0);
         // a FIFO has no end: refused, not read (this used to hang the server)

@@ -21,9 +21,10 @@ estado, sin relojes ni CRDTs.
 ## La regla
 
 Cada escritura viaja con el hash de la versión que tenía quien la escribió. El ancla acepta la
-primera escritura sobre una versión y rechaza las demás. hilo nunca mezcla dos ediciones: la máquina
-que perdió guarda su versión en una rama `hilo/conflict/<rama>/<fecha>`, con `git commit-tree` para
-no tocar el worktree, y toma la ganadora.
+primera escritura sobre una versión y rechaza las demás. Si las dos ediciones tocan líneas
+distintas, la máquina que perdió las mezcla ([más abajo](#ediciones-en-líneas-distintas)). Si no,
+guarda su versión en una rama `hilo/conflict/<rama>/<fecha>`, con `git commit-tree` para no tocar el
+worktree, y toma la ganadora.
 
 ```mermaid
 sequenceDiagram
@@ -63,6 +64,38 @@ que cambió mientras tanto termina en una rama de conflicto, no encima de la ver
 Una simulación determinista (3 máquinas, 400.000 pasos al azar con conexiones que se caen) comprueba
 que nada se sobrescribe antes de guardarse.
 
+## Ediciones en líneas distintas
+
+Antes de tomar la ganadora, la máquina que perdió intenta un merge de tres vías: la versión desde la
+que partieron las dos ediciones (del historial de hilo), la suya y la ganadora. Si las ediciones
+están en líneas que no se tocan:
+
+1. **Guarda las dos versiones** en su historial: `hilo log RUTA` muestra la suya como la línea
+   `conflict`.
+2. **Escribe el merge**, solo si el archivo sigue teniendo lo que mezcló. Si el agente escribió de
+   nuevo entretanto, se aplica la regla de siempre.
+3. **Manda el merge** al ancla encima de la ganadora, como cualquier escritura. Si vuelve a perder,
+   pasa lo mismo.
+4. **Le avisa a su agente** que el archivo tiene las dos ediciones y que lo relea.
+   `hilo restore RUTA --conflict` trae de vuelta solo su versión.
+
+Lo mismo pasa cuando la ganadora llega antes de que esta máquina alcance a mandar su edición (el
+agente escribió unos milisegundos antes y el escaneo todavía no la veía).
+
+No hay merge, y se aplica la regla de siempre, cuando:
+
+- las ediciones se solapan o se tocan (líneas adyacentes, o dos inserciones en el mismo punto), igual
+  que en git;
+- un lado borró el archivo, o es binario, pesa más de 1 MB o cambió en más de 1.000 líneas;
+- es un lockfile, un notebook (`.ipynb`) o un archivo minificado, o un `.json` que dejaría de ser
+  válido;
+- la versión base ya no está en el historial (se podó, o esta máquina solo tenía su hash);
+- el merge quedaría esperando `hilo approve`, o el token del sandbox es de solo lectura;
+- el archivo ya se mezcló 3 veces en el último minuto.
+
+Un merge limpio es textual: si dos agentes agregan la misma función en lugares distintos, quedan las
+dos. Por eso el aviso le pide al agente que relea el archivo.
+
 ## Ramas vivas, no carpetas
 
 Un worktree se identifica por su repo y su rama, no por su ruta: `~/code/x` en una máquina y `/srv/x`
@@ -98,9 +131,12 @@ en esa máquina: `hilo log RUTA` la muestra y `hilo restore RUTA --conflict` la 
 ## Leases
 
 El hook `PreToolUse` de Claude Code toma un lease de 120 segundos sobre el archivo. El ancla reparte
-la tabla de leases, así que el hook responde desde el daemon local en pocos milisegundos. Los agentes
-sin hooks (Codex, Cursor, OpenCode) usan `claim`, `release` y `who` por MCP, y sus herramientas de
-archivos (`read`, `write`, `list`, `search`) solo llegan a archivos sincronizados
+la tabla de leases, así que el hook responde desde el daemon local en pocos milisegundos. `Write` y
+`NotebookEdit`, que reemplazan el archivo entero, se bloquean mientras otra sesión lo tiene. `Edit` y
+`MultiEdit`, que cambian algunas líneas de lo que el agente acaba de leer, pasan: si dos llegan a la
+vez, [se mezclan](#ediciones-en-líneas-distintas). Los agentes sin hooks (Codex, Cursor, OpenCode)
+usan `claim`, `release` y `who` por MCP, y sus herramientas de archivos (`read`, `edit`, `write`,
+`list`, `search`) solo llegan a archivos sincronizados
 ([Comandos](commands.es.md#agentes-por-mcp)).
 
 ```mermaid
@@ -115,7 +151,7 @@ sequenceDiagram
     DS->>A: claim app.ts para la sesión B
     A-->>DS: lease: B en el servidor, 120 s
     A-->>DM: lease: B en el servidor, 120 s
-    MA->>DM: PreToolUse: Edit app.ts
+    MA->>DM: PreToolUse: Write app.ts
     DM-->>MA: bloqueado: el agente B en el servidor tiene app.ts, por 2 min
 ```
 

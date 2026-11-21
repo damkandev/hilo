@@ -260,6 +260,7 @@ struct D {
     held: Vec<Held>,
     cache: Cache,
     outstanding: HashMap<Key, u64>,
+    merges: HashMap<Key, (Instant, u32)>, // merges per file this minute
     needs_resync: HashSet<String>,
     ref_sha: HashMap<String, String>,
     out: Option<Sender<Msg>>,
@@ -994,6 +995,11 @@ impl D {
             }
         }
         self.outstanding.remove(&k);
+        if let Some(base) = self.r.unscanned_base(&op, dh) {
+            if self.merge(wi, &k, base, op.data.content().flatten(), &op.origin, disk.as_deref()) {
+                return self.bump(op.seq);
+            }
+        }
         let before = self.r.confirmed.get(&k).copied();
         let fx = self.r.applied(&op, dh, Data::from_opt(disk));
         if !self.apply_file(wi, &op.path, fx, &op.origin, false) {
@@ -1149,11 +1155,78 @@ impl D {
         }
         let disk = read_disk(&self.wts[wi].root, &rej.path);
         let k = (rej.wt.clone(), rej.path.clone());
+        if let Some(base) = self.r.base_of(&rej) {
+            if self.merge(wi, &k, base, rej.data.content().flatten(), &rej.origin, disk.as_deref()) {
+                return;
+            }
+        }
         let before = self.r.confirmed.get(&k).copied();
         let fx = self.r.rejected(&rej, hash_of(disk.as_deref()), Data::from_opt(disk));
         if !self.apply_file(wi, &rej.path, fx, &rej.origin, false) {
             self.unconfirm(k, before);
         }
+    }
+
+    /// Two machines edited the same version (`base_h`) of a text file and the other one's version
+    /// (`theirs`, from `origin`) got there first. If the edits don't touch, the file gets both: this
+    /// machine's version goes to the history first, the merge is written only if the file still holds
+    /// what was merged, and it goes to the anchor on top of theirs. False = the usual rule (theirs
+    /// replaces this one, which is kept).
+    fn merge(&mut self, wi: usize, k: &Key, base_h: Hash, theirs: Option<&[u8]>, origin: &str, disk: Option<&[u8]>) -> bool {
+        let (Some(ours), Some(theirs)) = (disk, theirs) else { return false }; // a deletion never merges
+        // a read-only sandbox has every write turned down: merging would only loop
+        if self.scope.as_ref().is_some_and(|s| s.1) || base_h == NONE {
+            return false;
+        }
+        // ponytail: 3 merges a minute per file, then the usual rule settles a hot file; a backoff if that bites
+        let now = Instant::now();
+        let n = self.merges.entry(k.clone()).or_insert((now, 0));
+        if now.duration_since(n.0) > Duration::from_secs(60) {
+            *n = (now, 0);
+        }
+        if n.1 >= 3 {
+            return false;
+        }
+        // the base is in the history unless pruned or never seen here (it came as a hash only)
+        let Some(base) = self.store.get(&base_h).ok().flatten() else { return false };
+        let Some(merged) = crate::merge::merge(&k.1, &base, ours, theirs) else { return false };
+        // the winner's lines arrive with the merge: what would hold them holds it
+        if self.hold_reason(wi, &k.1, origin, Some(&merged)).is_some() {
+            return false;
+        }
+        let root = self.wts[wi].root.clone();
+        if read_disk(&root, &k.1).as_deref() != Some(ours) {
+            return false; // the agent wrote again meanwhile: nothing merged covers that
+        }
+        let (id, path, me) = (k.0.clone(), k.1.clone(), self.sh.name.clone());
+        let kept = self.store.put(&id, &path, Some(theirs), Kind::Remote, origin).and_then(|_| self.store.put(&id, &path, Some(ours), Kind::Conflict, &me));
+        if let Err(e) = kept {
+            log!("merge on {path}: could not keep both versions in history ({e}); the usual rule applies");
+            return false;
+        }
+        let h = hash_of(Some(&merged));
+        match self.store.keep_and_write(&root, &id, &path, Some(&merged), Kind::Local, &me) {
+            Ok(st) => self.wts[wi].scanner.note(&path, st, h),
+            Err(e) => {
+                log!("merge on {path}: could not write it ({e}); the usual rule applies");
+                return false;
+            }
+        }
+        if let Some(n) = self.merges.get_mut(k) {
+            n.1 += 1;
+        }
+        if let Some(op) = self.r.rebased(k, hash_of(Some(theirs)), h, Data::Full(merged)) {
+            self.send_op(op);
+        }
+        self.dirty = true;
+        let who = if origin.is_empty() { "another machine" } else { origin };
+        log!("merge on {path}: this machine's edit and {who}'s didn't touch; the file has both");
+        let author = self.sh.authors.lock().unwrap().get(k).cloned();
+        self.sh.notify_session(
+            author,
+            format!("hilo: an agent on {who} edited {path} at the same time as you, in other lines. hilo merged both edits: the file now has yours and theirs. Re-read it before editing again. Your version alone: `hilo restore {path} --conflict`."),
+        );
+        true
     }
 
     // ---------- commits ----------
@@ -1986,6 +2059,7 @@ pub fn run() -> io::Result<()> {
         held: load_held(),
         cache: Cache::default(),
         outstanding: HashMap::new(),
+        merges: HashMap::new(),
         needs_resync: HashSet::new(),
         ref_sha: HashMap::new(),
         out: None,

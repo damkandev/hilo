@@ -346,6 +346,36 @@ impl Replica {
         fx
     }
 
+    /// The version the rejected write was made on, if it is still the oldest one waiting. A chained
+    /// write behind it, or one whose queue a merge already replaced, gets None.
+    pub fn base_of(&self, r: &Reject) -> Option<Hash> {
+        let q = self.pending.get(&(r.wt.clone(), r.path.clone()))?;
+        q.front().filter(|op| op.new == r.rejected).map(|op| op.base)
+    }
+
+    /// `op` from another machine lands on a file changed here but not scanned yet: the version that
+    /// change was made on. None if a write of this machine is waiting (it comes back rejected).
+    pub fn unscanned_base(&self, op: &Op, disk: Hash) -> Option<Hash> {
+        let k: Key = (op.wt.clone(), op.path.clone());
+        let old = self.confirmed.get(&k).copied().unwrap_or(NONE);
+        (self.pending.get(&k).is_none_or(|q| q.is_empty()) && disk != op.new && disk != old).then_some(old)
+    }
+
+    /// The disk now holds both edits merged (`new`) on top of the winner (`current`): everything
+    /// waiting for this key is replaced by one write on `current`, so the rejections still coming for
+    /// it change nothing. Returns that write, or None when the merge is the winner itself.
+    pub fn rebased(&mut self, k: &Key, current: Hash, new: Hash, data: Data) -> Option<Op> {
+        self.confirmed.insert(k.clone(), current);
+        let q = self.pending.entry(k.clone()).or_default();
+        q.clear();
+        if new == current {
+            return None;
+        }
+        let op = Op { seq: 0, wt: k.0.clone(), path: k.1.clone(), base: current, new, data, origin: String::new(), t_event: 0, t_seq: 0 };
+        q.push_back(op.clone());
+        Some(op)
+    }
+
     /// Forget what waits to be sent for `k` (the anchor would never take it); the file stays as it is.
     pub fn drop_pending(&mut self, k: &Key) -> usize {
         self.pending.remove(k).map_or(0, |q| q.len())
@@ -366,7 +396,8 @@ impl Replica {
 mod sim {
     //! Deterministic simulation: 3 machines, random writes, scans, deliveries and drops.
     //! Invariants: no version is ever overwritten before it was captured (sent or saved),
-    //! every captured version ends accepted or on a conflict branch, and all machines converge.
+    //! every captured version ends accepted or on a conflict branch, and all machines converge,
+    //! also when a rejected machine merges both edits and sends the result instead.
     use super::*;
     use std::collections::HashSet;
 
@@ -440,6 +471,7 @@ mod sim {
             connect(m, &seq, &blobs);
         }
 
+        let (merging, merges) = (std::cell::Cell::new(true), std::cell::Cell::new(0));
         let mut step = |rng: &mut Rng, ms: &mut Vec<M>, action: u64, i: usize| {
             match action {
                 // an agent writes (or deletes) a file, unseen by hilo yet
@@ -498,10 +530,47 @@ mod sim {
                     let (path, fx) = match msg {
                         Down::Applied(op) => {
                             let d = m.disk.get(&op.path).cloned();
-                            (op.path.clone(), m.r.applied(&op, hash_of(d.as_deref()), Data::from_opt(d)))
+                            let dh = hash_of(d.as_deref());
+                            // a remote write on a file changed here but not scanned yet: the daemon merges too
+                            if merging.get() && rng.below(2) == 0 && d.is_some() && op.data.content().is_some_and(|c| c.is_some()) && m.r.unscanned_base(&op, dh).is_some_and(|b| b != NONE) {
+                                merges.set(merges.get() + 1);
+                                saved.insert(dh); // ours (never scanned) goes to the history before the write
+                                m.r.last_seq = m.r.last_seq.max(op.seq);
+                                let merged = format!("m{}", rng.below(1000)).into_bytes();
+                                m.disk.insert(op.path.clone(), merged.clone());
+                                m.captured.insert(op.path.clone(), true);
+                                if let Some(o) = m.r.rebased(&(op.wt.clone(), op.path.clone()), op.new, hash_of(Some(&merged)), Data::Full(merged)) {
+                                    produced.insert(o.new);
+                                    if m.online && m.caught {
+                                        m.up.push_back(o);
+                                    }
+                                }
+                                return;
+                            }
+                            (op.path.clone(), m.r.applied(&op, dh, Data::from_opt(d)))
                         }
                         Down::Rejected(r) => {
                             let d = m.disk.get(&r.path).cloned();
+                            let theirs = r.data.content().flatten().map(<[u8]>::to_vec);
+                            // the daemon merges when both edits fit (a coin flip here), on a base it knows
+                            let can = merging.get() && rng.below(2) == 0 && d.is_some() && m.r.base_of(&r).is_some_and(|b| b != NONE);
+                            if let (true, Some(theirs)) = (can, theirs) {
+                                merges.set(merges.get() + 1);
+                                saved.insert(hash_of(d.as_deref())); // ours goes to the history before the write
+                                for op in &m.r.pending[&(r.wt.clone(), r.path.clone())] {
+                                    saved.insert(op.new); // in the history since their scan
+                                }
+                                let merged = if rng.below(4) == 0 { theirs } else { format!("m{}", rng.below(1000)).into_bytes() };
+                                m.disk.insert(r.path.clone(), merged.clone());
+                                m.captured.insert(r.path.clone(), true);
+                                if let Some(op) = m.r.rebased(&(r.wt.clone(), r.path.clone()), r.current, hash_of(Some(&merged)), Data::Full(merged)) {
+                                    produced.insert(op.new);
+                                    if m.online && m.caught {
+                                        m.up.push_back(op);
+                                    }
+                                }
+                                return;
+                            }
                             (r.path.clone(), m.r.rejected(&r, hash_of(d.as_deref()), Data::from_opt(d)))
                         }
                         Down::CaughtUp => {
@@ -574,7 +643,8 @@ mod sim {
             let i = rng.below(3) as usize;
             step(&mut rng, &mut ms, action, i);
         }
-        // settle: everyone online, then scan + deliver until quiet
+        // settle: everyone online, then scan + deliver until quiet (merges stop, as the daemon's cap does)
+        merging.set(false);
         for i in 0..3 {
             if !ms[i].online {
                 step(&mut rng, &mut ms, 99, i);
@@ -603,6 +673,7 @@ mod sim {
         for h in produced {
             assert!(accepted.contains(&h) || saved.contains(&h), "seed {seed}: lost a version");
         }
+        assert!(merges.get() > 100, "seed {seed}: only {} merges", merges.get());
     }
 }
 

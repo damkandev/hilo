@@ -36,8 +36,9 @@ files) and gives them one drive:
   branch, its commits and its uncommitted files.
 - **Any other folder syncs too.** Notes, specs, agent memory, CSV and JSON, the same on every machine.
 - **Nothing is ever lost.** Before hilo overwrites or deletes a file, it keeps the old version.
-  Two agents writing at once? One wins, the other's version is saved and its agent is told.
-- **Agents without a disk still get in.** Over MCP they read, write, list and search the drive.
+  Two agents editing one file at once? Edits to different lines are merged; on the same lines one
+  wins, the other's version is saved and its agent is told.
+- **Agents without a disk still get in.** Over MCP they read, edit, write, list and search the drive.
 - **A cloud sandbox gets one folder.** Scoped, expiring, read-only if you want: it never sees the rest.
 
 ## Get started
@@ -102,11 +103,11 @@ hilo token create --path ~/notes/clients --expires 7d --read-only   # one folder
 | | |
 | --- | --- |
 | **Every write, everywhere** | A file an agent writes appears on your other machines in milliseconds, in repos and drives alike. |
-| **Nothing is lost** | If two machines change the same file at once, one wins and the other's version is kept: on a `hilo/conflict/<branch>/<date>` branch in a repo, in hilo's history in a drive. The agent that lost is told where its version is. |
-| **Agents hear about it first** | Before an agent edits a file another agent is editing, Claude Code blocks the edit and tells it who has the file, where, and for how long. |
+| **Nothing is lost** | If two machines change different lines of the same file at once, the file gets both edits. If they change the same lines, one wins and the other's version is kept: on a `hilo/conflict/<branch>/<date>` branch in a repo, in hilo's history in a drive. The agent that lost is told where its version is. |
+| **Agents hear about it first** | Before an agent rewrites a whole file another agent is editing, Claude Code blocks it and tells it who has the file, where, and for how long. Edits to some of its lines go through, and are merged. |
 | **Branches and commits** | Commits travel with the files, branches move on every machine, and a new worktree on one machine appears on the others. |
 | **New repos on their own** | `git init` a repo in a linked folder, make the first commit, and it shows up on the other machine with its history and uncommitted files. |
-| **Agents without hooks or a disk** | `hilo mcp` gives any agent `read`, `write`, `list` and `search` on the synced folders, and nothing outside them. A `write` takes the lease and syncs at once. |
+| **Agents without hooks or a disk** | `hilo mcp` gives any agent `read`, `edit`, `write`, `list` and `search` on the synced folders, and nothing outside them. An `edit` changes some lines and can share a file with other agents; a `write` takes the lease. Both sync at once. |
 | **`.env` without copying** | Variables are encrypted, synced key by key, and written into every worktree that needs them. Keys can stay per machine or production-only. |
 | **Cloud agents, on a leash** | Claude Code on the web, Codex, Cursor and Codespaces sandboxes join with a token, and their work shows up on your Mac while they do it. A token can be limited to one folder, expire on its own and be read-only. The anchor filters everything it sends, and the sandbox knows its limits and says so. [How →](docs/cloud-agents.md) |
 
@@ -132,9 +133,9 @@ hilo token create --path ~/notes/clients --expires 7d --read-only   # one folder
 
 One machine, the **anchor**, gives every change a sequence number; the others connect to it over an
 encrypted, outgoing connection. A write carries the hash of the version it was based on, and the
-anchor accepts only the first write on each version. The loser's edit is never merged or dropped:
-it's saved first, on a conflict branch in a repo or in hilo's history in a drive, and only then
-replaced. [Read more →](docs/architecture.md)
+anchor accepts only the first write on each version. If the two edits are on different lines, the
+loser merges them and sends the result. If not, the loser's edit is never dropped: it's saved first,
+on a conflict branch in a repo or in hilo's history in a drive, and only then replaced. [Read more →](docs/architecture.md)
 
 ## Documentation
 
@@ -153,8 +154,8 @@ hilo is young (v0.3) and has had no external security audit. One Rust binary of 
 (2.1 MB on Linux); the only crates are for cryptography. Every change is checked by a deterministic
 simulation of 400,000 steps and an end-to-end script that runs real daemons.
 
-**Not yet:** Windows; NAT traversal (the anchor needs an address the others can reach); merging two
-edits of the same file (hilo keeps both and never merges); drives appearing on their own on new
+**Not yet:** Windows; NAT traversal (the anchor needs an address the others can reach); merging edits
+to the same lines of a file (one wins, the other is kept); drives appearing on their own on new
 machines (add them on each); syncing the agent's conversation.
 
 ## License

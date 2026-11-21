@@ -104,7 +104,7 @@ fn lease(wt: &str, path: &str, e: &Entry, now: Instant) -> Lease {
 pub fn busy_message(path: &str, e: &Entry) -> String {
     let now = Instant::now();
     format!(
-        "hilo: {path} is being edited by another agent ({}, session {}, {} s ago).\nWork on another file or wait; the lease expires in {} s unless renewed.",
+        "hilo: {path} is being edited by another agent ({}, session {}, {} s ago).\nWriting the whole file would drop their changes. Change only the lines you need with an edit (Edit, or the MCP edit tool): edits to different lines are merged. Or wait; the lease expires in {} s unless renewed.",
         e.machine,
         e.session.chars().take(4).collect::<String>(),
         (now - e.since).as_secs(),

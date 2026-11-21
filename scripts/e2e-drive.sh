@@ -121,6 +121,30 @@ on_b restore "$B/c.txt" --conflict | sed 's/^/     /'
 has "$B/c.txt" "devbox's version" || fail "restore --conflict brings devbox's version back"
 wait_for "the restored version syncs to mac" has "$A/c.txt" "devbox's version"
 
+echo "== concurrent edits to different lines of one file are merged"
+printf 'one\ntwo\nthree\nfour\nfive\n' >"$A/m.txt"
+wait_for "m.txt reaches devbox" has "$B/m.txt" "$(printf 'one\ntwo\nthree\nfour\nfive')"
+wait_for "devbox settled" synced b
+kill -STOP "$PB"
+printf 'one\ntwo\nthree\nfour\nFIVE (devbox)\n' >"$B/m.txt"
+printf 'ONE (mac)\ntwo\nthree\nfour\nfive\n' >"$A/m.txt"
+mac_sent_m() { [ "$(on_a log "$A/m.txt" | grep -c ' local ')" -ge 2 ] && synced a; }
+wait_for "mac's edit is accepted" mac_sent_m
+kill -CONT "$PB"
+MERGED=$(printf 'ONE (mac)\ntwo\nthree\nfour\nFIVE (devbox)')
+wait_for "devbox merges both edits" has "$B/m.txt" "$MERGED"
+wait_for "the merge syncs to mac" has "$A/m.txt" "$MERGED"
+on_b log "$B/m.txt" | sed 's/^/     /'
+on_b log "$B/m.txt" | grep -q " conflict " || fail "devbox keeps its own version in the history"
+ok "devbox's own version is in its history"
+
+echo "== a held file: another session may edit lines of it, not overwrite it"
+hook() { printf '{"tool_name":"%s","session_id":"%s","tool_input":{"file_path":"%s"}}' "$1" "$2" "$3" | on_a hook pre >/dev/null 2>&1; }
+hook Write s1 "$A/m.txt" || fail "s1 takes m.txt"
+hook Edit s2 "$A/m.txt" || fail "s2 may edit m.txt while s1 holds it"
+if hook Write s2 "$A/m.txt"; then fail "s2 may not overwrite m.txt while s1 holds it"; fi
+ok "Edit goes through, Write is refused"
+
 echo "== a version from outside the history is kept before hilo overwrites it"
 # devbox's history is lost (pruned, or from before hilo kept one): the copy on disk has no record
 kill "$PB"; wait "$PB" 2>/dev/null || true; PIDS[1]=
