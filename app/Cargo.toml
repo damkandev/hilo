@@ -1,0 +1,19 @@
+[package]
+name = "hilo-app"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+description = "hilo's desktop app: status, folders, versions and pairing, on top of the hilo CLI."
+publish = false
+
+# Its own workspace: gpui's dependency tree stays out of the CLI, its vendor/ and its cargo-vet audits.
+[workspace]
+
+[dependencies]
+# runtime_shaders: no Metal toolchain needed to build (Xcode ships without it)
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = "thin"

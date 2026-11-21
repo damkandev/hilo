@@ -29,6 +29,13 @@ jobs:
       - run: cargo test --release --offline --locked --no-run
       - run: cargo build --release --offline --locked
 
+  # the Mac app: its own workspace, crates.io instead of vendor/, so it builds outside the repo's cargo config
+  app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cd / && cargo check --locked --manifest-path "$GITHUB_WORKSPACE/app/Cargo.toml"
+
   vet:
     runs-on: ubuntu-24.04
     steps:

@@ -75,6 +75,17 @@ See [Deployment](docs/deployment.md) for addresses, services and platforms.
 
 </details>
 
+<details>
+<summary>The Mac app</summary>
+
+`hilo.app` keeps a shared folder on your Desktop, `~/Desktop/hilo`. Open it, pick your other machine
+from `~/.ssh/config` (or paste a join code), and that folder holds the same files on both. From the
+app you also see who's online, add and remove folders, bring back any version of a file and restore
+deleted ones. It runs the `hilo` CLI that ships inside it. Build it with `app/bundle.sh`, which also
+makes the `.dmg`; each release has it as `hilo-macos.dmg` (Apple silicon). Windows comes later.
+
+</details>
+
 ## hilo drive
 
 Code is half of what agents share. The other half is context: the spec one agent wrote, the report

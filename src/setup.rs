@@ -214,6 +214,8 @@ pub struct Plan {
     pub remote_folder: String,
     pub listen: Option<String>,
     pub service: bool,
+    /// link the folders as a drive with this label (both sides), not as a folder of repos
+    pub drive: Option<String>,
 }
 
 fn code_in(s: &str) -> Option<String> {
@@ -239,13 +241,17 @@ pub fn progress() -> HashMap<String, String> {
 }
 
 /// Links `folder` here: through the daemon, or in the config when it isn't running (it reads it at start).
-fn link_here(folder: &Path) -> Result<(), String> {
-    match ipc::call(&ipc::args(&["add", &folder.to_string_lossy()]), Duration::from_secs(30)) {
+fn link_here(folder: &Path, drive: Option<&str>) -> Result<(), String> {
+    let add = match drive {
+        Some(l) => ipc::args(&["add", &folder.to_string_lossy(), "drive", l]),
+        None => ipc::args(&["add", &folder.to_string_lossy()]),
+    };
+    match ipc::call(&add, Duration::from_secs(30)) {
         Ok((0, _)) => Ok(()),
         Ok((_, t)) => Err(t),
         Err(_) => {
             let mut cfg = Config::load();
-            crate::register(&mut cfg, folder, None)?;
+            crate::register(&mut cfg, folder, drive)?;
             cfg.save().map_err(|e| e.to_string())
         }
     }
@@ -266,6 +272,7 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
     let local_anchor_key = Config::load().get("anchor_key").unwrap_or_default().to_string();
     let rf = remote_path(&plan.remote_folder);
     let ns = if plan.service { "" } else { " --no-service" };
+    let as_drive = plan.drive.as_ref().map_or(String::new(), |l| format!(" --as {}", q(l)));
 
     // who is the anchor, and a code to pair the other side
     let (remote_is_anchor, code) = match (local_role.as_str(), r.role()) {
@@ -281,10 +288,10 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
             return Err(format!("this machine is paired with another anchor, not {host}"))
         }
         (_, "anchor") => {
-            let (rr, rf2) = (r.clone(), rf.clone());
+            let (rr, rf2, as_drive) = (r.clone(), rf.clone(), as_drive.clone());
             let code = tui::step(&format!("Linking {} on {host}", plan.remote_folder), move |_| {
                 ssh(&rr.host, &format!("mkdir -p {rf2}"))?;
-                rr.hilo(&format!("add {rf2}"))?;
+                rr.hilo(&format!("add {rf2}{as_drive}"))?;
                 let code = if local_role.is_empty() { code_in(&rr.hilo("invite")?) } else { None };
                 Ok((code, format!("{} is the anchor; folder linked there", rr.host)))
             })?;
@@ -296,11 +303,11 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
                 Some(l) => l.clone(),
                 None => format!("{}:7710", r.ips.first().ok_or(format!("{host} has no private address to listen on"))?.0),
             };
-            let (rr, rf2, ip2) = (r.clone(), rf.clone(), ip.clone());
+            let (rr, rf2, ip2, as_drive) = (r.clone(), rf.clone(), ip.clone(), as_drive.clone());
             let code = tui::step(&format!("Starting the anchor on {host}"), move |p| {
                 ssh(&rr.host, &format!("mkdir -p {rf2}"))?;
                 p.set(&ip2);
-                let out = rr.hilo(&format!("init --listen {ip2} --name {} --folder {rf2}{ns}", q(&rr.host)))?;
+                let out = rr.hilo(&format!("init --listen {ip2} --name {} --folder {rf2}{as_drive}{ns}", q(&rr.host)))?;
                 let code = code_in(&out).ok_or("init printed no code")?;
                 if ns.is_empty() {
                     Ok((code, format!("{} is the anchor at {ip2}", rr.host)))
@@ -321,13 +328,14 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
     // pair the side that isn't paired yet
     let folder = plan.local_folder.clone();
     let service = plan.service;
+    let drive = plan.drive.clone();
     if remote_is_anchor {
         tui::step("Pairing this machine", move |_| {
             match code {
                 Some(c) => {
-                    crate::join_core(&c, &Opts { folder: Some(folder.clone()), service, ..Default::default() })?;
+                    crate::join_core(&c, &Opts { folder: Some(folder.clone()), service, drive, ..Default::default() })?;
                 }
-                None => link_here(&crate::fsops::canonical(&folder).map_err(|e| e.to_string())?)?,
+                None => link_here(&crate::fsops::canonical(&folder).map_err(|e| e.to_string())?, drive.as_deref())?,
             }
             if !service && progress().is_empty() {
                 crate::spawn_daemon()?;
@@ -341,17 +349,17 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
             ssh(&rr.host, &format!("mkdir -p {rf2}"))?;
             match code {
                 Some(c) => {
-                    rr.hilo(&format!("join {c} --name {} --folder {rf2}{ns}", q(&rr.host)))?;
+                    rr.hilo(&format!("join {c} --name {} --folder {rf2}{as_drive}{ns}", q(&rr.host)))?;
                     if !ns.is_empty() {
                         let h = rr.hilo.clone().unwrap_or_default();
                         ssh(&rr.host, &format!("nohup env {} {} daemon >/tmp/hilo-daemon.log 2>&1 </dev/null &", remote_env(), q(&h)))?;
                     }
                 }
                 None => {
-                    rr.hilo(&format!("add {rf2}"))?;
+                    rr.hilo(&format!("add {rf2}{as_drive}"))?;
                 }
             }
-            link_here(&crate::fsops::canonical(&folder).map_err(|e| e.to_string())?)?;
+            link_here(&crate::fsops::canonical(&folder).map_err(|e| e.to_string())?, drive.as_deref())?;
             Ok(((), format!("{} joined this machine", rr.host)))
         })?;
     }
@@ -362,6 +370,7 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
     // until both sides have every repo
     let rr = r.clone();
     let mine = crate::repos_in(&plan.local_folder).len();
+    let is_drive = plan.drive.is_some();
     tui::step("Syncing", move |p| {
         let end = Instant::now() + Duration::from_secs(600);
         let mut asked = Instant::now() - Duration::from_secs(60);
@@ -375,7 +384,7 @@ pub fn run(plan: Plan, remote: Remote) -> Result<(), String> {
                 let there: HashMap<String, String> = rr.hilo("info").unwrap_or_default().lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.into(), v.into())).collect();
                 let theirs: usize = there.get("repos").and_then(|v| v.parse().ok()).unwrap_or(0);
                 if theirs >= mine {
-                    return Ok(((), format!("in sync: {mine} repos on both machines")));
+                    return Ok(((), if is_drive { "in sync".into() } else { format!("in sync: {mine} repos on both machines") }));
                 }
                 p.set(format!("{} has {theirs} of {mine} repos", rr.host));
             } else if !caught {
@@ -431,12 +440,21 @@ fn remote_default(local: &Path, r: &Remote) -> String {
     let home = crate::config::user_home().unwrap_or_default();
     let rel = local.strip_prefix(&home).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| local.file_name().unwrap_or_default().to_string_lossy().into_owned());
     let first = rel.split('/').next().unwrap_or(&rel);
+    let has = |d: &str| r.dirs.iter().any(|x| x.eq_ignore_ascii_case(d));
+    if first.eq_ignore_ascii_case("desktop") && !has(first) && rel.contains('/') {
+        return format!("~/{}", rel.split_once('/').map_or("", |x| x.1)); // a server has no Desktop
+    }
     let fixed = r.dirs.iter().find(|d| d.eq_ignore_ascii_case(first)).cloned().unwrap_or_else(|| first.to_string());
     format!("~/{}", [fixed.as_str()].into_iter().chain(rel.split('/').skip(1)).collect::<Vec<_>>().join("/"))
 }
 
-/// `hilo setup HOST [--folder DIR] [--remote-folder DIR] [--listen IP:PORT] [--no-service]`
+/// `hilo setup HOST [--folder DIR] [--remote-folder DIR] [--as LABEL] [--listen IP:PORT] [--no-service]`
+/// `hilo setup --hosts`: the hosts in ~/.ssh/config (for the desktop app)
 pub fn command(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("--hosts") {
+        ssh_hosts().iter().for_each(|(h, name)| println!("{h}\t{name}"));
+        return Ok(());
+    }
     let Some(host) = args.first().filter(|a| !a.starts_with("--")).cloned() else {
         return if tui::interactive() { wizard() } else { Err("usage: hilo setup HOST [--folder DIR]".into()) };
     };
@@ -449,7 +467,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         Ok((r, msg))
     })?;
     let remote_folder = crate::flag(args, "--remote-folder").unwrap_or_else(|| remote_default(&local_folder, &remote));
-    let plan = Plan { host, local_folder, remote_folder, listen: crate::flag(args, "--listen"), service: !args.iter().any(|a| a == "--no-service") };
+    let plan = Plan { host, local_folder, remote_folder, listen: crate::flag(args, "--listen"), service: !args.iter().any(|a| a == "--no-service"), drive: crate::flag(args, "--as") };
     run(plan, remote)
 }
 
@@ -538,7 +556,7 @@ fn ssh_flow(host: &str, folder: PathBuf) -> Result<(), String> {
         return Ok(());
     }
     println!();
-    run(Plan { host: host.into(), local_folder: folder, remote_folder, listen, service: true }, remote)
+    run(Plan { host: host.into(), local_folder: folder, remote_folder, listen, service: true, drive: None }, remote)
 }
 
 fn server_flow(folder: PathBuf) -> Result<(), String> {
@@ -689,5 +707,6 @@ mod tests {
         let home = std::env::var("HOME").unwrap();
         assert_eq!(remote_default(&PathBuf::from(format!("{home}/Codigo")), &r), "~/codigo");
         assert_eq!(remote_default(&PathBuf::from(format!("{home}/work/x")), &r), "~/work/x");
+        assert_eq!(remote_default(&PathBuf::from(format!("{home}/Desktop/hilo")), &r), "~/hilo");
     }
 }

@@ -78,6 +78,17 @@ Mira [Despliegue](docs/deployment.es.md) para direcciones, servicios y plataform
 
 </details>
 
+<details>
+<summary>La app para Mac</summary>
+
+`hilo.app` mantiene una carpeta compartida en tu Escritorio, `~/Desktop/hilo`. La abres, eliges tu
+otra máquina de `~/.ssh/config` (o pegas un código de unión) y esa carpeta tiene los mismos archivos en
+las dos. Desde la app también ves quién está conectado, agregas y quitas carpetas, traes de vuelta
+cualquier versión de un archivo y recuperas los borrados. Usa el CLI `hilo` que viene adentro. Se arma
+con `app/bundle.sh`, que también genera el `.dmg`; cada release lo trae como `hilo-macos.dmg` (Apple silicon). Windows viene después.
+
+</details>
+
 ## hilo drive
 
 El código es la mitad de lo que comparten los agentes. La otra mitad es el contexto: la spec que
