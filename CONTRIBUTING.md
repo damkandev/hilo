@@ -30,7 +30,9 @@ app/bundle.sh                                               # app/dist/hilo.app 
 ```
 
 `bundle.sh` signs ad hoc unless `SIGN_ID` names a Developer ID; a public `.dmg` also needs notarizing
-(`xcrun notarytool submit … --wait`, then `xcrun stapler staple`).
+(`xcrun notarytool submit … --wait`, then `xcrun stapler staple`). The `.dmg` window (`app/dmg.py`, its background
+drawn in `app/assets/dmg.html`) is laid out by dmgbuild, which `bundle.sh` installs pinned in a throwaway venv:
+it needs Python 3.11 or later (`PYTHON=python3.13` picks one).
 
 ## Rules of the codebase
 

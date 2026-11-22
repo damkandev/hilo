@@ -32,7 +32,9 @@ app/bundle.sh                                               # app/dist/hilo.app 
 ```
 
 `bundle.sh` firma ad hoc salvo que `SIGN_ID` nombre un Developer ID; un `.dmg` público además necesita
-notarización (`xcrun notarytool submit … --wait` y luego `xcrun stapler staple`).
+notarización (`xcrun notarytool submit … --wait` y luego `xcrun stapler staple`). La ventana del `.dmg` (`app/dmg.py`,
+con el fondo dibujado en `app/assets/dmg.html`) la arma dmgbuild, que `bundle.sh` instala fijado en un venv
+desechable: necesita Python 3.11 o superior (`PYTHON=python3.13` elige uno).
 
 ## Reglas del código
 

@@ -1,0 +1,37 @@
+<!doctype html>
+<!-- The .dmg window's background, 600×400. Rendered to dmg-background.tiff (1x and 2x):
+       for s in 1 2; do "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new \
+         --hide-scrollbars --window-size=600,400 --force-device-scale-factor=$s \
+         --screenshot=/tmp/bg$s.png "file://$PWD/app/assets/dmg.html"; done
+       tiffutil -cathidpicheck /tmp/bg1.png /tmp/bg2.png -out app/assets/dmg-background.tiff
+     The icons sit on it where app/dmg.py puts them: hilo at (150, 250), Applications at (450, 250). -->
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; width: 600px; height: 400px; overflow: hidden; }
+  body { background: url(metal.png) 0 0 / 100% 100%; font-family: "Lucida Grande", sans-serif; color: #262626; }
+  /* the iTunes LCD, as in the app's toolbar */
+  .lcd {
+    position: absolute; left: 120px; top: 34px; width: 360px; height: 48px; box-sizing: border-box;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+    border: 1px solid #6e6e6e; border-radius: 8px; background: linear-gradient(#fbfcef, #d3d9bf);
+    box-shadow: 0 1px 0 rgb(255 255 255 / .7), inset 0 1px 2px rgb(0 0 0 / .12);
+  }
+  .lcd b { font-size: 13px; }
+  .lcd span { font-size: 11px; }
+  /* a blue gel arrow, like the default button, from the app to Applications */
+  svg { position: absolute; left: 236px; top: 222px; }
+</style>
+<div class="lcd"><b>Drag hilo onto Applications</b><span>then open it there to set it up</span></div>
+<svg width="128" height="56" viewBox="0 0 128 56">
+  <defs>
+    <linearGradient id="gel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a9cff8"/><stop offset=".5" stop-color="#4f8fe6"/><stop offset=".51" stop-color="#2f6fd0"/><stop offset="1" stop-color="#6ea8f0"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".85"/><stop offset="1" stop-color="#fff" stop-opacity=".1"/>
+    </linearGradient>
+    <filter id="drop" x="-10%" y="-20%" width="120%" height="150%"><feDropShadow dx="0" dy="1.5" stdDeviation="1.5" flood-opacity=".35"/></filter>
+  </defs>
+  <path d="M6 18 H84 V5 L122 28 L84 51 V38 H6 Q2 38 2 34 V22 Q2 18 6 18 Z" fill="url(#gel)" stroke="#2a5aa6" stroke-width="1.5" stroke-linejoin="round" filter="url(#drop)"/>
+  <path d="M8 20.5 H86 V10 L114 27 H8 Q5 27 5 24 V23 Q5 20.5 8 20.5 Z" fill="url(#gloss)"/>
+</svg>
