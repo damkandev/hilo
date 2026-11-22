@@ -19,9 +19,13 @@ cargo build --release --offline --locked
 rm -rf "$OUT" && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp app/target/release/hilo-app target/release/hilo "$APP/Contents/MacOS/"
 
-# the icon, from assets/icon.svg (Quick Look rasterizes SVG)
+# the icon, from assets/icon.svg (Quick Look rasterizes SVG), on Apple's grid: the 824px tile
+# centered in 1024 with a soft shadow, so it sits the size of the other apps' icons
 ICON=$(mktemp -d)
-qlmanage -t -s 1024 -o "$ICON" assets/icon.svg >/dev/null 2>&1
+{ echo '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><filter id="s"><feGaussianBlur stdDeviation="12"/></filter><rect x="100" y="112" width="824" height="824" rx="181" opacity=".3" filter="url(#s)"/>'
+  sed 's/<svg /<svg x="100" y="100" width="824" height="824" /' assets/icon.svg
+  echo '</svg>'; } > "$ICON/icon.svg"
+qlmanage -t -s 1024 -o "$ICON" "$ICON/icon.svg" >/dev/null 2>&1
 mkdir "$ICON/hilo.iconset"
 for s in 16 32 128 256 512; do
     sips -z $s $s "$ICON/icon.svg.png" --out "$ICON/hilo.iconset/icon_${s}x${s}.png" >/dev/null
