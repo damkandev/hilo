@@ -28,7 +28,15 @@ echo "hilo: checksum ok"
 # The checksum comes from the same release as the binary: it catches corruption, not a tampered
 # release. The build attestation (signed by GitHub for this repo's workflow) is what proves origin.
 if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-  gh attestation verify "hilo-$T.tar.gz" --repo "$REPO" >/dev/null && echo "hilo: build attestation ok (built by $REPO's release workflow)"
+  # in an if, not after &&: set -e doesn't stop on a failed command inside an && list
+  if gh attestation verify "hilo-$T.tar.gz" --repo "$REPO" >/dev/null; then
+    echo "hilo: build attestation ok (built by $REPO's release workflow)"
+  elif [ "${HILO_REQUIRE_ATTESTATION:-0}" = 1 ]; then
+    echo "hilo: the build attestation of hilo-$T.tar.gz did not verify; not installing" >&2
+    exit 1
+  else
+    echo "hilo: warning: the build attestation of hilo-$T.tar.gz did not verify (HILO_REQUIRE_ATTESTATION=1 refuses to install)" >&2
+  fi
 elif [ "${HILO_REQUIRE_ATTESTATION:-0}" = 1 ]; then
   echo "hilo: HILO_REQUIRE_ATTESTATION=1 needs the GitHub CLI (gh), logged in" >&2
   exit 1
