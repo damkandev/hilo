@@ -83,6 +83,30 @@ enum Page {
     Trash,
 }
 
+/// The setup assistant's steps, in order (they're listed down its left side).
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+enum Step {
+    Welcome,
+    Choose,
+    Connect,
+    Working,
+    Done,
+}
+const STEPS: [&str; 5] = ["Introduction", "Other Computer", "Connect", "Set Up", "Done"];
+
+/// How this Mac meets the other machine.
+#[derive(Clone, Copy, PartialEq)]
+enum Way {
+    /// hilo installs itself on an SSH host and pairs both
+    Ssh,
+    /// a join code from a machine that already runs hilo
+    Code,
+    /// this Mac is the anchor; the others join it
+    Server,
+    /// already the anchor: a new code for one more machine
+    Invite,
+}
+
 struct Hilo {
     bin: PathBuf,
     folder: PathBuf,
@@ -98,6 +122,24 @@ struct Hilo {
     metal: Arc<gpui::Image>,
     /// each table's scroll position, kept across renders
     scrolls: std::cell::RefCell<std::collections::HashMap<String, ScrollHandle>>,
+    /// the setup assistant, while it's open
+    tour: Option<Step>,
+    way: Way,
+    /// the join code pasted in the assistant
+    code: Option<String>,
+    /// the SSH host being set up
+    target: String,
+    /// the assistant was opened to add one more machine (not the first setup)
+    adding: bool,
+}
+
+fn load_hosts(bin: &Path) -> Vec<(String, String)> {
+    run(bin, &["setup", "--hosts"]).unwrap_or_default().lines().filter_map(|l| l.split_once('\t')).map(|(h, n)| (h.to_string(), n.to_string())).collect()
+}
+
+/// A join code on the clipboard: the code alone, or a whole `hilo join CODE …` command.
+fn find_code(s: &str) -> Option<String> {
+    s.split_whitespace().find(|w| w.starts_with("HILO-") && w.contains('@')).map(String::from)
 }
 
 // Mac OS X 10.3/10.4, the brushed-metal apps (iTunes, Safari, the Finder): metal with its grain, an
@@ -114,21 +156,23 @@ const GREEN: (u32, u32) = (0x28c840, 0x1ea333);
 const YELLOW: (u32, u32) = (0xfebc2e, 0xd49b1e);
 const RED: (u32, u32) = (0xff5f57, 0xd9453d);
 const OFF: (u32, u32) = (0xc8c8c8, 0x9a9a9a);
+/// the Installer's bullet for the step you're on
+const BLUE: (u32, u32) = (0x5b9bf0, 0x2c62bf);
 impl Hilo {
     fn new(cx: &mut Context<Self>) -> Self {
         let bin = find_hilo();
-        let hosts = run(&bin, &["setup", "--hosts"])
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| l.split_once('\t'))
-            .map(|(h, n)| (h.to_string(), n.to_string()))
-            .collect();
+        let hosts = load_hosts(&bin);
         // poll the daemon; a running job's output shows up on the same tick
         cx.spawn(async move |this, cx| loop {
             let Ok(bin) = this.read_with(cx, |h, _| h.bin.clone()) else { return };
             let st = cx.background_executor().spawn(async move { run(&bin, &["status", "--json"]) }).await;
             let alive = this.update(cx, |h, cx| {
+                let first = h.status.is_none();
                 h.status = st.ok().and_then(|s| serde_json::from_str(&s).ok());
+                // not set up yet: the assistant opens on its own
+                if first && h.status.is_some() && h.str("role").is_empty() && h.tour.is_none() {
+                    h.tour = Some(Step::Welcome);
+                }
                 cx.notify();
             });
             if alive.is_err() {
@@ -137,7 +181,7 @@ impl Hilo {
             cx.background_executor().timer(Duration::from_millis(1000)).await;
         })
         .detach();
-        Hilo { bin, folder: home().join("Desktop").join(LABEL), page: Page::Status, status: None, hosts, job: Default::default(), notice: None, versions: None, trash: vec![], sel: None, metal: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, include_bytes!("../assets/metal.png").to_vec())), scrolls: Default::default() }
+        Hilo { bin, folder: home().join("Desktop").join(LABEL), page: Page::Status, status: None, hosts, job: Default::default(), notice: None, versions: None, trash: vec![], sel: None, metal: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, include_bytes!("../assets/metal.png").to_vec())), scrolls: Default::default(), tour: None, way: Way::Ssh, code: None, target: String::new(), adding: false }
     }
 
     fn str(&self, k: &str) -> String {
@@ -180,7 +224,7 @@ impl Hilo {
         cx.spawn(async move |this, cx| {
             if task.await {
                 if let Some(f) = then {
-                    let _ = this.update(cx, |h, cx| f(h, cx));
+                    let _ = this.update(cx, f);
                 }
             }
         })
@@ -198,26 +242,72 @@ impl Hilo {
         }
     }
 
-    fn pair_ssh(&mut self, host: String, cx: &mut Context<Self>) {
-        let Some(f) = self.ensure_folder() else { return };
-        let args = ["setup", &host, "--folder", &f, "--as", LABEL].map(String::from).to_vec();
-        self.start(&format!("Setting up {host}"), args, None, cx);
-    }
-
-    fn pair_code(&mut self, cx: &mut Context<Self>) {
-        let code = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default().trim().to_string();
-        if !(code.starts_with("HILO-") && code.contains('@')) {
-            self.notice = Some("Copy the join code first (it starts with HILO-), then click here again.".into());
-            return cx.notify();
+    /// The assistant's last step runs the command for the chosen way; on success it moves to Done.
+    fn set_up(&mut self, cx: &mut Context<Self>) {
+        let done = Some(Hilo::finish as fn(&mut Hilo, &mut Context<Hilo>));
+        if self.way == Way::Invite {
+            self.start("Making a join code", vec!["invite".into()], done, cx);
+        } else if let Some(f) = self.ensure_folder() {
+            let (title, args): (String, Vec<String>) = match self.way {
+                Way::Ssh => {
+                    // Try Again has no selection: the host from the last try
+                    let Some(h) = self.sel.and_then(|i| self.hosts.get(i)).map(|h| h.0.clone()).or(Some(self.target.clone()).filter(|t| !t.is_empty())) else { return };
+                    self.target = h.clone();
+                    (format!("Setting up {h}"), ["setup", &h, "--folder", &f, "--as", LABEL].map(String::from).to_vec())
+                }
+                Way::Code => {
+                    let Some(c) = self.code.clone() else { return };
+                    ("Joining the other machine".into(), ["join", &c, "--folder", &f, "--as", LABEL].map(String::from).to_vec())
+                }
+                _ => ("Starting hilo on this Mac".into(), ["init", "--folder", &f, "--as", LABEL].map(String::from).to_vec()),
+            };
+            self.start(&title, args, done, cx);
         }
-        let Some(f) = self.ensure_folder() else { return };
-        self.notice = None;
-        self.start("Joining", ["join", &code, "--folder", &f, "--as", LABEL].map(String::from).to_vec(), None, cx);
+        if self.job.lock().unwrap().running {
+            self.step(Step::Working, cx);
+        }
+        cx.notify();
     }
 
-    fn be_server(&mut self, cx: &mut Context<Self>) {
-        let Some(f) = self.ensure_folder() else { return };
-        self.start("Starting the anchor on this Mac", ["init", "--folder", &f, "--as", LABEL].map(String::from).to_vec(), None, cx);
+    fn finish(&mut self, cx: &mut Context<Self>) {
+        if self.tour.is_some() {
+            self.tour = Some(Step::Done);
+            cx.notify();
+        }
+    }
+
+    fn open_tour(&mut self, adding: bool, cx: &mut Context<Self>) {
+        (self.adding, self.way, self.code, self.target) = (adding, Way::Ssh, None, String::new());
+        self.step(if adding { Step::Choose } else { Step::Welcome }, cx);
+    }
+
+    fn step(&mut self, s: Step, cx: &mut Context<Self>) {
+        if s < Step::Working {
+            *self.job.lock().unwrap() = Job::default();
+        }
+        if s == Step::Connect && self.way == Way::Code && self.code.is_none() {
+            self.code = cx.read_from_clipboard().and_then(|c| c.text()).and_then(|t| find_code(&t));
+        }
+        (self.tour, self.sel, self.notice) = (Some(s), None, None);
+        cx.notify();
+    }
+
+    fn close_tour(&mut self, cx: &mut Context<Self>) {
+        self.tour = None;
+        *self.job.lock().unwrap() = Job::default();
+        self.go(Page::Status, cx);
+    }
+
+    fn paste_code(&mut self, cx: &mut Context<Self>) {
+        self.code = cx.read_from_clipboard().and_then(|c| c.text()).and_then(|t| find_code(&t));
+        if self.code.is_none() {
+            self.notice = Some("There's no join code on the clipboard. Copy it on the other machine first: it starts with HILO-.".into());
+        }
+        cx.notify();
+    }
+
+    fn job_code(&self) -> Option<String> {
+        self.job.lock().unwrap().lines.iter().find_map(|l| find_code(l))
     }
 
     fn add_folder(&mut self, drive: bool, cx: &mut Context<Self>) {
@@ -471,6 +561,53 @@ fn scroller(id: &str, h: &ScrollHandle, cx: &mut Context<Hilo>) -> gpui::Div {
 }
 
 /// Small bold caption over a table, on the metal.
+/// An Aqua radio button: blue gel with a dark dot when on.
+fn radio(on: bool) -> gpui::Div {
+    let d = div().flex().flex_none().items_center().justify_center().size(px(14.)).rounded_full().border_1();
+    if on {
+        d.border_color(rgb(0x2f5fa8)).bg(grad(0x9cc6f7, 0x2f6fd0)).shadow(vec![shadow(1., 1., 0.25)]).child(div().size(px(5.)).rounded_full().bg(rgb(0x0f2346)))
+    } else {
+        d.border_color(rgb(0x8a8a8a)).bg(grad(0xffffff, 0xd4d4d4)).shadow(vec![shadow(1., 1., 0.15)])
+    }
+}
+
+fn para(s: impl Into<SharedString>) -> gpui::Div {
+    div().text_size(px(12.)).line_height(px(17.)).child(s.into())
+}
+
+/// Text to read or copy, in an inset white field.
+fn field(s: impl Into<SharedString>, size: f32) -> gpui::Div {
+    div().px(px(8.)).py(px(5.)).bg(rgb(0xffffff)).border_1().border_color(rgb(0x8e8e8e)).font_family(MONO).text_size(px(size)).child(s.into())
+}
+
+/// A machine and its folder, in the assistant's welcome.
+fn place(who: &'static str, path: impl Into<SharedString>) -> gpui::Div {
+    div().flex().flex_col().gap(px(2.)).px(px(12.)).py(px(8.)).bg(rgb(SOURCE)).border_1().border_color(rgb(0xa9b4c4)).rounded(px(4.)).child(div().text_size(px(12.)).font_weight(FontWeight::BOLD).child(who)).child(div().text_size(px(11.)).child(path.into()))
+}
+
+/// A command's output, the newest lines that fit.
+fn log_box(lines: &[String], h: f32) -> gpui::Div {
+    let fit = ((h - 12.) / 14.) as usize;
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .h(px(h))
+        .p(px(6.))
+        .bg(rgb(0xffffff))
+        .border_1()
+        .border_color(rgb(0x9b9b9b))
+        .overflow_hidden()
+        .font_family(MONO)
+        .text_size(px(10.))
+        .line_height(px(14.))
+        .children(lines.iter().rev().take(fit).rev().map(|l| div().whitespace_nowrap().child(l.clone())))
+}
+
+fn copy_button(id: &'static str, text: &'static str, s: String) -> gpui::AnyElement {
+    aqua_button(id, text, Btn::Normal, Some(Box::new(move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| cx.write_to_clipboard(ClipboardItem::new_string(s.clone())))))
+}
+
 fn caption(s: impl Into<SharedString>) -> gpui::Div {
     div().text_size(px(11.)).font_weight(FontWeight::BOLD).text_color(rgb(0x3a3a3a)).child(s.into())
 }
@@ -549,39 +686,192 @@ impl Hilo {
 // ---------- pages ----------
 
 impl Hilo {
-    fn onboarding(&mut self, cx: &mut Context<Self>) -> gpui::Div {
-        let rows = self.hosts.iter().map(|(h, a)| vec![cell(h.clone()), cell(a.clone())]).collect();
-        let picked = self.sel.and_then(|i| self.hosts.get(i)).map(|h| h.0.clone());
-        let go = match picked {
-            Some(h) => aqua_button("setup", format!("Set Up {h}"), Btn::Default, self.click(cx, move |this, cx| this.pair_ssh(h.clone(), cx))),
-            None => aqua_button("setup", "Set Up", Btn::Disabled, None),
-        };
+    /// One choice in the assistant: an Aqua radio button, its name and what it means.
+    fn choice(&self, way: Way, name: &'static str, about: &'static str, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         div()
+            .id(name)
+            .flex()
+            .gap(px(10.))
+            .py(px(6.))
+            .child(div().pt(px(1.)).child(radio(self.way == way)))
+            .child(div().flex().flex_col().flex_1().min_w_0().gap(px(2.)).child(div().text_size(px(13.)).font_weight(FontWeight::BOLD).child(name)).child(para(about).text_color(rgb(0x4a4a4a))))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.way = way;
+                cx.notify();
+            }))
+    }
+
+    /// The setup assistant, as in the Mac OS X Installer: the steps down the left, a white pane, and
+    /// Go Back / Continue under it. Its last steps run `hilo setup`, `join`, `init` or `invite`.
+    fn tour_page(&mut self, step: Step, cx: &mut Context<Self>) -> gpui::Div {
+        let folder = tilde(&self.folder.to_string_lossy());
+        let job = self.job.lock().unwrap();
+        let (running, failed, job_title, lines) = (job.running, job.ok == Some(false), job.title.clone(), job.lines.clone());
+        drop(job);
+        let next = |id: &'static str, text: String, on: Option<Click>| aqua_button(id, text, if on.is_some() { Btn::Default } else { Btn::Disabled }, on);
+        let to = |cx: &mut Context<Self>, s: Step| self.click(cx, move |this, cx| this.step(s, cx));
+
+        let (title, body, back, cont): (String, gpui::Div, Option<Step>, gpui::AnyElement) = match step {
+            Step::Welcome => (
+                "Welcome to hilo".into(),
+                div()
+                    .child(para("hilo keeps one folder the same on this Mac and on your other computers. Put a file in it here and it shows up there a moment later, and the other way round."))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .py(px(6.))
+                            .child(place("This Mac", folder.clone()))
+                            .child(div().text_size(px(18.)).text_color(rgb(0x3875d7)).child("⇄"))
+                            .child(place("Your other computer", "its hilo folder")),
+                    )
+                    .child(para("It takes about a minute. Have your other computer at hand: another Mac, a Linux or Windows PC, or a server.")),
+                None,
+                next("go", "Continue".into(), to(cx, Step::Choose)),
+            ),
+            Step::Choose => {
+                let mut list = div().flex().flex_col().gap(px(4.)).child(self.choice(
+                    Way::Ssh,
+                    "Set it up from here",
+                    "For a server or a computer you reach with ssh. hilo installs itself there and pairs the two: nothing to do on the other side.",
+                    cx,
+                ));
+                if self.adding {
+                    list = list.child(self.choice(Way::Invite, "Give me a code to type there", "For a computer you can't reach with ssh. Install hilo there and paste the code.", cx));
+                } else {
+                    list = list
+                        .child(self.choice(
+                            Way::Code,
+                            "It already runs hilo",
+                            "Get a join code from the computer that keeps the shared copy: Add Computer in its hilo app, or hilo invite in its terminal.",
+                            cx,
+                        ))
+                        .child(self.choice(Way::Server, "This Mac is the first one", "Your other computers will connect to this Mac. You'll get a code to type on each of them.", cx));
+                }
+                let go = if self.way == Way::Invite { self.click(cx, |this, cx| this.set_up(cx)) } else { to(cx, Step::Connect) };
+                ("How do you want to connect?".into(), div().child(list), (!self.adding).then_some(Step::Welcome), next("go", "Continue".into(), go))
+            }
+            Step::Connect => match self.way {
+                Way::Ssh => {
+                    let rows: Vec<_> = self.hosts.iter().map(|(h, a)| vec![cell(h.clone()), cell(a.clone())]).collect();
+                    let picked = self.sel.and_then(|i| self.hosts.get(i)).map(|h| h.0.clone());
+                    let mut d = div().child(para("These come from your SSH config (~/.ssh/config). hilo signs in the same way ssh does, with your key, and installs itself in your home folder there."));
+                    d = if rows.is_empty() {
+                        d.child(para("There are no computers in your SSH config yet. Add yours there and click Check Again, or go back and use a join code."))
+                            .child(div().flex().child(aqua_button("again", "Check Again", Btn::Normal, self.click(cx, |this, cx| {
+                                this.hosts = load_hosts(&this.bin);
+                                cx.notify();
+                            }))))
+                    } else {
+                        d.child(self.table("hosts", &[("Name", None), ("Address", Some(220.))], rows, true, cx))
+                    };
+                    let go = match picked {
+                        Some(h) => next("go", format!("Set Up {h}"), self.click(cx, |this, cx| this.set_up(cx))),
+                        None => next("go", "Set Up".into(), None),
+                    };
+                    ("Choose your other computer".into(), d, Some(Step::Choose), go)
+                }
+                Way::Code => {
+                    let shown = self.code.clone();
+                    (
+                        "Paste the join code".into(),
+                        div()
+                            .child(para("Copy the code on the other computer, then click Paste. It looks like HILO-7KQ2-M9PA-XR4T@192.168.1.20:7710."))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .child(field(shown.clone().unwrap_or("No code yet".into()), 12.).flex_1().when(shown.is_none(), |d| d.text_color(rgb(0x8a8a8a))))
+                                    .child(aqua_button("paste", "Paste", Btn::Normal, self.click(cx, |this, cx| this.paste_code(cx)))),
+                            ),
+                        Some(Step::Choose),
+                        next("go", "Join".into(), shown.and_then(|_| self.click(cx, |this, cx| this.set_up(cx)))),
+                    )
+                }
+                _ => (
+                    "This Mac keeps the shared copy".into(),
+                    div()
+                        .child(para("Your other computers connect to this Mac to stay in sync, so it works best when it stays on. They need to reach it: on the same network, or over a VPN like Tailscale."))
+                        .child(para("hilo starts in the background now, and every time you log in. Then it gives you a code for the other computers.")),
+                    Some(Step::Choose),
+                    next("go", "Start".into(), self.click(cx, |this, cx| this.set_up(cx))),
+                ),
+            },
+            Step::Working => {
+                let back = if self.way == Way::Invite { Step::Choose } else { Step::Connect };
+                (
+                    if failed { "That didn't work".into() } else { job_title },
+                    div()
+                        .child(para(if failed {
+                            "Here's what hilo said. Fix it and click Try Again, or go back and choose another way."
+                        } else {
+                            "This can take a minute. Leave this window open."
+                        }))
+                        .child(log_box(&lines, 170.))
+                        .when(running, |d| d.child(barber())),
+                    failed.then_some(back),
+                    if failed { next("go", "Try Again".into(), self.click(cx, |this, cx| this.set_up(cx))) } else { next("go", "Continue".into(), None) },
+                )
+            }
+            Step::Done => {
+                let mut d = div();
+                if matches!(self.way, Way::Server | Way::Invite) {
+                    let code = self.job_code().unwrap_or_default();
+                    let cmd = format!("curl -fsSL https://raw.githubusercontent.com/damkandev/hilo/main/install.sh | sh -s -- join {code} --as {LABEL} --folder ~/{LABEL}");
+                    d = d
+                        .child(para("On your other computer, get hilo from hilo.dapan.es, choose “It already runs hilo” and paste this code:"))
+                        .child(div().flex().items_center().gap(px(10.)).child(field(code.clone(), 14.).font_weight(FontWeight::BOLD).flex_1()).child(copy_button("copy", "Copy Code", code)))
+                        .child(para("Or run this in a terminal there (Linux or Mac): it installs hilo and joins in one go."))
+                        .child(div().flex().items_center().gap(px(10.)).child(field(cmd.clone(), 10.).flex_1().overflow_hidden().whitespace_nowrap()).child(copy_button("copycmd", "Copy Command", cmd)))
+                        .child(para("Each code works once. For one more computer, click Add Computer in the toolbar."));
+                } else {
+                    let other = if self.way == Way::Ssh { self.target.as_str() } else { "the other computer" };
+                    d = d.child(para(format!("{folder} on this Mac and the hilo folder on {other} are now the same folder. Put a file in it and it shows up there a moment later.")));
+                }
+                if self.way != Way::Invite {
+                    let f = self.folder.clone();
+                    d = d.child(para("hilo keeps running in the background. This window shows how it's doing, older versions of every file, and what was deleted.")).child(
+                        div().flex().child(aqua_button("open", "Open the hilo Folder", Btn::Normal, Some(Box::new(move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| cx.open_with_system(&f))))),
+                    );
+                }
+                (if self.way == Way::Invite { "One more computer".into() } else { "hilo is ready".into() }, d, None, next("go", "Done".into(), self.click(cx, |this, cx| this.close_tour(cx))))
+            }
+        };
+
+        let steps = div().flex().flex_col().flex_none().w(px(150.)).pt(px(14.)).gap(px(10.)).children(STEPS.iter().enumerate().map(|(i, s)| {
+            let at = i == step as usize;
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(10.))
+                .text_size(px(12.))
+                .when(at, |d| d.font_weight(FontWeight::BOLD))
+                .when(i > step as usize, |d| d.text_color(rgb(0x5e5e5e)))
+                .child(lamp(if at { BLUE } else { OFF }, 9.))
+                .child(*s)
+        }));
+        let mut buttons = div().flex().items_center().gap(px(10.)).pt(px(8.));
+        if self.adding && step != Step::Done {
+            buttons = buttons.child(aqua_button("cancel", "Cancel", Btn::Normal, self.click(cx, |this, cx| this.close_tour(cx))));
+        }
+        buttons = buttons.child(div().flex_1());
+        if step != Step::Done && !(self.adding && step == Step::Choose) {
+            buttons = buttons.child(aqua_button("back", "Go Back", if back.is_some() { Btn::Normal } else { Btn::Disabled }, back.and_then(|b| to(cx, b))));
+        }
+        let pane = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
-            .gap(px(10.))
-            .p(px(20.))
             .bg(rgb(0xffffff))
             .border_1()
             .border_color(rgb(0x7b7b7b))
-            .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).child("Set Up hilo"))
-            .child(div().text_size(px(12.)).child(format!(
-                "{} will hold the same files on this Mac and on your other machine. Choose the other machine, or join one that is already set up.",
-                tilde(&self.folder.to_string_lossy())
-            )))
-            .child(caption(if self.hosts.is_empty() { "No machines in ~/.ssh/config" } else { "Machines in ~/.ssh/config" }))
-            .child(self.table("hosts", &[("Name", None), ("Address", Some(220.))], rows, true, cx))
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(px(10.))
-                    .child(aqua_button("paste", "Paste Join Code", Btn::Normal, self.click(cx, |this, cx| this.pair_code(cx))))
-                    .child(aqua_button("server", "This Mac Is the Server", Btn::Normal, self.click(cx, |this, cx| this.be_server(cx))))
-                    .child(go),
-            )
+            .child(div().px(px(20.)).pt(px(16.)).pb(px(8.)).text_size(px(15.)).font_weight(FontWeight::BOLD).child(title))
+            .child(body.flex().flex_col().flex_1().min_h_0().gap(px(10.)).px(px(20.)).pb(px(16.)));
+        div().flex().flex_1().min_h_0().gap(px(8.)).child(steps).child(div().flex().flex_col().flex_1().min_w_0().min_h_0().child(pane).child(buttons.child(cont)))
     }
 
     /// Starts the daemon: through its launchd job when there is one, else as a detached process.
@@ -753,10 +1043,11 @@ impl Hilo {
             ("hilo".to_string(), vec![n.clone()], false, None)
         } else {
             let j = self.job.lock().unwrap();
-            if j.title.is_empty() {
+            // the assistant shows its own commands
+            if j.title.is_empty() || self.tour.is_some() {
                 return None;
             }
-            let code = j.lines.iter().find_map(|l| l.split_whitespace().find(|w| w.starts_with("HILO-") && w.contains('@')).map(String::from));
+            let code = j.lines.iter().find_map(|l| find_code(l));
             let t = match (j.running, j.ok) {
                 (true, _) => j.title.clone(),
                 (_, Some(true)) => format!("{}: done", j.title),
@@ -764,19 +1055,7 @@ impl Hilo {
             };
             (t, j.lines.clone(), j.running, code)
         };
-        let out = div()
-            .flex()
-            .flex_col()
-            .h(px(130.))
-            .p(px(6.))
-            .bg(rgb(0xffffff))
-            .border_1()
-            .border_color(rgb(0x9b9b9b))
-            .overflow_hidden()
-            .font_family(MONO)
-            .text_size(px(10.))
-            .line_height(px(14.))
-            .children(lines.iter().rev().take(8).rev().map(|l| div().whitespace_nowrap().child(l.clone())));
+        let out = log_box(&lines, 130.);
         let mut buttons = div().flex().justify_end().gap(px(10.));
         if let Some(code) = code {
             let cmd = format!("hilo join {code} --as {LABEL} --folder ~/{LABEL}");
@@ -868,6 +1147,9 @@ impl Render for Hilo {
         let mut right = div().flex().flex_1().items_center().justify_end();
         if set_up && !self.daemon_up() {
             right = right.child(metal_button("start", "Start hilo").on_click(cx.listener(|this, _, _, cx| this.start_daemon(cx))));
+        } else if self.tour.is_none() && self.str("role") == "anchor" {
+            // ponytail: only the anchor adds machines here; on a member, its anchor hands out the codes
+            right = right.child(metal_button("add", "Add Computer").on_click(cx.listener(|this, _, _, cx| this.open_tour(true, cx))));
         }
         let toolbar = div().flex().flex_none().items_center().h(px(50.)).px(px(12.)).child(left).child(self.lcd()).child(right);
 
@@ -886,7 +1168,7 @@ impl Render for Hilo {
                 .on_click(cx.listener(move |this, _, _, cx| this.go(p, cx)))
         };
         let mut body = div().flex().flex_1().min_h_0().gap(px(8.)).px(px(10.));
-        if set_up {
+        if set_up && self.tour.is_none() {
             body = body.child(
                 div()
                     .flex()
@@ -903,12 +1185,14 @@ impl Render for Hilo {
                     .child(nav("n-trash", "Trash", Page::Trash, cx)),
             );
         }
-        let page = match (set_up, self.page) {
-            (false, _) => self.onboarding(cx),
-            (_, Page::Status) => self.status_page(cx),
-            (_, Page::Folders) => self.folders_page(cx),
-            (_, Page::Versions) => self.versions_page(cx),
-            (_, Page::Trash) => self.trash_page(cx),
+        let page = match (self.tour, set_up, self.page) {
+            (Some(s), ..) => self.tour_page(s, cx),
+            // the first status hasn't arrived yet
+            (None, false, _) => div(),
+            (_, _, Page::Status) => self.status_page(cx),
+            (_, _, Page::Folders) => self.folders_page(cx),
+            (_, _, Page::Versions) => self.versions_page(cx),
+            (_, _, Page::Trash) => self.trash_page(cx),
         };
         body = body.child(div().flex().flex_col().flex_1().min_w_0().min_h_0().child(page));
 
