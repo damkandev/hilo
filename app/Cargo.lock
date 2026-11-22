@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "hilo-app"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "gpui",
  "serde_json",

@@ -1,6 +1,6 @@
 [package]
 name = "hilo"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 license = "MIT"
 description = "Keeps the same code alive on all your machines while your agents work."
