@@ -105,4 +105,4 @@ Lo que cambia respecto de macOS y Linux:
 ## Actualizar
 
 Corre el instalador de nuevo. Reemplaza el binario en `~/.local/bin` (o `HILO_BIN_DIR`); para fijar
-un release usa `HILO_VERSION=v0.4.3`.
+un release usa `HILO_VERSION=v0.4.4`.

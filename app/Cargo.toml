@@ -1,6 +1,6 @@
 [package]
 name = "hilo-app"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 license = "MIT"
 description = "hilo's desktop app: status, folders, versions and pairing, on top of the hilo CLI."
