@@ -54,12 +54,15 @@ else
     codesign --force -s - "$APP/Contents/MacOS/hilo" "$APP/Contents/MacOS/hilo-app" && codesign --force -s - "$APP"
 fi
 
-# the .dmg: the app and a link to Applications, side by side
-STAGE=$(mktemp -d)
-cp -R "$APP" "$STAGE/" && ln -s /Applications "$STAGE/Applications"
+# the .dmg: a brushed-metal window with the app, an arrow and Applications (app/dmg.py), laid out
+# by dmgbuild (pinned, hash-checked, in a throwaway venv: Python 3.11 or later)
+VENV=$(mktemp -d)
+"${PYTHON:-python3}" -m venv "$VENV"
+"$VENV/bin/pip" install -q --disable-pip-version-check --require-hashes --only-binary :all: -r app/dmg-requirements.txt
 # a stable name, so https://github.com/damkandev/hilo/releases/latest/download/hilo-macos.dmg always works
-hdiutil create -quiet -volname hilo -srcfolder "$STAGE" -ov -format UDZO "$OUT/hilo-macos.dmg"
-rm -rf "$STAGE"
+rm -f "$OUT/hilo-macos.dmg"
+"$VENV/bin/dmgbuild" -s app/dmg.py -D app="$APP" -D icon="$APP/Contents/Resources/hilo.icns" -D bg="$ROOT/app/assets/dmg-background.tiff" hilo "$OUT/hilo-macos.dmg" >/dev/null
+rm -rf "$VENV"
 [ -n "${SIGN_ID:-}" ] && codesign -s "$SIGN_ID" "$OUT/hilo-macos.dmg"
 echo "$APP"
 echo "$OUT/hilo-macos.dmg"
