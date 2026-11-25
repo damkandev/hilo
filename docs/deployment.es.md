@@ -65,14 +65,15 @@ escribe en `~/.hilo/daemon.log`. `--no-service` omite el servicio en `setup`, `i
 
 ## Zo Computer
 
-Zo no tiene systemd. `hilo`, `setup`, `init` y `join` lo detectan (existe `/home/workspace` y no hay
-gestor de usuario de systemd), imprimen los campos de un service de Zo y dejan el daemon corriendo en
-segundo plano con su log en `~/.hilo/daemon.log`, como `hilo up`. Ese proceso no sobrevive a un
-reinicio de Zo: registra el service en Zo con los valores impresos para que vuelva solo.
-
 Vincula carpetas bajo `/home/workspace`: es lo que persiste en Zo.
 
 ### Peer
+
+Zo no tiene systemd. `hilo join` y `hilo setup` (también `hilo` y `hilo init`) detectan Zo
+(existe `/home/workspace` y no hay gestor de usuario de systemd), imprimen los campos de un service
+de Zo y dejan el daemon corriendo en segundo plano con su log en `~/.hilo/daemon.log`, como `hilo up`.
+Ese proceso no sobrevive a un reinicio de Zo si no registras el service: créalo en Zo con los
+valores impresos para que el daemon vuelva solo. hilo imprime:
 
 ```
 Zo Computer has no systemd: register hilo as a Zo service so it survives restarts
@@ -80,6 +81,7 @@ label: hilo
 mode: process
 entrypoint: /root/.local/bin/hilo daemon
 workdir: /home/workspace
+the daemon is running now (log: /root/.hilo/daemon.log)
 ```
 
 | Campo | Valor |
