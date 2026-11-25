@@ -215,11 +215,49 @@ fn run(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd).args(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
+/// hilo's own settings, carried into the service (tests run with an isolated home and no Keychain).
+#[cfg(unix)]
+fn service_envs() -> Vec<(String, String)> {
+    ["HILO_HOME", "HILO_KEYCHAIN", "HILO_NOTIFY"].iter().filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?))).collect()
+}
+
+/// Zo Computer: hay /home/workspace y no hay systemd de usuario usable.
+#[cfg(unix)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn is_zo(workspace: bool, user_systemd: bool) -> bool {
+    workspace && !user_systemd
+}
+
+/// /home/workspace alone could be any box; what matters is that `systemctl --user` can't work.
+/// `/run/systemd/system` exists only when systemd is PID 1 (the same test as sd_booted()), and
+/// `/run/user/<uid>` only when logind started a user manager for us. Zo's container has neither,
+/// and probing the dirs is cheaper and quieter than running systemctl.
+#[cfg(unix)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn zo_detected() -> bool {
+    let user_systemd = Path::new("/run/systemd/system").is_dir() && Path::new(&format!("/run/user/{}", unsafe { getuid() })).is_dir();
+    is_zo(Path::new("/home/workspace").is_dir(), user_systemd)
+}
+
+/// Instrucciones para registrar el daemon como service `process` de Zo.
+#[cfg(unix)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn zo_instructions(bin: &Path, envs: &[(String, String)]) -> String {
+    let mut s = format!(
+        "Zo Computer has no systemd: register hilo as a Zo service so it survives restarts\nlabel: hilo\nmode: process\nentrypoint: {} daemon\nworkdir: /home/workspace\n",
+        bin.display()
+    );
+    for (k, v) in envs {
+        s.push_str(&format!("{k}={v}\n"));
+    }
+    s.pop();
+    s
+}
+
 #[cfg(unix)]
 fn service(bin: &Path, add: bool) -> Option<String> {
-    // carry hilo's own settings into the service (tests run with an isolated home and no Keychain)
-    let envs: Vec<(String, String)> = ["HILO_HOME", "HILO_KEYCHAIN", "HILO_NOTIFY"].iter().filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?))).collect();
     if cfg!(target_os = "macos") {
+        let envs = service_envs();
         let p = home().join(format!("Library/LaunchAgents/{LABEL}.plist"));
         let domain = format!("gui/{}", unsafe { getuid() });
         // The label is per user, not per HOME: only touch the loaded job if it is ours (our plist exists).
@@ -251,30 +289,47 @@ fn service(bin: &Path, add: bool) -> Option<String> {
         let ok = run("launchctl", &["bootstrap", &domain, &p.to_string_lossy()]);
         Some(if ok { format!("launchd service {} (starts at login)", p.display()) } else { format!("wrote {} but launchctl refused it; run `hilo daemon` yourself", p.display()) })
     } else {
-        let p = home().join(".config/systemd/user/hilo.service");
-        if !add {
-            if !p.exists() {
-                return None;
-            }
-            run("systemctl", &["--user", "disable", "--now", "hilo.service"]);
-            return std::fs::remove_file(&p).ok().map(|_| format!("removed {}", p.display()));
-        }
-        let env: String = envs.iter().map(|(k, v)| format!("Environment={k}={v}\n")).collect();
-        let unit = format!(
-            "[Unit]\nDescription=hilo: same code on all your machines\nAfter=network-online.target\n\n[Service]\nExecStart={} daemon\nRestart=always\nRestartSec=2\n{env}\n[Install]\nWantedBy=default.target\n",
-            sh_quote(bin)
-        );
-        std::fs::create_dir_all(p.parent()?).ok()?;
-        std::fs::write(&p, unit).ok()?;
-        let ok = run("systemctl", &["--user", "daemon-reload"]) && run("systemctl", &["--user", "enable", "--now", "hilo.service"]);
-        let user = std::env::var("USER").unwrap_or_default();
-        let linger = run("loginctl", &["enable-linger", &user]);
-        Some(match (ok, linger) {
-            (true, true) => format!("systemd user service {} (runs without a login session)", p.display()),
-            (true, false) => format!("systemd user service {} (enable lingering to keep it running after logout: `sudo loginctl enable-linger {user}`)", p.display()),
-            _ => format!("wrote {} but systemctl failed; run `hilo daemon` yourself", p.display()),
-        })
+        linux_service(&home(), bin, add, zo_detected(), &mut |c, a| run(c, a), &mut || if crate::daemon_up() { Ok(()) } else { crate::spawn_daemon() })
     }
+}
+
+/// Rama Linux de service(): una unidad systemd de usuario, o en Zo Computer las instrucciones para
+/// registrar un service `process` de Zo más el daemon arrancado ya (como `hilo up`).
+#[cfg(unix)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn linux_service(home: &Path, bin: &Path, add: bool, zo: bool, run: &mut dyn FnMut(&str, &[&str]) -> bool, start: &mut dyn FnMut() -> Result<(), String>) -> Option<String> {
+    let p = home.join(".config/systemd/user/hilo.service");
+    if !add {
+        if !p.exists() {
+            return None;
+        }
+        run("systemctl", &["--user", "disable", "--now", "hilo.service"]);
+        return std::fs::remove_file(&p).ok().map(|_| format!("removed {}", p.display()));
+    }
+    let envs = service_envs();
+    if zo {
+        let mut s = zo_instructions(bin, &envs);
+        match start() {
+            Ok(()) => s.push_str(&format!("\nthe daemon is running now (log: {})", crate::config::path("daemon.log").display())),
+            Err(e) => s.push_str(&format!("\ncould not start the daemon ({e}); run `hilo up` yourself")),
+        }
+        return Some(s);
+    }
+    let env: String = envs.iter().map(|(k, v)| format!("Environment={k}={v}\n")).collect();
+    let unit = format!(
+        "[Unit]\nDescription=hilo: same code on all your machines\nAfter=network-online.target\n\n[Service]\nExecStart={} daemon\nRestart=always\nRestartSec=2\n{env}\n[Install]\nWantedBy=default.target\n",
+        sh_quote(bin)
+    );
+    std::fs::create_dir_all(p.parent()?).ok()?;
+    std::fs::write(&p, unit).ok()?;
+    let ok = run("systemctl", &["--user", "daemon-reload"]) && run("systemctl", &["--user", "enable", "--now", "hilo.service"]);
+    let user = std::env::var("USER").unwrap_or_default();
+    let linger = run("loginctl", &["enable-linger", &user]);
+    Some(match (ok, linger) {
+        (true, true) => format!("systemd user service {} (runs without a login session)", p.display()),
+        (true, false) => format!("systemd user service {} (enable lingering to keep it running after logout: `sudo loginctl enable-linger {user}`)", p.display()),
+        _ => format!("wrote {} but systemctl failed; run `hilo daemon` yourself", p.display()),
+    })
 }
 
 /// Windows: a per-user Run key, which needs no admin (an ONLOGON scheduled task does). The daemon
@@ -376,5 +431,90 @@ mod tests {
         assert!(std::fs::symlink_metadata(d.join("config.toml")).unwrap().file_type().is_symlink());
         assert!(std::fs::read_to_string(d.join("real.toml")).unwrap().contains("b = 2"));
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zo_needs_workspace_and_no_user_systemd() {
+        assert!(is_zo(true, false));
+        assert!(!is_zo(true, true));
+        assert!(!is_zo(false, false));
+        assert!(!is_zo(false, true));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zo_instructions_lines() {
+        let envs = vec![("HILO_HOME".to_string(), "/x/h".to_string()), ("HILO_NOTIFY".to_string(), "0".to_string())];
+        let t = zo_instructions(Path::new("/usr/bin/hilo"), &envs);
+        let lines: Vec<&str> = t.lines().collect();
+        for want in ["label: hilo", "mode: process", "entrypoint: /usr/bin/hilo daemon", "workdir: /home/workspace", "HILO_HOME=/x/h", "HILO_NOTIFY=0"] {
+            assert!(lines.contains(&want), "{want} missing in {t}");
+        }
+        assert!(t.find("HILO_HOME=").unwrap() < t.find("HILO_NOTIFY=").unwrap());
+        assert!(!t.contains("HILO_KEYCHAIN"));
+    }
+
+    /// (home, runner calls, start calls, result)
+    #[cfg(unix)]
+    fn linux(zo: bool, add: bool, unit: bool, start_ok: bool) -> (PathBuf, Vec<String>, usize, Option<String>) {
+        let home = std::env::temp_dir().join(format!("hilo-zo-{}", crate::crypto::hex(&crate::crypto::random::<4>())));
+        let p = home.join(".config/systemd/user/hilo.service");
+        if unit {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x").unwrap();
+        }
+        let mut calls = vec![];
+        let mut starts = 0;
+        let r = linux_service(&home, Path::new("/opt/hilo"), add, zo, &mut |c, a| {
+            calls.push(format!("{c} {}", a.join(" ")));
+            true
+        }, &mut || {
+            starts += 1;
+            if start_ok { Ok(()) } else { Err("boom".into()) }
+        });
+        (home, calls, starts, r)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zo_starts_the_daemon_instead_of_systemd() {
+        let (home, calls, starts, r) = linux(true, true, false, true);
+        let r = r.unwrap();
+        assert!(!home.join(".config/systemd/user/hilo.service").exists());
+        assert!(calls.is_empty());
+        assert_eq!(starts, 1);
+        assert!(r.lines().any(|l| l == "mode: process") && r.contains("entrypoint: /opt/hilo daemon"));
+        let (_, calls, starts, r) = linux(true, true, false, false);
+        let r = r.unwrap();
+        assert!(calls.is_empty() && starts == 1);
+        assert!(r.contains("boom") && r.contains("hilo up"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn outside_zo_systemd_as_before() {
+        let (home, calls, starts, r) = linux(false, true, false, true);
+        let p = home.join(".config/systemd/user/hilo.service");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("ExecStart='/opt/hilo' daemon\nRestart=always"));
+        let user = std::env::var("USER").unwrap_or_default();
+        assert_eq!(calls, ["systemctl --user daemon-reload", "systemctl --user enable --now hilo.service", &format!("loginctl enable-linger {user}")]);
+        assert_eq!(starts, 0);
+        assert_eq!(r.unwrap(), format!("systemd user service {} (runs without a login session)", p.display()));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn removal_ignores_zo() {
+        for zo in [true, false] {
+            let (_, calls, starts, r) = linux(zo, false, false, true);
+            assert!(r.is_none() && calls.is_empty() && starts == 0);
+            let (home, calls, starts, r) = linux(zo, false, true, true);
+            assert_eq!(calls, ["systemctl --user disable --now hilo.service"]);
+            assert_eq!(starts, 0);
+            assert!(r.unwrap().starts_with("removed ") && !home.join(".config/systemd/user/hilo.service").exists());
+            std::fs::remove_dir_all(&home).unwrap();
+        }
     }
 }
