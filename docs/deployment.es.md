@@ -154,6 +154,22 @@ Lo que cambia respecto de macOS y Linux:
 - `hilo run -- CMD` arranca `CMD` directamente: usa `npm.cmd`, o `cmd /c npm ...`, para scripts `.cmd`.
 - Sin notificaciones de escritorio; quedan en el log.
 
+#### App de escritorio
+
+```powershell
+app\bundle.ps1   # requiere cargo y el toolchain MSVC
+```
+
+Compila la CLI y la app y deja `app\dist\hilo-windows.zip`, con `hilo-app.exe` (la app) y
+`hilo.exe` (la CLI) juntos.
+
+- Descomprímelo donde quieras y abre `hilo-app.exe`. Deja `hilo.exe` en la misma carpeta para que
+  la app lo encuentre; también busca en `~/.local/bin` y en tu `PATH`.
+- El zip no está firmado, así que SmartScreen puede advertir al abrirlo, y no se publica en los
+  releases: lo armas tú.
+- La carpeta por defecto es `~/Desktop/hilo`. Si tu Escritorio está redirigido a OneDrive, la app
+  no sigue esa redirección.
+
 ## Actualizar
 
 Corre el instalador de nuevo. Reemplaza el binario en `~/.local/bin` (o `HILO_BIN_DIR`); para fijar
