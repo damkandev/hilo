@@ -52,6 +52,7 @@ holds at most 16 pending connections.
 | macOS | launchd agent in `~/Library/LaunchAgents/`, starts at login | `~/Library/Logs/hilo.log` |
 | Linux | systemd user unit `~/.config/systemd/user/hilo.service` | `journalctl --user -u hilo` |
 | Windows | `hilo` value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, starts at logon (no admin needed) | `~/.hilo/daemon.log` |
+| Zo Computer | no systemd: a Zo service in `process` mode that you register ([Zo Computer](#zo-computer)) | `~/.hilo/daemon.log` |
 
 On a Linux server, keep it running after you log out:
 
@@ -61,6 +62,57 @@ sudo loginctl enable-linger $USER
 
 Without a service manager (containers, sandboxes), `hilo up` starts the daemon in the background and
 logs to `~/.hilo/daemon.log`. `--no-service` skips the service on `setup`, `init` and `join`.
+
+## Zo Computer
+
+Link folders under `/home/workspace`: it is what persists on Zo.
+
+### Peer
+
+Zo has no systemd. `hilo join` and `hilo setup` (also `hilo` and `hilo init`) detect Zo
+(`/home/workspace` exists and there is no systemd user manager), print the fields of a Zo service
+and leave the daemon running in the background with its log in `~/.hilo/daemon.log`, like `hilo up`.
+That process does not survive a restart of Zo unless you register the service: create it in Zo with
+the printed values so the daemon comes back on its own. hilo prints:
+
+```
+Zo Computer has no systemd: register hilo as a Zo service so it survives restarts
+label: hilo
+mode: process
+entrypoint: /root/.local/bin/hilo daemon
+workdir: /home/workspace
+the daemon is running now (log: /root/.hilo/daemon.log)
+```
+
+| Field | Value |
+| --- | --- |
+| label | `hilo` |
+| mode | `process` |
+| entrypoint | `<path to hilo> daemon`, e.g. `/root/.local/bin/hilo daemon` (the output of `command -v hilo`) |
+| workdir | `/home/workspace` |
+| env vars | `HILO_HOME`, `HILO_KEYCHAIN`, `HILO_NOTIFY`, only if you use them (hilo prints them as `KEY=value`) |
+
+### Anchor
+
+Register the daemon as the same `process` service as a peer, and add a second service in `tcp` mode
+so Zo exposes the anchor's port:
+
+| Field | Value |
+| --- | --- |
+| mode | `tcp` |
+| local_port | `7710` |
+
+Zo gives that service a public host and port. Advertise them and listen on 7710:
+
+```sh
+hilo init --listen <zo-host>:<public-port> --public --bind 0.0.0.0:7710
+```
+
+- `--listen` takes an IP, not a name. If Zo gives you a hostname, resolve it with
+  `getent hosts <host>` and use the IP.
+- `--bind` is needed because Zo's public port is not 7710: the socket listens on 7710 and the
+  others dial the public port.
+- Run `init` once the `tcp` service exists, so you know the public port.
 
 ## Files
 

@@ -52,6 +52,7 @@ y acepta como mucho 16 conexiones pendientes.
 | macOS | agente de launchd en `~/Library/LaunchAgents/`, arranca al iniciar sesión | `~/Library/Logs/hilo.log` |
 | Linux | unidad de usuario de systemd `~/.config/systemd/user/hilo.service` | `journalctl --user -u hilo` |
 | Windows | valor `hilo` en `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, arranca al iniciar sesión (sin admin) | `~/.hilo/daemon.log` |
+| Zo Computer | sin systemd: un service de Zo en modo `process` que registras tú ([Zo Computer](#zo-computer)) | `~/.hilo/daemon.log` |
 
 En un servidor Linux, para que siga corriendo después de cerrar sesión:
 
@@ -61,6 +62,57 @@ sudo loginctl enable-linger $USER
 
 Sin gestor de servicios (contenedores, sandboxes), `hilo up` arranca el daemon en segundo plano y
 escribe en `~/.hilo/daemon.log`. `--no-service` omite el servicio en `setup`, `init` y `join`.
+
+## Zo Computer
+
+Vincula carpetas bajo `/home/workspace`: es lo que persiste en Zo.
+
+### Peer
+
+Zo no tiene systemd. `hilo join` y `hilo setup` (también `hilo` y `hilo init`) detectan Zo
+(existe `/home/workspace` y no hay gestor de usuario de systemd), imprimen los campos de un service
+de Zo y dejan el daemon corriendo en segundo plano con su log en `~/.hilo/daemon.log`, como `hilo up`.
+Ese proceso no sobrevive a un reinicio de Zo si no registras el service: créalo en Zo con los
+valores impresos para que el daemon vuelva solo. hilo imprime:
+
+```
+Zo Computer has no systemd: register hilo as a Zo service so it survives restarts
+label: hilo
+mode: process
+entrypoint: /root/.local/bin/hilo daemon
+workdir: /home/workspace
+the daemon is running now (log: /root/.hilo/daemon.log)
+```
+
+| Campo | Valor |
+| --- | --- |
+| label | `hilo` |
+| mode | `process` |
+| entrypoint | `<ruta de hilo> daemon`, p. ej. `/root/.local/bin/hilo daemon` (la salida de `command -v hilo`) |
+| workdir | `/home/workspace` |
+| env vars | `HILO_HOME`, `HILO_KEYCHAIN`, `HILO_NOTIFY`, solo si los usas (hilo los imprime como `CLAVE=valor`) |
+
+### Ancla
+
+Registra el daemon con el mismo service `process` que un peer, y agrega un segundo service en modo
+`tcp` para que Zo exponga el puerto del ancla:
+
+| Campo | Valor |
+| --- | --- |
+| mode | `tcp` |
+| local_port | `7710` |
+
+Zo le da a ese service un host y un puerto públicos. Anúncialos y escucha en 7710:
+
+```sh
+hilo init --listen <host-zo>:<puerto-público> --public --bind 0.0.0.0:7710
+```
+
+- `--listen` toma una IP, no un nombre. Si Zo te da un hostname, resuélvelo con
+  `getent hosts <host>` y usa la IP.
+- `--bind` hace falta porque el puerto público de Zo no es 7710: el socket escucha en 7710 y las
+  demás marcan el puerto público.
+- Corre `init` cuando ya exista el service `tcp`, para saber el puerto público.
 
 ## Archivos
 
