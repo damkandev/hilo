@@ -1,3 +1,4 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 //! hilo's desktop app. It runs the `hilo` CLI for everything (`status --json`, `setup`, `add`,
 //! `log`, `restore`…), so the CLI stays the one place that knows how hilo works.
 use gpui::{
@@ -5,6 +6,8 @@ use gpui::{
     ClipboardItem, Context, FontWeight, Pixels, ScrollHandle, Menu, MenuItem, PathPromptOptions, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use serde_json::Value;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -12,15 +15,52 @@ use std::time::Duration;
 
 actions!(hilo, [Quit]);
 
+#[cfg(target_os = "macos")]
 extern "C" {
     fn getuid() -> u32;
 }
 
+/// The platforms the app runs on. What differs between them lives in the functions that take one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Os {
+    Mac,
+    Windows,
+}
+#[cfg(windows)]
+const OS: Os = Os::Windows;
+#[cfg(not(windows))]
+const OS: Os = Os::Mac;
+
 /// The shared folder the app sets up: ~/Desktop/hilo, a drive labelled "hilo" on every machine.
 const LABEL: &str = "hilo";
 
+/// The user's home, as the CLI finds it (src/config.rs): HOME, or USERPROFILE on Windows (where HOME is usually unset).
+fn home_in(os: Os, env: impl Fn(&str) -> Option<String>) -> PathBuf {
+    env("HOME").or_else(|| if os == Os::Windows { env("USERPROFILE") } else { None }).map(PathBuf::from).unwrap_or_default()
+}
+
 fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    home_in(OS, |k| std::env::var(k).ok())
+}
+
+fn bin_name(os: Os) -> &'static str {
+    match os {
+        Os::Mac => "hilo",
+        Os::Windows => "hilo.exe",
+    }
+}
+
+fn reveal_label(os: Os) -> &'static str {
+    match os {
+        Os::Mac => "Show in Finder",
+        Os::Windows => "Show in Explorer",
+    }
+}
+
+/// The Mac window has a transparent title bar, with the traffic lights over the metal. On Windows
+/// the system draws the bar, with its own title and buttons.
+fn transparent_titlebar(os: Os) -> bool {
+    os == Os::Mac
 }
 
 fn tilde(p: &str) -> String {
@@ -32,14 +72,24 @@ fn tilde(p: &str) -> String {
 }
 
 /// The CLI shipped inside the bundle, else the one install.sh puts in ~/.local/bin, else PATH.
+fn find_hilo_in(os: Os, exe_dir: Option<&Path>, home: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    let name = bin_name(os);
+    [exe_dir.map(|d| d.join(name)), Some(home.join(".local").join("bin").join(name))].into_iter().flatten().find(|p| exists(p)).unwrap_or_else(|| name.into())
+}
+
 fn find_hilo() -> PathBuf {
-    let bundled = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("hilo")));
-    [bundled, Some(home().join(".local/bin/hilo"))].into_iter().flatten().find(|p| p.is_file()).unwrap_or_else(|| "hilo".into())
+    let exe = std::env::current_exe().ok();
+    find_hilo_in(OS, exe.as_deref().and_then(Path::parent), &home(), |p| p.is_file())
 }
 
 /// Runs the CLI and returns stdout, or its error line.
 fn run(bin: &Path, args: &[&str]) -> Result<String, String> {
-    let o = Command::new(bin).args(args).env("NO_COLOR", "1").stdin(Stdio::null()).output().map_err(|e| format!("{}: {e}", bin.display()))?;
+    let mut c = Command::new(bin);
+    c.args(args).env("NO_COLOR", "1").stdin(Stdio::null());
+    // Windows: no console window flashing up for each call (CREATE_NO_WINDOW)
+    #[cfg(windows)]
+    c.creation_flags(0x08000000);
+    let o = c.output().map_err(|e| format!("{}: {e}", bin.display()))?;
     if o.status.success() {
         Ok(String::from_utf8_lossy(&o.stdout).into_owned())
     } else {
@@ -181,6 +231,7 @@ impl Hilo {
             cx.background_executor().timer(Duration::from_millis(1000)).await;
         })
         .detach();
+        // ponytail: on Windows the Desktop can be redirected to OneDrive and this doesn't resolve it; the fix is the Desktop Known Folder (FOLDERID_Desktop)
         Hilo { bin, folder: home().join("Desktop").join(LABEL), page: Page::Status, status: None, hosts, job: Default::default(), notice: None, versions: None, trash: vec![], sel: None, metal: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, include_bytes!("../assets/metal.png").to_vec())), scrolls: Default::default(), tour: None, way: Way::Ssh, code: None, target: String::new(), adding: false }
     }
 
@@ -201,8 +252,11 @@ impl Hilo {
         let (bin, job) = (self.bin.clone(), self.job.clone());
         let task = cx.background_executor().spawn(async move {
             use std::io::BufRead;
-            let child = Command::new(&bin).args(&args).env("NO_COLOR", "1").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
-            let ok = match child {
+            let mut c = Command::new(&bin);
+            c.args(&args).env("NO_COLOR", "1").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            #[cfg(windows)]
+            c.creation_flags(0x08000000);
+            let ok = match c.spawn() {
                 Ok(mut c) => {
                     for l in std::io::BufReader::new(c.stdout.take().unwrap()).lines().map_while(Result::ok) {
                         job.lock().unwrap().lines.push(l.trim().to_string());
@@ -876,13 +930,25 @@ impl Hilo {
 
     /// Starts the daemon: through its launchd job when there is one, else as a detached process.
     fn start_daemon(&mut self, cx: &mut Context<Self>) {
-        let plist = home().join("Library/LaunchAgents/dev.hilo.daemon.plist");
-        let ok = if plist.exists() {
-            Command::new("launchctl").args(["bootstrap", &format!("gui/{}", unsafe { getuid() }), &plist.to_string_lossy()]).status().is_ok()
-        } else {
-            let log = std::fs::OpenOptions::new().create(true).append(true).open(home().join("Library/Logs/hilo.log"));
-            // ponytail: plain child process, it outlives the app; the launchd job is the real fix (`hilo init/join` installs it)
-            Command::new(&self.bin).arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log.map_or(Stdio::null(), Stdio::from)).spawn().is_ok()
+        #[cfg(target_os = "macos")]
+        let ok = {
+            let plist = home().join("Library/LaunchAgents/dev.hilo.daemon.plist");
+            if plist.exists() {
+                Command::new("launchctl").args(["bootstrap", &format!("gui/{}", unsafe { getuid() }), &plist.to_string_lossy()]).status().is_ok()
+            } else {
+                let log = std::fs::OpenOptions::new().create(true).append(true).open(home().join("Library/Logs/hilo.log"));
+                // ponytail: plain child process, it outlives the app; the launchd job is the real fix (`hilo init/join` installs it)
+                Command::new(&self.bin).arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log.map_or(Stdio::null(), Stdio::from)).spawn().is_ok()
+            }
+        };
+        // Windows: a child with no console window, which outlives the app. It logs where the CLI's own daemon does.
+        #[cfg(windows)]
+        let ok = {
+            let log = std::fs::OpenOptions::new().create(true).append(true).open(home().join(".hilo").join("daemon.log"));
+            let mut c = Command::new(&self.bin);
+            c.arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log.map_or(Stdio::null(), Stdio::from));
+            c.creation_flags(0x08000000);
+            c.spawn().is_ok()
         };
         self.notice = (!ok).then(|| "Could not start hilo. Run `hilo daemon` in Terminal to see why.".into());
         cx.notify();
@@ -954,11 +1020,11 @@ impl Hilo {
             Some(p) => {
                 let (open, rm) = (PathBuf::from(&p), p.clone());
                 (
-                    aqua_button("show", "Show in Finder", Btn::Normal, Some(Box::new(move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| cx.reveal_path(&open)))),
+                    aqua_button("show", reveal_label(OS), Btn::Normal, Some(Box::new(move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| cx.reveal_path(&open)))),
                     aqua_button("stop", "Stop Syncing", Btn::Normal, self.click(cx, move |this, cx| this.start(&format!("Unlinking {}", tilde(&rm)), vec!["remove".into(), rm.clone()], None, cx))),
                 )
             }
-            None => (aqua_button("show", "Show in Finder", Btn::Disabled, None), aqua_button("stop", "Stop Syncing", Btn::Disabled, None)),
+            None => (aqua_button("show", reveal_label(OS), Btn::Disabled, None), aqua_button("stop", "Stop Syncing", Btn::Disabled, None)),
         };
         div()
             .flex()
@@ -1136,8 +1202,9 @@ impl Render for Hilo {
         let set_up = !self.str("role").is_empty();
         let cur = self.page;
 
-        // title bar: the system lights on the left, the title centred
-        let title = div().flex().flex_none().justify_center().items_center().h(px(22.)).text_size(px(13.)).text_color(rgb(0x262626)).child("hilo");
+        // title bar: the system lights on the left, the title centred. Where the system draws the bar there's none of ours.
+        let bar = if transparent_titlebar(OS) { 22. } else { 0. };
+        let title = div().flex().flex_none().justify_center().items_center().h(px(bar)).text_size(px(13.)).text_color(rgb(0x262626)).when(bar > 0., |d| d.child("hilo"));
 
         // toolbar: a textured button on each side, the LCD in the middle
         let mut left = div().flex().flex_1().items_center();
@@ -1215,7 +1282,7 @@ impl Render for Hilo {
             .child(gpui::img(self.metal.clone()).absolute().top_0().left_0().size_full().object_fit(gpui::ObjectFit::Fill))
             .child(div().absolute().top_0().left_0().size_full().flex().flex_col().child(title).child(toolbar).child(body).child(status_bar));
         if let Some(sheet) = self.sheet(cx) {
-            root = root.child(div().absolute().top(px(72.)).left_0().right_0().flex().justify_center().child(sheet));
+            root = root.child(div().absolute().top(px(bar + 50.)).left_0().right_0().flex().justify_center().child(sheet));
         }
         root
     }
@@ -1228,13 +1295,120 @@ fn main() {
         cx.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_window_closed(|cx| cx.quit()).detach();
         let bounds = Bounds::centered(None, size(px(860.), px(600.)), cx);
+        // Windows draws its own title bar: the drag area and the close, minimise and maximise buttons
+        let titlebar = if transparent_titlebar(OS) {
+            TitlebarOptions { title: Some("hilo".into()), appears_transparent: true, traffic_light_position: Some(gpui::point(px(9.), px(5.))) }
+        } else {
+            TitlebarOptions { title: Some("hilo".into()), appears_transparent: false, traffic_light_position: None }
+        };
         let opts = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions { title: Some("hilo".into()), appears_transparent: true, traffic_light_position: Some(gpui::point(px(9.), px(5.))) }),
+            titlebar: Some(titlebar),
             window_min_size: Some(size(px(700.), px(460.))),
             ..Default::default()
         };
         cx.open_window(opts, |_, cx| cx.new(Hilo::new)).unwrap();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BOTH: [Os; 2] = [Os::Mac, Os::Windows];
+
+    fn env(vars: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    fn local_bin(home: &str, os: Os) -> PathBuf {
+        Path::new(home).join(".local").join("bin").join(bin_name(os))
+    }
+
+    #[test]
+    fn home_windows_falls_back_to_userprofile() {
+        assert_eq!(home_in(Os::Windows, env(&[("USERPROFILE", r"C:\Users\ana")])), PathBuf::from(r"C:\Users\ana"));
+    }
+
+    #[test]
+    fn home_windows_prefers_home() {
+        assert_eq!(home_in(Os::Windows, env(&[("HOME", r"C:\msys\ana"), ("USERPROFILE", r"C:\Users\ana")])), PathBuf::from(r"C:\msys\ana"));
+        assert_eq!(home_in(Os::Windows, |k| Some(format!("/{k}"))), PathBuf::from("/HOME"));
+    }
+
+    #[test]
+    fn home_mac_uses_home() {
+        assert_eq!(home_in(Os::Mac, env(&[("HOME", "/Users/ana")])), PathBuf::from("/Users/ana"));
+    }
+
+    #[test]
+    fn home_mac_ignores_userprofile() {
+        assert_eq!(home_in(Os::Mac, env(&[("USERPROFILE", "x")])), PathBuf::new());
+    }
+
+    #[test]
+    fn home_is_empty_without_variables() {
+        for os in BOTH {
+            assert_eq!(home_in(os, |_| None), PathBuf::new());
+        }
+    }
+
+    #[test]
+    fn bin_name_per_platform() {
+        assert_eq!(bin_name(Os::Mac), "hilo");
+        assert_eq!(bin_name(Os::Windows), "hilo.exe");
+    }
+
+    #[test]
+    fn find_hilo_prefers_the_one_beside_the_app() {
+        for os in BOTH {
+            assert_eq!(find_hilo_in(os, Some(Path::new("/app")), Path::new("/h"), |_| true), Path::new("/app").join(bin_name(os)));
+        }
+    }
+
+    #[test]
+    fn find_hilo_falls_back_to_local_bin() {
+        for os in BOTH {
+            let want = local_bin("/h", os);
+            assert_eq!(find_hilo_in(os, Some(Path::new("/app")), Path::new("/h"), |p| p == want), want);
+        }
+    }
+
+    #[test]
+    fn find_hilo_falls_back_to_path() {
+        assert_eq!(find_hilo_in(Os::Mac, Some(Path::new("/app")), Path::new("/h"), |_| false), PathBuf::from("hilo"));
+        assert_eq!(find_hilo_in(Os::Windows, Some(Path::new("/app")), Path::new("/h"), |_| false), PathBuf::from("hilo.exe"));
+    }
+
+    #[test]
+    fn find_hilo_without_exe_dir() {
+        for os in BOTH {
+            let want = local_bin("/h", os);
+            assert_eq!(find_hilo_in(os, None, Path::new("/h"), |_| true), want);
+            assert_eq!(find_hilo_in(os, None, Path::new("/h"), |p| p == want), want);
+            assert_eq!(find_hilo_in(os, None, Path::new("/h"), |_| false), PathBuf::from(bin_name(os)));
+        }
+    }
+
+    #[test]
+    fn find_hilo_only_looks_for_this_platforms_name() {
+        // a Mac binary beside a Windows app is not the CLI, and the other way round
+        let mac = Path::new("/app").join("hilo");
+        assert_eq!(find_hilo_in(Os::Windows, Some(Path::new("/app")), Path::new("/h"), |p| p == mac), PathBuf::from("hilo.exe"));
+        let win = Path::new("/app").join("hilo.exe");
+        assert_eq!(find_hilo_in(Os::Mac, Some(Path::new("/app")), Path::new("/h"), |p| p == win), PathBuf::from("hilo"));
+    }
+
+    #[test]
+    fn reveal_label_per_platform() {
+        assert_eq!(reveal_label(Os::Mac), "Show in Finder");
+        assert_eq!(reveal_label(Os::Windows), "Show in Explorer");
+    }
+
+    #[test]
+    fn titlebar_per_platform() {
+        assert!(transparent_titlebar(Os::Mac));
+        assert!(!transparent_titlebar(Os::Windows));
+    }
 }
