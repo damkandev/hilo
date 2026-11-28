@@ -125,6 +125,42 @@ pub fn has_secret(data: &[u8]) -> bool {
         || data.windows(16).any(|w| w == b"PRIVATE KEY-----")
 }
 
+/// How a symlink travels as file content: this prefix, then the target as written.
+const LINK_MAGIC: &[u8; 14] = b"\0hilo-symlink\0";
+
+#[allow(dead_code)] // callers arrive with the symlink sync (s4-u2)
+pub fn link_payload(target: &str) -> Vec<u8> {
+    [&LINK_MAGIC[..], target.as_bytes()].concat()
+}
+
+#[allow(dead_code)] // callers arrive with the symlink sync (s4-u2)
+pub fn parse_link(data: &[u8]) -> Option<&str> {
+    std::str::from_utf8(data.strip_prefix(&LINK_MAGIC[..])?).ok()
+}
+
+/// A link target that stays inside the root, given the link at `rel`. Lexical only: never touches the disk.
+#[allow(dead_code)] // callers arrive with the symlink sync (s4-u2)
+pub fn link_ok(rel: &str, target: &str) -> bool {
+    if target.is_empty() || target.starts_with('/') || target.contains(['\0', '\\', ':']) {
+        return false;
+    }
+    let mut stack: Vec<&str> = rel.split('/').collect();
+    stack.pop();
+    for c in target.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                if stack.pop().is_none() {
+                    return false;
+                }
+            }
+            _ if is_dotgit(c) => return false,
+            _ => stack.push(c),
+        }
+    }
+    !stack.is_empty()
+}
+
 // ---- openat-based writes: a parent turned into a symlink can't redirect us ----
 
 #[cfg(target_os = "macos")]
@@ -136,6 +172,7 @@ mod c {
     pub const O_EXCL: i32 = 0x800;
     pub const O_DIRECTORY: i32 = 0x100000;
     pub const O_CLOEXEC: i32 = 0x1000000;
+    pub const ELOOP: i32 = 62;
     pub type Mode = u16;
 }
 #[cfg(target_os = "linux")]
@@ -145,6 +182,7 @@ mod c {
     pub const O_NONBLOCK: i32 = 0x800;
     pub const O_EXCL: i32 = 0x80;
     pub const O_CLOEXEC: i32 = 0x80000;
+    pub const ELOOP: i32 = 40;
     #[cfg(target_arch = "aarch64")]
     pub const O_DIRECTORY: i32 = 0x4000;
     #[cfg(target_arch = "aarch64")]
@@ -162,6 +200,7 @@ extern "C" {
     fn mkdirat(fd: c_int, path: *const c_char, mode: c::Mode) -> c_int;
     fn renameat(from_fd: c_int, from: *const c_char, to_fd: c_int, to: *const c_char) -> c_int;
     fn unlinkat(fd: c_int, path: *const c_char, flags: c_int) -> c_int;
+    fn symlinkat(target: *const c_char, fd: c_int, path: *const c_char) -> c_int;
 }
 
 #[cfg(unix)]
@@ -291,8 +330,9 @@ pub fn write_mode(root: &Path, rel: &str, data: Option<&[u8]>, new_mode: u32) ->
             }
             m.permissions().mode() & 0o777
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => new_mode & 0o777,
-        Err(e) => return Err(e), // ELOOP: target is a symlink
+        // ELOOP: `name` itself is a symlink (O_NOFOLLOW); the rename replaces the link, never its target
+        Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(c::ELOOP) => new_mode & 0o777,
+        Err(e) => return Err(e),
     };
     let tmp = format!("{TMP_PREFIX}{}", hex(&random::<8>()));
     let mut f = File::from(open_at(&dir, &tmp, c::O_WRONLY | c::O_CREAT | c::O_EXCL, 0o600)?);
@@ -309,6 +349,26 @@ pub fn write_mode(root: &Path, rel: &str, data: Option<&[u8]>, new_mode: u32) ->
         unsafe { unlinkat(dir.as_raw_fd(), t.as_ptr(), 0) };
     }
     res
+}
+
+/// Atomic create-or-replace of the symlink `rel` -> `target` (symlinkat to a temp name + renameat).
+/// An old link at `rel` is replaced, not followed.
+#[allow(dead_code)] // callers arrive with the symlink sync (s4-u2)
+#[cfg(unix)]
+pub fn write_link(root: &Path, rel: &str, target: &str) -> io::Result<()> {
+    if !link_ok(rel, target) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "link target leaves the folder"));
+    }
+    let (dir, at, name) = open_parent(root, rel, true)?;
+    case_twin(&at, &name)?;
+    let tmp = format!("{TMP_PREFIX}{}", hex(&random::<8>()));
+    let (t, n, dst) = (cstr(&tmp)?, cstr(&name)?, cstr(target)?);
+    check(unsafe { symlinkat(dst.as_ptr(), dir.as_raw_fd(), t.as_ptr()) })?;
+    let res = check(unsafe { renameat(dir.as_raw_fd(), t.as_ptr(), dir.as_raw_fd(), n.as_ptr()) });
+    if res.is_err() {
+        unsafe { unlinkat(dir.as_raw_fd(), t.as_ptr(), 0) };
+    }
+    res.map(|_| ())
 }
 
 /// (device, inode) of a directory: tells a drive folder from another one later put at its path.
@@ -386,7 +446,7 @@ pub fn write_mode(root: &Path, rel: &str, data: Option<&[u8]>, _new_mode: u32) -
     case_twin(&at, &name)?;
     let target = at.join(&name);
     match std::fs::symlink_metadata(&target) {
-        Ok(m) if !m.is_file() => return Err(io::Error::new(io::ErrorKind::InvalidInput, "target is not a regular file")),
+        Ok(m) if !m.is_file() && !m.is_symlink() => return Err(io::Error::new(io::ErrorKind::InvalidInput, "target is not a regular file")),
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
@@ -400,6 +460,27 @@ pub fn write_mode(root: &Path, rel: &str, data: Option<&[u8]>, _new_mode: u32) -
     })();
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// Windows: symlink_dir when the target is an existing directory (Windows links are typed), symlink_file
+/// otherwise; made under a temp name and renamed over `rel`, so a failure leaves `rel` as it was.
+#[allow(dead_code)] // callers arrive with the symlink sync (s4-u2)
+#[cfg(windows)]
+pub fn write_link(root: &Path, rel: &str, target: &str) -> io::Result<()> {
+    if !link_ok(rel, target) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "link target leaves the folder"));
+    }
+    let (at, name) = open_parent(root, rel, true)?;
+    case_twin(&at, &name)?;
+    let dst = target.replace('/', "\\");
+    let tmp = at.join(format!("{TMP_PREFIX}{}", hex(&random::<8>())));
+    let is_dir = std::fs::metadata(at.join(&dst)).is_ok_and(|m| m.is_dir());
+    if is_dir { std::os::windows::fs::symlink_dir(&dst, &tmp) } else { std::os::windows::fs::symlink_file(&dst, &tmp) }?;
+    let res = std::fs::rename(&tmp, at.join(&name));
+    if res.is_err() {
+        let _ = if is_dir { std::fs::remove_dir(&tmp) } else { std::fs::remove_file(&tmp) };
     }
     res
 }
@@ -466,7 +547,8 @@ mod tests {
         assert!(write(&root, "evil/x.txt", Some(b"pwn")).is_err());
         assert!(!outside.join("x.txt").exists());
         std::os::unix::fs::symlink(outside.join("t"), root.join("link")).unwrap();
-        assert!(write(&root, "link", Some(b"pwn")).is_err());
+        write(&root, "link", Some(b"new")).unwrap(); // replaces the link itself
+        assert!(std::fs::symlink_metadata(root.join("link")).unwrap().is_file() && !outside.join("t").exists());
         write(&root, "A/b/c.txt", Some(b"x")).unwrap_err(); // case twin of "a"
         std::fs::set_permissions(root.join("a/b/c.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
         write(&root, "a/b/c.txt", Some(b"v2")).unwrap();
@@ -482,4 +564,58 @@ mod tests {
         assert!(write(&root, "p", Some(b"x")).is_err());
         std::fs::remove_dir_all(&base).unwrap();
     }
+
+    #[test]
+    fn link_format_and_targets() {
+        for t in ["", "AGENTS.md", "../x", "a\0b"] {
+            assert_eq!(parse_link(&link_payload(t)), Some(t));
+        }
+        assert_eq!(parse_link(b""), None);
+        assert_eq!(parse_link(b"hola"), None);
+        assert_eq!(parse_link(b"\0hilo-symlink\0\xff"), None);
+        for (rel, t) in [("CLAUDE.md", "AGENTS.md"), ("a/b/l", "../docs/x.md"), ("l", "sub/dir"), ("l", "./a//b/")] {
+            assert!(link_ok(rel, t), "{rel} -> {t}");
+        }
+        for (rel, t) in [("l", "/etc/passwd"), ("a/l", "../../fuera"), ("l", ".."), ("l", "a/../../x"), ("l", ".git/config"), ("l", ""), ("l", "a\0b"), ("l", "."), ("a/l", ".."), ("l", "a\\b"), ("l", "c:x"), ("l", "x/.GIT")] {
+            assert!(!link_ok(rel, t), "{rel} -> {t}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn links_replace_atomically() {
+        use std::fs::{read_link, symlink_metadata};
+        let root = std::env::temp_dir().join(format!("hilo-ln-{}", hex(&random::<4>())));
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "agents").unwrap();
+        let no_tmp = |d: &Path| std::fs::read_dir(d).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(TMP_PREFIX));
+        // new link, in new parents, dangling allowed
+        write_link(&root, "x/y/l", "../../nope").unwrap();
+        assert_eq!(read_link(root.join("x/y/l")).unwrap(), Path::new("../../nope"));
+        // file -> link
+        write(&root, "CLAUDE.md", Some(b"old")).unwrap();
+        write_link(&root, "CLAUDE.md", "AGENTS.md").unwrap();
+        assert_eq!(read_link(root.join("CLAUDE.md")).unwrap(), Path::new("AGENTS.md"));
+        // link -> link
+        write_link(&root, "CLAUDE.md", "real").unwrap();
+        assert_eq!(read_link(root.join("CLAUDE.md")).unwrap(), Path::new("real"));
+        write_link(&root, "CLAUDE.md", "AGENTS.md").unwrap();
+        // link -> file: the old target stays
+        write(&root, "CLAUDE.md", Some(b"mine")).unwrap();
+        assert!(symlink_metadata(root.join("CLAUDE.md")).unwrap().is_file());
+        assert_eq!(std::fs::read(root.join("CLAUDE.md")).unwrap(), b"mine");
+        assert_eq!(std::fs::read(root.join("AGENTS.md")).unwrap(), b"agents");
+        // refused: escaping target, symlinked parent, directory in the way
+        assert_eq!(write_link(&root, "CLAUDE.md", "../out").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        std::os::unix::fs::symlink("real", root.join("p")).unwrap();
+        assert!(write_link(&root, "p/l", "x").is_err());
+        assert!(symlink_metadata(root.join("real/l")).is_err());
+        assert!(write_link(&root, "real", "AGENTS.md").is_err());
+        assert!(symlink_metadata(root.join("real")).unwrap().is_dir());
+        assert!(no_tmp(&root) && no_tmp(&root.join("real")));
+        assert_eq!(std::fs::read(root.join("CLAUDE.md")).unwrap(), b"mine");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
+
+#[cfg(test)] #[path = "fsops_symlink_tests.rs"] mod symlink_tests;
