@@ -83,13 +83,16 @@ struct Core {
     clients: HashMap<u64, Client>,
     leases: lease::Table,
     sessions: HashMap<String, [u8; 32]>, // lease session -> the machine that holds it
+    ticks: u32,                          // ticks since the last GC
 }
+
+/// One GC a day: 24 h of 30 s ticks.
+const GC_TICKS: u32 = 2880;
 
 fn blob_path(h: &Hash) -> std::path::PathBuf {
     config::path(&format!("anchor/blobs/{}", hex(h)))
 }
 
-// ponytail: blobs are never collected and the log never compacts; add both when ~/.hilo/anchor grows.
 fn read_blob(h: &Hash) -> io::Result<Option<Vec<u8>>> {
     if *h == NONE { Ok(None) } else { std::fs::read(blob_path(h)).map(Some) }
 }
@@ -125,6 +128,60 @@ fn open_log() -> io::Result<(Sequencer, HashMap<Key, String>, File)> {
     f.set_len(good as u64)?;
     f.seek(io::SeekFrom::End(0))?;
     Ok((seq, origins, f))
+}
+
+// What GC keeps: the blob of the current version of each key in `seq.state`. Nobody reads an
+// older version: `validate`, `accept`, `reject`, `latest` and `unpair` only read the current one,
+// and a delta on any other base is turned down before its base is read.
+fn gc_blobs(seq: &Sequencer) -> io::Result<(usize, u64)> {
+    let live: std::collections::HashSet<String> = seq.state.values().filter(|(_, h)| *h != NONE).map(|(_, h)| hex(h)).collect();
+    let (mut n, mut bytes) = (0, 0);
+    // ponytail: a synchronous walk of anchor/blobs on Core's thread, fine below millions of blobs; incremental GC past that.
+    for e in std::fs::read_dir(config::path("anchor/blobs"))?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let blob = name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if e.file_type().map_or(true, |t| t.is_dir()) || !(name.ends_with(".tmp") || blob && !live.contains(&name)) {
+            continue;
+        }
+        let len = e.metadata().map_or(0, |m| m.len());
+        match std::fs::remove_file(e.path()) {
+            Ok(()) => (n, bytes) = (n + 1, bytes + len),
+            Err(err) => log!("anchor: cannot delete blob {name}: {err}"),
+        }
+    }
+    Ok((n, bytes))
+}
+
+/// Rewrites `anchor/log2` with one record per key, in seq order. Once the rename is done it can't
+/// fail: `Core.log` must move to the new file or later changes would go to the unlinked one.
+fn compact_log(seq: &Sequencer, origins: &HashMap<Key, String>) -> io::Result<File> {
+    let mut keys: Vec<(&Key, &(u64, Hash))> = seq.state.iter().collect();
+    keys.sort_by_key(|(_, (s, _))| *s);
+    let mut w = W::default();
+    for (k, (s, h)) in keys {
+        w.u64(*s).str(&k.0).str(&k.1).hash(h).str(origins.get(k).map_or("", |o| o.as_str()));
+    }
+    let (tmp, p) = (config::path("anchor/log2.tmp"), config::path("anchor/log2"));
+    let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
+    f.write_all(&w.0)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, &p)?;
+    // best effort, and Windows can't open a directory as a file
+    #[cfg(unix)]
+    if let Err(e) = File::open(config::path("anchor")).and_then(|d| d.sync_all()) {
+        log!("anchor: cannot sync the anchor directory: {e}");
+    }
+    Ok(f)
+}
+
+fn log_records() -> usize {
+    let bytes = std::fs::read(config::path("anchor/log2")).unwrap_or_default();
+    let mut r = Rd(&bytes);
+    let mut n = 0;
+    while (|| Some((r.u64()?, r.str()?, r.str()?, r.hash()?, r.str()?)))().is_some() {
+        n += 1;
+    }
+    n
 }
 
 /// Checks an op from the network and resolves deltas (the anchor always has the base).
@@ -279,6 +336,28 @@ impl Core {
         }
     }
 
+    /// Compacts the log and drops the blobs no key points at; a failure leaves the anchor as it was.
+    fn gc(&mut self) {
+        let before = log_records();
+        let after = match compact_log(&self.seq, &self.origins) {
+            Ok(f) => {
+                self.log = f;
+                self.seq.state.len()
+            }
+            Err(e) => {
+                log!("anchor: cannot compact the log: {e}");
+                before
+            }
+        };
+        let (k, bytes) = gc_blobs(&self.seq).unwrap_or_else(|e| {
+            log!("anchor: cannot collect blobs: {e}");
+            (0, 0)
+        });
+        if before > after || k > 0 {
+            log!("anchor: compacted log {before}→{after} records, freed {k} blobs ({:.1} MB)", bytes as f64 / 1_048_576.0);
+        }
+    }
+
     fn handle(&mut self, ev: In) {
         match ev {
             In::Connect { id, tx, key, ip, stream } => {
@@ -330,6 +409,11 @@ impl Core {
                 self.leases.purge();
                 let live: std::collections::HashSet<&str> = self.leases.0.values().map(|e| e.session.as_str()).collect();
                 self.sessions.retain(|s, _| live.contains(s.as_str()));
+                self.ticks += 1;
+                if self.ticks >= GC_TICKS {
+                    self.ticks = 0;
+                    self.gc();
+                }
             }
             In::Gone(id) => {
                 if self.clients.remove(&id).is_some_and(|c| c.ready) {
@@ -519,7 +603,8 @@ pub fn start(listen: &str, key: [u8; 32]) -> io::Result<Sender<In>> {
     let listener = TcpListener::bind(listen)?;
     let (tx, rx): (Sender<In>, Receiver<In>) = channel();
     std::thread::spawn(move || {
-        let mut core = Core { seq, origins, log, clients: HashMap::new(), leases: lease::Table::default(), sessions: HashMap::new() };
+        let mut core = Core { seq, origins, log, clients: HashMap::new(), leases: lease::Table::default(), sessions: HashMap::new(), ticks: 0 };
+        core.gc();
         for ev in rx {
             core.handle(ev);
         }
@@ -607,6 +692,9 @@ fn serve(mut s: TcpStream, key: [u8; 32], atx: Sender<In>, unauth: Arc<AtomicUsi
 }
 
 #[cfg(test)]
+mod gc_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{CloudToken, Scope};
@@ -655,7 +743,7 @@ mod tests {
         config::save_peers(&peers).unwrap();
 
         let (seq, origins, log) = open_log().unwrap();
-        let mut core = Core { seq, origins, log, clients: HashMap::new(), leases: lease::Table::default(), sessions: HashMap::new() };
+        let mut core = Core { seq, origins, log, clients: HashMap::new(), leases: lease::Table::default(), sessions: HashMap::new(), ticks: 0 };
         let connect = |core: &mut Core, id: u64| {
             let (tx, rx) = channel();
             core.handle(In::Connect { id, tx, key: [id as u8; 32], ip: "-".into(), stream: None });
