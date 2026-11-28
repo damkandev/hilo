@@ -20,6 +20,8 @@ jobs:
       # vendored crates only: the build never touches the network
       - run: cargo test --release --offline --locked
       - run: cargo build --release --offline --locked && ls -la target/release/hilo
+      # real daemons (an anchor and a member) in a temp dir: drive sync, history, conflicts, trash
+      - run: bash scripts/e2e-drive.sh target/release/hilo
 
   windows:
     # builds and links on real Windows; the test suite still assumes a Unix box, so it only compiles
